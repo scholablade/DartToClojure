@@ -60,7 +60,7 @@ Future<void> main(List<String> args) async {
       exit(2);
     }
     content = f.readAsStringSync();
-    path = f.absolute.path;
+    path = f.path;
   }
 
   final result = parseString(
@@ -640,11 +640,12 @@ String dump(AstNode node, LineInfo li) {
     // ---------------------------------------------------------------------
     case ConstantPattern cp:
       f.write(':expr ${dump(cp.expression, li)} ');
-    case VariablePattern vp:
-      final type = vp.runtimeType.toString().startsWith('Typed')
-          ? dump((vp as dynamic).type as AstNode, li)
-          : 'nil';
-      f.write(':name ${s(vp.name.lexeme)} :type $type ');
+    case DeclaredVariablePattern vp:
+      f.write(':name ${s(vp.name.lexeme)} '
+          ':keyword ${_tok(vp.keyword)} '
+          ':type ${vp.type == null ? 'nil' : dump(vp.type!, li)} ');
+    case AssignedVariablePattern vp:
+      f.write(':name ${s(vp.name.lexeme)} ');
     case ListPattern lp:
       f.write(':type-args ${_typeArgs(lp.typeArguments, li)} '
           ':elements ${vec(lp.elements.map((el) => dump(el, li)))} ');

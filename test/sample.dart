@@ -1,9 +1,9 @@
 // sample.dart — exercises the language surface for astdump
+library my.app;
+
 import 'dart:async';
 import 'package:flutter/material.dart' as m;
 import 'package:collection/collection.dart' show groupBy;
-
-library my.app;
 
 @Deprecated('use bar')
 const kMax = 0xFF;
