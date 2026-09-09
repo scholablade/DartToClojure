@@ -1,0 +1,11 @@
+.cpcache/
+.nrepl-port
+.lsp/.cache/
+.clj-kondo/.cache/
+target/
+.dart_tool/
+.dart2cljd-cache/
+verify/build/
+verify/.dart_tool/
+verify/.cljd/
+*.iml

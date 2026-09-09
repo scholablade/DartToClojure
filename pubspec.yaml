@@ -1,0 +1,12 @@
+name: dart2cljd_frontend
+description: Dart frontend for dart2cljd — dumps the analyzer AST as EDN.
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  analyzer: 6.11.0
+
+dev_dependencies:
+  lints: ^5.0.0

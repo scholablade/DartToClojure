@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# dart2cljd CLI entry. Delegates to clojure -M.
+# Usage: bin/dart2cljd [options] [file.dart | -]
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec clojure -M:run "$@"

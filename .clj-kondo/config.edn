@@ -1,0 +1,3 @@
+{:linters {:unresolved-symbol {:level :warning}
+           :unused-var {:level :warning}}
+ :output {:progress true}}
