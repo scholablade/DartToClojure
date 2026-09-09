@@ -21,10 +21,15 @@ import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/dart/analysis/utilities.dart';
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/token.dart';
+import 'package:analyzer/diagnostic/diagnostic.dart';
 import 'package:analyzer/source/line_info.dart';
 
 const int astVersion = 1;
 final featureSet = FeatureSet.latestLanguageVersion();
+
+/// Set to 1 when a snippet was wrapped in a synthetic function body so that
+/// reported positions match the original snippet.
+int _lineOffset = 0;
 
 Future<void> main(List<String> args) async {
   var resolved = false;
@@ -69,18 +74,36 @@ Future<void> main(List<String> args) async {
     featureSet: featureSet,
     throwIfDiagnostics: false,
   );
-  final unit = result.unit;
+  var unit = result.unit;
+  var errors = result.errors;
+  // Snippet mode accepts bare expressions/statements (DartClojure parity):
+  // retry inside a function body and unwrap it, shifting lines back by one.
+  var wrapped = false;
+  if (snippet && errors.any((e) => e.severity == Severity.error)) {
+    final wresult = parseString(
+      content: 'void _snippet_() {\n$content\n;\n}',
+      path: path,
+      featureSet: featureSet,
+      throwIfDiagnostics: false,
+    );
+    if (!wresult.errors.any((e) => e.severity == Severity.error)) {
+      unit = wresult.unit;
+      errors = const [];
+      wrapped = true;
+    }
+  }
   final li = unit.lineInfo;
+  _lineOffset = wrapped ? 1 : 0;
 
   final buf = StringBuffer();
   buf.write('{:ast-version $astVersion :mode ${snippet ? ':snippet' : ':file'}');
   if (!snippet) buf.write(' :path "${_escape(path)}"');
   buf.write(' :errors [');
-  for (final e in result.errors) {
+  for (final e in errors) {
     final loc = li.getLocation(e.offset);
     buf.write(
         '{:message "${_escape(e.message)}" :severity :${e.severity.name.toLowerCase()} '
-        ':line ${loc.lineNumber} :col ${loc.columnNumber}} ');
+        ':line ${loc.lineNumber - _lineOffset} :col ${loc.columnNumber}} ');
   }
   buf.write('] :resolved ');
   if (!resolved) {
@@ -89,7 +112,15 @@ Future<void> main(List<String> args) async {
     buf.write(await _resolvedInfo(path));
   }
   buf.write(' :unit ');
-  buf.write(dump(unit, li));
+  if (wrapped) {
+    final fn = unit.declarations.single as FunctionDeclaration;
+    final block = (fn.functionExpression.body as BlockFunctionBody).block;
+    buf.write('{:ast :CompilationUnit :directives [] :decls '
+        '${vec(block.statements.map((st) => dump(st, li)))} '
+        ':src {:line 1 :col 1}}');
+  } else {
+    buf.write(dump(unit, li));
+  }
   buf.write('}');
   stdout.writeln(buf.toString());
 }
@@ -161,7 +192,7 @@ String kw(AstNode n) {
 String src(Token? token, LineInfo li) {
   if (token == null) return 'nil';
   final loc = li.getLocation(token.offset);
-  return '{:line ${loc.lineNumber} :col ${loc.columnNumber}}';
+  return '{:line ${loc.lineNumber - _lineOffset} :col ${loc.columnNumber}}';
 }
 
 String srcOf(AstNode n, LineInfo li) => src(n.beginToken, li);
@@ -561,7 +592,7 @@ String dump(AstNode node, LineInfo li) {
     case StringInterpolation sip:
       f.write(':parts ${vec(sip.elements.map((el) => dump(el, li)))} ');
     case InterpolationString istr:
-      f.write(':raw ${_tok(istr.contents)} ');
+      f.write(':raw ${_tok(istr.contents)} :value ${s(istr.value)} ');
     case InterpolationExpression iexp:
       f.write(':brace ${b(iexp.leftBracket.lexeme == '{')} '
           ':expr ${dump(iexp.expression, li)} ');
@@ -574,7 +605,23 @@ String dump(AstNode node, LineInfo li) {
           ':type-args ${_typeArgs(ll.typeArguments, li)} '
           ':elements ${vec(ll.elements.map((el) => dump(el, li)))} ');
     case SetOrMapLiteral sm:
-      f.write(':kind ${sm.isMap ? ':map' : ':set'} '
+      // isMap/isSet require resolution; infer the kind syntactically
+      final bool hasEntry = sm.elements.any((e) => e is MapLiteralEntry);
+      final bool hasValue = sm.elements.any((e) =>
+          e is! SpreadElement && e is! NullAwareElement);
+      final int nTypeArgs = sm.typeArguments?.arguments.length ?? 0;
+      final String kind = hasEntry
+          ? ':map'
+          : hasValue
+              ? ':set'
+              : nTypeArgs == 2
+                  ? ':map'
+                  : nTypeArgs == 1
+                      ? ':set'
+                      : sm.elements.isEmpty
+                          ? ':map' // bare {} is an empty map in Dart
+                          : ':unknown';
+      f.write(':kind $kind '
           ':const ${b(sm.isConst)} '
           ':type-args ${_typeArgs(sm.typeArguments, li)} '
           ':elements ${vec(sm.elements.map((el) => dump(el, li)))} ');

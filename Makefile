@@ -13,6 +13,8 @@ golden:
 fixture:
 	$(DART) run bin/astdump.dart test/sample.dart > test/fixtures/sample.edn
 	$(DART) run bin/astdump.dart test/surface.dart > test/fixtures/surface.edn
+	$(DART) run bin/astdump.dart test/parity.dart > test/fixtures/parity.edn
+	$(DART) run bin/astdump.dart test/statements.dart > test/fixtures/statements.edn
 
 verify:
 	clojure -M -m dart2cljd.verify

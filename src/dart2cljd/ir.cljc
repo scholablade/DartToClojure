@@ -632,7 +632,8 @@
 
    :InterpolationString
    {:ir :interp-string
-    :fields [[:raw :scalar]]}
+    :fields [[:raw :scalar]
+             [:value :scalar]]}
 
    :InterpolationExpression
    {:ir :interp-expr

@@ -122,13 +122,22 @@
              :params (normalize-params (:params raw))
              :nullable false}})
 
-   ;; set vs map is decided by the analyzer's :kind
+   ;; set vs map is decided by astdump's syntactic kind inference
    :SetOrMapLiteral
    (fn [raw]
-     {:ir (if (= :map (:kind raw)) :map-lit :set-lit)
-      :const (:const raw)
-      :type-args (mapv normalize-node (or (:type-args raw) []))
-      :elements (mapv normalize-node (or (:elements raw) []))})
+     (case (:kind raw)
+       :map {:ir :map-lit
+             :const (:const raw)
+             :type-args (mapv normalize-node (or (:type-args raw) []))
+             :elements (mapv normalize-node (or (:elements raw) []))}
+       :set {:ir :set-lit
+             :const (:const raw)
+             :type-args (mapv normalize-node (or (:type-args raw) []))
+             :elements (mapv normalize-node (or (:elements raw) []))}
+       (fail! :unsupported
+              (str "cannot determine whether this literal is a map or a set"
+                   (at (:src raw)) " without type resolution")
+              {:tag :SetOrMapLiteral :src (:src raw)})))
 
    ;; assigned patterns have no keyword/type; keep the :var-pattern shape
    :AssignedVariablePattern

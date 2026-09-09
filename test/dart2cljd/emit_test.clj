@@ -1,0 +1,208 @@
+(ns dart2cljd.emit-test
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
+            [dart2cljd.api :as api]
+            [dart2cljd.ast :as ast]
+            [dart2cljd.emit.core :as core]
+            [dart2cljd.emit.decls :as decls]
+            [dart2cljd.emit.statements :as st]
+            [dart2cljd.printer :as printer]))
+
+;; ---------------------------------------------------------------------------
+;; fixtures
+;; ---------------------------------------------------------------------------
+
+(defn- fixture [name]
+  (ast/normalize-doc (edn/read-string (slurp (io/resource (str "fixtures/" name))))))
+
+(def parity-doc (delay (fixture "parity.edn")))
+(def parity-ctx (delay (decls/ctx-for (decls/unit-aliases (:unit @parity-doc) {}) {})))
+(def parity-exprs
+  (delay (into {}
+               (for [d (:decls (:unit @parity-doc))
+                     :when (= :top-var-decl (:ir d))
+                     v (:vars (:vars d))]
+                 [(:name v) (:init v)]))))
+
+(defn- emit-expr-str [name]
+  (printer/flat (core/emit-expr (get @parity-exprs name) @parity-ctx)))
+
+(def statements-doc (delay (fixture "statements.edn")))
+(def statements-ctx (delay (decls/ctx-for (decls/unit-aliases (:unit @statements-doc) {}) {})))
+(def statements-decls
+  (delay (into {} (map (juxt :name identity) (:decls (:unit @statements-doc))))))
+
+(defn- emit-defn-str [name]
+  (printer/print-form (first (decls/emit-decl (get @statements-decls name) @statements-ctx))))
+
+;; ---------------------------------------------------------------------------
+;; expression parity (seeded from DartClojure's corpus, corrected to
+;; canonical cljd syntax: nil instead of null, dot-symbols for named args,
+;; alias-qualified types, .name static access, some-> for null-aware chains)
+;; ---------------------------------------------------------------------------
+
+(deftest parity-expressions
+  (doseq [[name expected]
+          {"p01_add" "(+ 1 2)"
+           "p02_arith_chain" "(- (+ 1 2 3) 4)"
+           "p03_div" "(/ 7 2)"
+           "p04_intdiv" "(quot 7 2)"
+           "p05_mod" "(. 7 % 3)"
+           "p06_logic" "(or (and true false) (not true))"
+           "p07_ifnull" "(or nil 3)"
+           "p08_ternary" "(if (> 1 0) \"pos\" \"neg\")"
+           "p09_eq" "(= 1 2)"
+           "p10_neq" "(not= 1 2)"
+           "p11_is" "(dart/is? 1 int)"
+           "p12_is_not" "(not (dart/is? 1 String))"
+           "p13_cast" "^num 1"
+           "p14_interp" "(str \"Some \" name \" and \" (foo) \"!\")"
+           "p15_interp_only" "(str x)"
+           "p16_literal_interp" "(str \"a\" 1 \"b\")"
+           "p17_raw" "\"Some $x ${y}\""
+           "p18_adjacent" "(str \"a\" \"b\")"
+           "p19_list" "[1 2 3]"
+           "p20_list_typed" "[1 2]"
+           "p21_list_if" "[(if true 1 2)]"
+           "p22_list_for" "[(for [i [1 2]] i)]"
+           "p23_list_spread" "(into [1] (concat xs))"
+           "p24_set" "#{1 2 3}"
+           "p25_map" "{\"a\" 1 \"b\" 2}"
+           "p26_map_spread" "(merge {\"a\" 1} other)"
+           "p27_index" "(get a 0)"
+           "p28_index_chain" "(get (get a 0) 1)"
+           "p29_prop" "(.-field obj)"
+           "p30_prop_chain" "(-> obj .-a .-b)"
+           "p31_method" "(.doIt obj 1 2)"
+           "p32_method_chain" "(-> obj (.a) .-b)"
+           "p33_null_chain" "(some-> obj .-a .-b)"
+           "p34_ctor" "(m/Text \"hi\" .style style)"
+           "p35_ctor_named" "(Duration .milliseconds 250)"
+           "p36_static_field" "m/Colors.blue"
+           "p37_static_index" "(get m/Colors.red 500)"
+           "p38_static_call" "(m/BorderRadius.circular 8)"
+           "p39_static_chain" "m/Colors.grey.shade300"
+           "p40_lambda" "(fn [a] (+ a 1))"
+           "p41_lambda_block" "(fn [a] (+ a 1))"
+           "p43_throw_expr" "(or x (throw (StateError \"boom\")))"
+           "p44_cascade" "(doto (m/Point 1 2) (.-x! 3) (.-y! 4))"
+           "p45_cascade_call" "(doto list (.add 1) (.add 2))"
+           "p46_bitwise" "(bit-or (bit-and 1 2) (bit-xor 3 4))"
+           "p47_shift" "(bit-shift-left 1 2)"
+           "p48_prefix_neg" "(- x)"
+           "p49_paren" "(* (+ 1 2) 3)"
+           "p50_hex" "255"
+           "p51_hex_color" "4293128957"
+           "p52_double_exp" "1000.0"
+           "p53_underscore_num" "1000"
+           "p54_null_lit" "nil"
+           "p55_bool_lit" "true"
+           "p56_uri_parse" "(Uri.parse \"http://x\")"
+           "p57_call" "(foo 1)"
+           "p58_postfix_bang" "maybe"
+           "p59_math_prefix" "(math/max 1 2)"
+           "p60_map_nested" "{\"a\" [1 2]}"
+           "p61_not_equal_chain" "(not (= a b))"
+           "p62_and_chain" "(and a b c)"
+           "p63_or_chain" "(or a b c)"
+           "p64_comparison" "(< a b)"
+           "p65_string_dq" "\"double\""
+           "p66_prefixed_ctor" "(m/Text \"x\")"
+           "p67_widget_column" "(m/Column .children [(m/Question (get (get questions _questionIndex) \"questionText\")) (-> ^List (get (get questions _questionIndex) \"answers\") (.map (fn [answer] (m/Answer _answerQuestion answer))) (.toList)) (m/Numb .sorted (and (< 1 2) (< 2 3) (< 3 a) (= a b)))])"
+           "p68_widget_app" "(m/MaterialApp .title \"Cljd Demo\" .theme (m/ThemeData .primarySwatch m/Colors.blue) .home (m/Scaffold .appBar (m/AppBar .title (m/Text \"Home\")) .body (m/Center .child (m/Text \"Hi\"))))"
+           "p69_ternary_lambda" "(m/TextButton .onPressed (if _searchEnabled (fn [] (pop)) nil))"
+           "p70_interp_factory" "(m/Text (str \"Some \" field \" and \" (m/Factory.create)))"
+           "p71_get_chain" "(get (get questions 1) \"two\")"
+           "p72_const_list" "(m/SizedBox .height 8)"}]
+    (testing name
+      (is (= expected (emit-expr-str name))))))
+
+;; ---------------------------------------------------------------------------
+;; statements
+;; ---------------------------------------------------------------------------
+
+(deftest statement-parity
+  (doseq [[name expected]
+          {"s_if" "(defn s_if [a]\n  (when (> a 0) (print \"pos\")))"
+           "s_if_else" "(defn s_if_else [a]\n  (if (> a 0) (print \"pos\") (print \"neg\")))"
+           "s_else_if" "(defn s_else_if [a]\n  (cond (> a 0) (print \"pos\") (< a 0) (print \"neg\") :else (print \"zero\")))"
+           "s_for_in" "(defn s_for_in [xs]\n  (doseq [x xs] (print x)))"
+           "s_switch" "(defn s_switch [x]\n  (case x 1 (print \"one\") 2 (print \"2or3\") 3 (print \"2or3\") (print \"other\")))"
+           "s_try" "(defn s_try []\n  (try (print 1) (catch StateError e st (print e)) (catch dynamic e (print e)) (finally (print 2))))"
+           "s_return" "(defn s_return [a]\n  (+ a 1))"
+           "s_expr_body" "(defn s_expr_body [a]\n  (* a 2))"
+           "s_vars" "(defn s_vars []\n  (let [a 1 b 2] (print (+ a b))))"
+           "s_assert" "(defn s_assert [a]\n  (assert (> a 0) \"positive\"))"
+           "s_nested_block" "(defn s_nested_block [a]\n  (print a))"
+           "s_await" "(defn s_await [f]\n  (await f))"}]
+    (testing name
+      (is (= expected (emit-defn-str name))))))
+
+;; ---------------------------------------------------------------------------
+;; ns / imports
+;; ---------------------------------------------------------------------------
+
+(deftest ns-emission
+  (is (= (str "(ns parity\n"
+              "  (:require\n"
+              "   [\"dart:math\" :as math]\n"
+              "   [\"package:flutter/material.dart\" :as m]))")
+         (printer/print-form
+          (first (decls/emit-unit (:unit @parity-doc) {:path "parity.dart"}))))))
+
+(deftest top-level-vars
+  (let [forms (decls/emit-unit (:unit @parity-doc) {:path "parity.dart"})
+        defs (filter #(and (seq? %) (= 'def (first %))) forms)]
+    (is (pos? (count defs)))
+    (is (some #(= 'p01_add (second %)) defs))))
+
+;; ---------------------------------------------------------------------------
+;; failure policy
+;; ---------------------------------------------------------------------------
+
+(deftest unsupported-fails-loudly-with-position
+  (testing "assignment needs the mutable-local pass (M3)"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"unsupported expression :assign at 7:3"
+         (core/emit-expr {:ir :assign :src {:line 7 :col 3}
+                          :lhs {:ir :id :name "x" :src {:line 7 :col 3}}
+                          :op "="
+                          :rhs {:ir :int-lit :raw "1" :value 1 :src {:line 7 :col 7}}}
+                         @parity-ctx))))
+  (testing "classes are M3"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"unsupported top-level declaration :class"
+         (decls/emit-decl {:ir :class :name "A" :src {:line 1 :col 1}}
+                          @parity-ctx))))
+  (testing "non-constant switch patterns are not yet supported"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"only constant switch cases"
+         (st/emit-stmt
+          {:ir :switch-stmt :src {:line 1 :col 1}
+           :expr {:ir :id :name "x" :src {:line 1 :col 8}}
+           :cases [{:ir :switch-pattern-case :src {:line 2 :col 3}
+                    :labels []
+                    :pattern {:ir :object-pattern :src {:line 2 :col 8}
+                              :type {:ir :named-type :prefix nil :name "A"
+                                     :type-args [] :nullable false
+                                     :src {:line 2 :col 8}}
+                              :fields []}
+                    :stmts []}]}
+          @parity-ctx)))))
+
+;; ---------------------------------------------------------------------------
+;; end-to-end (needs the Dart SDK; cached under .dart2cljd-cache)
+;; ---------------------------------------------------------------------------
+
+(def ^:private dart-bin
+  (or (System/getenv "DART2CLJD_DART")
+      "/home/Schola/Projects/develop/flutter/bin/dart"))
+
+(deftest ^:integration convert-snippet-end-to-end
+  (if (.exists (io/file dart-bin))
+    (is (= "(m/Text \"hi\" .style (m/TextStyle .fontSize 12))"
+           (api/convert "Text('hi', style: TextStyle(fontSize: 12))"
+                        :format :string
+                        :dart dart-bin)))
+    (is true "dart binary not present; skipped")))
