@@ -15,6 +15,7 @@ fixture:
 	$(DART) run bin/astdump.dart test/surface.dart > test/fixtures/surface.edn
 	$(DART) run bin/astdump.dart test/parity.dart > test/fixtures/parity.edn
 	$(DART) run bin/astdump.dart test/statements.dart > test/fixtures/statements.edn
+	$(DART) run bin/astdump.dart test/m3.dart > test/fixtures/m3.edn
 
 verify:
 	clojure -M -m dart2cljd.verify

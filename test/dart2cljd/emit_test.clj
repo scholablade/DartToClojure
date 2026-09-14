@@ -35,6 +35,42 @@
 (defn- emit-defn-str [name]
   (printer/print-form (first (decls/emit-decl (get @statements-decls name) @statements-ctx))))
 
+(def m3-doc (delay (fixture "m3.edn")))
+
+(def m3-forms
+  (delay (decls/emit-unit (:unit @m3-doc) {:path "m3.dart"})))
+
+;; ---------------------------------------------------------------------------
+;; M3 golden (whole-file faithful translation; regenerate: make golden)
+;; ---------------------------------------------------------------------------
+
+(deftest m3-golden
+  (testing "test/m3.dart translates byte-identically to the reviewed golden file"
+    (is (= (slurp (io/file "corpus/m3.cljd"))
+           (str (printer/print-forms @m3-forms) "\n")))))
+
+(deftest m3-key-forms
+  (testing "M3 constructs survive emission"
+    (let [out (printer/print-forms @m3-forms)
+          by-name (fn [tag n]
+                    (some #(and (seq? %) (= tag (first %)) (= n (second %)))
+                          @m3-forms))]
+      (is (some? (by-name 'deftype 'Point)))
+      (is (some? (by-name 'deftype 'Child)))
+      (is (some? (by-name 'deftype 'Color)))
+      (is (some? (by-name 'defn 'fib)))
+      (is (some? (by-name 'defn 'main)))
+      (testing "record literals with computed fields are identity-wrapped"
+        (is (re-find #"\(cljd\.core/identity #dart" out)))
+      (testing "user operators dispatch through interop calls"
+        (is (re-find #"\(\. p \+ \(Point-make 1\)\)" out)))
+      (testing "make-fn return tags and scalar parameter hints"
+        (is (re-find #"\(defn \^Point Point-new \[\^double x \^double y\]" out)))
+      (testing "setters end in nil instead of returning a value"
+        (is (re-find #"\^:setter norm \[this \^double v\] \(set! x v\) \(set! y v\) nil\)" out)))
+      (testing "guarded returns guard every following statement"
+        (is (re-find #"(?s)\(defn fib.*\(when \(not \(deref d2c\$done\)\)\s*\(do \(vreset! d2c\$result \(\+ \(fib" out))))))
+
 ;; ---------------------------------------------------------------------------
 ;; expression parity (seeded from DartClojure's corpus, corrected to
 ;; canonical cljd syntax: nil instead of null, dot-symbols for named args,

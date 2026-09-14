@@ -1,0 +1,183 @@
+(ns m3)
+
+(deftype Point
+  [^:mutable ^double x ^:mutable ^double y]
+  :type-only true
+  Point
+  (^:getter ^double norm [this] (+ (* x x) (* y y)))
+  (^:setter norm [this ^double v] (set! x v) (set! y v) nil)
+  (^Point + [this o] (Point-new (+ x (.-x o)) (+ y (.-y o))))
+  (^Point - [this] (Point-new (- x) (- y)))
+  (^String toString [this] (str "Point(" x ", " y ")")))
+
+(defn ^Point Point-new [^double x ^double y]
+  (let [this (Point x y)] this))
+
+(defn ^Point Point-origin []
+  (let [x 0 y 0 this (Point x y)] this))
+
+(def Point-zero (Point-new 0 0))
+
+(defn Point-make [^double v]
+  (Point-new v v))
+
+(deftype Base
+  [^:mutable ^String name]
+  :type-only true
+  Base
+  (^String greet [this] (str "hi " name)))
+
+(defn ^Base Base-new [^String name]
+  (let [this (Base name)] this))
+
+(deftype Child
+  [^:mutable ^int n d2c$super0]
+  :type-only true
+  :extends (Base d2c$super0)
+  Child
+  (^String greet [this] (str (.greet ^super this) "!")))
+
+(defn ^Child Child-new [^int n ^String name]
+  (let [d2c$super0 name this (Child n d2c$super0)] this))
+
+(deftype Shape
+  [^:mutable ^String label]
+  :type-only true
+  Shape
+  (^double area [this] (throw (UnsupportedError. "abstract method")))
+  (^String describe [this] (str label ": " (.-area this))))
+
+(defn ^Shape Shape-new [^String label]
+  (let [this (Shape label)] this))
+
+(deftype Square
+  [^:mutable ^double side d2c$super0]
+  :type-only true
+  :extends (Shape d2c$super0)
+  Square
+  (^double area [this] (* side side)))
+
+(defn ^Square Square-new [^double side ^String label]
+  (let [d2c$super0 label this (Square side d2c$super0)] this))
+
+(deftype Color
+  [^String name ^int index]
+  :type-only true
+  Color)
+
+(def Color-red (Color "red" 0))
+
+(def Color-green (Color "green" 1))
+
+(def Color-blue (Color "blue" 2))
+
+(def Color-values [Color-red Color-green Color-blue])
+
+(deftype Suit
+  [^String name ^int index ^int value]
+  :type-only true
+  Suit)
+
+(def Suit-hearts (let [value 2] (Suit "hearts" 0 value)))
+
+(def Suit-spades (let [value 11] (Suit "spades" 1 value)))
+
+(def Suit-values [Suit-hearts Suit-spades])
+
+(comment "typedef Cb (expanded at use sites)")
+
+(comment "typedef Pair (expanded at use sites)")
+
+(defn fib [^int n]
+  (let [d2c$result (volatile! nil)
+        d2c$done (volatile! false)]
+    (do
+      (when (not (deref d2c$done))
+        (when (< n 2)
+          (when (not (deref d2c$done)) (do (vreset! d2c$result n) (vreset! d2c$done true)))))
+      (when (not (deref d2c$done))
+        (do (vreset! d2c$result (+ (fib (- n 1)) (fib (- n 2)))) (vreset! d2c$done true))))
+    (deref d2c$result)))
+
+(defn loops []
+  (let [sum (volatile! 0)]
+    (let [d2c$brk (volatile! false)
+          d2c$cont (volatile! false)]
+      (loop [i 0]
+        (vreset! d2c$cont false)
+        (when (and (not (or (deref d2c$brk) (deref d2c$cont))) (< i 10))
+          (do
+            (when (not (or (deref d2c$brk) (deref d2c$cont)))
+              (when (= i 3)
+                (when (not (or (deref d2c$brk) (deref d2c$cont))) (vreset! d2c$cont true))))
+            (do
+              (when (not (or (deref d2c$brk) (deref d2c$cont)))
+                (when (= i 8)
+                  (when (not (or (deref d2c$brk) (deref d2c$cont))) (vreset! d2c$brk true))))
+              (when (not (or (deref d2c$brk) (deref d2c$cont))) (vswap! sum + i))))
+          (when (not (deref d2c$brk)) (recur (inc i))))))
+    (loop [] (when (> (deref sum) 0) (vswap! sum dec) (recur)))
+    (loop [] (vswap! sum + 2) (when (< (deref sum) 0) (recur)))
+    (let [d2c$brk$outer (volatile! false)
+          d2c$cont$outer (volatile! false)]
+      (loop [d2c$seq (seq [1 2 3])]
+        (vreset! d2c$cont$outer false)
+        (when (and (not (or (deref d2c$brk$outer) (deref d2c$cont$outer))) d2c$seq)
+          (let [x (first d2c$seq)]
+            (when (not (or (deref d2c$brk$outer) (deref d2c$cont$outer)))
+              (loop [d2c$seq (seq [1 2])]
+                (when (and (not (or (deref d2c$brk$outer) (deref d2c$cont$outer))) d2c$seq)
+                  (let [y (first d2c$seq)]
+                    (do
+                      (when (not (or (deref d2c$brk$outer) (deref d2c$cont$outer)))
+                        (when (= y 1)
+                          (when (not (or (deref d2c$brk$outer) (deref d2c$cont$outer)))
+                            (vreset! d2c$cont$outer true))))
+                      (when (not (or (deref d2c$brk$outer) (deref d2c$cont$outer)))
+                        (vreset! d2c$brk$outer true)))
+                    (when (not (or (deref d2c$brk$outer) (deref d2c$cont$outer)))
+                      (recur (next d2c$seq)))))))
+            (when (not (deref d2c$brk$outer)) (recur (next d2c$seq)))))))
+    (let [list [1 2 3]]
+      (let [d2c$subj list]
+        (cond
+          (and (dart/is? d2c$subj List) (<= 1 (count d2c$subj)) (dart/is? (get d2c$subj 0) int))
+            (let [a (volatile! (get d2c$subj 0))
+                  rest (into [] (drop 1 d2c$subj))]
+              (do (print (deref a)) (print rest)))
+          (and (dart/is? d2c$subj Map) (contains? d2c$subj "k") (dart/is? (get d2c$subj "k") int))
+            (let [v (get d2c$subj "k")] (print v))
+          (and (dart/is? d2c$subj Record) (dart/is? (.-$1 d2c$subj) int) (dart/is? (.-$2 d2c$subj) String))
+            (let [x (.-$1 d2c$subj) y (.-$2 d2c$subj)] (if (> x 0) (print y) nil))
+          :else (print "none")))
+      (let [sw
+              (let [d2c$subj (deref sum)]
+                (cond
+                  (and (= d2c$subj 0)) "zero"
+                  (and (dart/is? d2c$subj int)) (let [n d2c$subj] (if (> n 0) "pos" nil))
+                  :else "neg"))]
+        (print sw)
+        (let [d2c$pat #dart (1 2)
+              a (volatile! (.-$1 d2c$pat))
+              b (volatile! (.-$2 d2c$pat))]
+          (let [d2c$pat (cljd.core/identity #dart ((deref b) (deref a)))]
+            (do (vreset! a (.-$1 d2c$pat)) (vreset! b (.-$2 d2c$pat))))
+          (print (str (deref a) " " (deref b))))))))
+
+(defn ^:async work [^int x]
+  (await (Future.delayed (Duration .seconds 1)))
+  (+ x 1))
+
+^{:dart/annotations ["@Deprecated(\"use newName\")"]} ^:deprecated (def oldName 1)
+
+(defn main []
+  (let [p (Point-new 1 2)]
+    (.-x! p 3)
+    (.-norm! p 4)
+    (print (. p + (Point-make 1)))
+    (print Point-zero)
+    (print Color-red)
+    (print (.-value Suit-hearts))
+    (print (fib 5))
+    (loops)
+    (print oldName)))
