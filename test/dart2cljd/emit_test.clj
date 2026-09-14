@@ -234,3 +234,12 @@
                         :format :string
                         :dart dart-bin)))
     (is true "dart binary not present; skipped")))
+
+(deftest ^:integration mid-case-break-fails-loudly
+  (if (.exists (io/file dart-bin))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"trailing terminator"
+         (api/convert
+          "void f(int x) { switch (x) { case 1: if (x > 0) break; print('a'); } }"
+          :dart dart-bin)))
+    (is true "dart binary not present; skipped")))

@@ -483,7 +483,7 @@
    "+" "+" "-" "-" "*" "*" "/" "/" "%" "%" "~/" "~/"
    "&" "&" "|" "|" "^" "^" "<<" "<<" ">>" ">>" ">>>" ">>>"})
 
-(def ^:private string-member-ops #{"^" "~" "~/"})
+(def ^:private string-member-ops #{"^" "~" "~/" ">>>"})
 
 (defn- operator-method-symbol [m]
   (if (contains? string-member-ops m) m (symbol m)))

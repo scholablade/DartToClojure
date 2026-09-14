@@ -572,8 +572,28 @@
       (or last? pattern-case?) v
       :else (fail! last-s "switch case must end with break/return/throw/continue"))))
 
+(defn- find-switch-level-break
+  "First unlabeled `break` whose target is the switch being emitted (breaks
+  inside nested loops/switches/functions target those), or nil."
+  [node]
+  (let [found (atom nil)]
+    (letfn [(scan [n]
+              (when-not @found
+                (cond
+                  (map? n)
+                  (case (:ir n)
+                    (:fn :fn-decl) nil
+                    (:for :while :do-while :switch-stmt) nil
+                    :break (when (nil? (:label n)) (reset! found n))
+                    (doseq [v (vals (dissoc n :ir :src :annotations))] (scan v)))
+                  (coll? n) (doseq [v n] (scan v)))))]
+      (scan node)
+      @found)))
+
 (defn- switch-body [stmts ctx opts]
   (let [stmts (case-terminator stmts ctx opts)]
+    (when-let [b (find-switch-level-break stmts)]
+      (fail! b "break inside a switch case is only supported as the trailing terminator"))
     (do-form (emit-body-forms stmts ctx))))
 
 (defn- switch-clauses
