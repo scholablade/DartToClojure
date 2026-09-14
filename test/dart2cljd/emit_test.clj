@@ -6,7 +6,6 @@
             [dart2cljd.ast :as ast]
             [dart2cljd.emit.core :as core]
             [dart2cljd.emit.decls :as decls]
-            [dart2cljd.emit.statements :as st]
             [dart2cljd.printer :as printer]))
 
 ;; ---------------------------------------------------------------------------
@@ -135,7 +134,7 @@
            "s_vars" "(defn s_vars []\n  (let [a 1 b 2] (print (+ a b))))"
            "s_assert" "(defn s_assert [a]\n  (assert (> a 0) \"positive\"))"
            "s_nested_block" "(defn s_nested_block [a]\n  (print a))"
-           "s_await" "(defn s_await [f]\n  (await f))"}]
+           "s_await" "(defn ^:async s_await [f]\n  (await f))"}]
     (testing name
       (is (= expected (emit-defn-str name))))))
 
@@ -162,34 +161,27 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest unsupported-fails-loudly-with-position
-  (testing "assignment needs the mutable-local pass (M3)"
+  (testing "generators are not supported by ClojureDart"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"unsupported expression :assign at 7:3"
-         (core/emit-expr {:ir :assign :src {:line 7 :col 3}
-                          :lhs {:ir :id :name "x" :src {:line 7 :col 3}}
-                          :op "="
-                          :rhs {:ir :int-lit :raw "1" :value 1 :src {:line 7 :col 7}}}
-                         @parity-ctx))))
-  (testing "classes are M3"
+         clojure.lang.ExceptionInfo #"generators"
+         (core/emit-expr
+          {:ir :fn :src {:line 3 :col 1} :type-params [] :params []
+           :body {:ir :block-body :async "async*" :src {:line 3 :col 1}
+                  :block {:ir :block :stmts [] :src {:line 3 :col 1}}}}
+          @parity-ctx))))
+  (testing "Dart extensions are not supported"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"unsupported top-level declaration :class"
-         (decls/emit-decl {:ir :class :name "A" :src {:line 1 :col 1}}
+         clojure.lang.ExceptionInfo #"extensions"
+         (decls/emit-decl {:ir :extension :name "X" :src {:line 1 :col 1}}
                           @parity-ctx))))
-  (testing "non-constant switch patterns are not yet supported"
+  (testing "unknown static members fail loudly"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"only constant switch cases"
-         (st/emit-stmt
-          {:ir :switch-stmt :src {:line 1 :col 1}
-           :expr {:ir :id :name "x" :src {:line 1 :col 8}}
-           :cases [{:ir :switch-pattern-case :src {:line 2 :col 3}
-                    :labels []
-                    :pattern {:ir :object-pattern :src {:line 2 :col 8}
-                              :type {:ir :named-type :prefix nil :name "A"
-                                     :type-args [] :nullable false
-                                     :src {:line 2 :col 8}}
-                              :fields []}
-                    :stmts []}]}
-          @parity-ctx)))))
+         clojure.lang.ExceptionInfo #"unknown static member"
+         (core/emit-expr
+          {:ir :prop :src {:line 1 :col 1}
+           :target {:ir :id :name "Foo" :src {:line 1 :col 1}}
+           :name "nope" :null-aware false}
+          (assoc @parity-ctx :unit-info {:classes {"Foo" {:ctors #{nil}}}}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; end-to-end (needs the Dart SDK; cached under .dart2cljd-cache)

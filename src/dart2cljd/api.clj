@@ -66,9 +66,7 @@
         unit (:unit doc)
         snippet? (= :snippet (:mode doc))
         aliases (or (:aliases opts)
-                    (if snippet?
-                      (snippet-aliases opts)
-                      (decls/unit-aliases unit opts)))
+                    (when snippet? (snippet-aliases opts)))
         ctx (decls/ctx-for aliases opts)
         forms (if snippet?
                 (let [fs (vec (mapcat #(emit-snippet-decl % ctx) (:decls unit)))]

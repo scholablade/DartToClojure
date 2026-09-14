@@ -164,10 +164,10 @@
                :src (src 1 1)})]
     (is (= :fn-decl (:ir ir)))
     (is (= [{:ir :param :kind :required-positional :name "a" :type nil
-             :final false :const false :covariant false :default nil
+             :final false :const false :covariant false :default nil :required nil
              :super false :this false :fn-typed nil :src (src 1 6)}
             {:ir :param :kind :named :name "cb" :type nil
-             :final false :const false :covariant false :default nil
+             :final false :const false :covariant false :default nil :required nil
              :super false :this false
              :fn-typed {:ir :fn-suffix :type-params [] :params [] :nullable true
                         :src (src 1 14)}

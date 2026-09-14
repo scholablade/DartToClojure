@@ -1,14 +1,28 @@
 (ns dart2cljd.emit.statements
-  "IR statements -> cljd forms (faithful mode, M2 subset).
+  "IR statements -> cljd forms (faithful mode).
 
-  `emit-body` turns a Dart statement sequence into a vector of cljd body
-  forms, hoisting local declarations into nested `let`s and turning a
-  trailing `return` into the body's value. Statement-level for-in loops
-  become `doseq` (eager, like Dart); collection `for` elements use `for`."
-  (:require [dart2cljd.emit.core :as core]))
+  Body emission has two shapes:
 
-(declare emit-body emit-stmt)
+  * direct mode — used when no `return` needs to escape a nested construct.
+    Local declarations are hoisted into `let`s and a trailing `return`
+    becomes the body's value. `break`/`continue` loops carry guard flags.
+  * guarded mode — used when a function contains early/non-tail returns.
+    The function body is wrapped in
+      (let [d2c$result (volatile! nil) d2c$done (volatile! false)]
+        ... @d2c$result)
+    `return` sets both boxes; every following statement is guarded so it is
+    skipped once a box is set. Loop `break`/`continue` add their own flags.
 
+  Statement-level for-in loops become `doseq` (eager, like Dart) when no
+  jumps escape them; otherwise they become `loop`/`recur`. Collection `for`
+  elements stay lazy via dart2cljd.emit.core."
+  (:require [dart2cljd.emit.core :as core]
+            [dart2cljd.mutable :as mutable]
+            [dart2cljd.pattern :as pattern]))
+
+(declare emit-body emit-stmt emit-guarded-seq tail-stmt?)
+
+(defn- fail! [node msg] (core/fail! node msg))
 (defn- emit-expr [node ctx] (core/emit-expr node ctx))
 
 (defn- do-form [forms]
@@ -17,138 +31,645 @@
     (= 1 (count forms)) (first forms)
     :else (list* 'do forms)))
 
+(defn- and-form [& xs]
+  (let [xs (remove nil? xs)]
+    (case (count xs)
+      0 true
+      1 (first xs)
+      (list* 'and xs))))
+
 ;; ---------------------------------------------------------------------------
-;; bodies
+;; return / tail analysis
 ;; ---------------------------------------------------------------------------
+
+(defn- contains-return? [node]
+  (cond
+    (map? node)
+    (case (:ir node)
+      (:fn :fn-decl) false
+      :return true
+      (boolean (some contains-return?
+                     (vals (dissoc node :ir :src :annotations)))))
+    (coll? node) (boolean (some contains-return? node))
+    :else false))
+
+(defn- all-returns-tail? [stmts]
+  (loop [ss (seq stmts)]
+    (if-not ss
+      true
+      (if (next ss)
+        (and (not (contains-return? (first ss)))
+             (recur (next ss)))
+        (tail-stmt? (first ss))))))
+
+(defn- tail-stmt? [s]
+  (case (:ir s)
+    :return true
+    :block (all-returns-tail? (:stmts s))
+    :if (and (not (contains-return? (:cond s)))
+             (tail-stmt? (:then s))
+             (or (nil? (:else s)) (tail-stmt? (:else s))))
+    :switch-stmt (every? #(all-returns-tail? (:stmts %)) (:cases s))
+    :try (and (all-returns-tail? (:stmts (:body s)))
+              (every? #(all-returns-tail? (:stmts (:body %))) (:catches s))
+              (or (nil? (:finally s))
+                  (not (contains-return? (:finally s)))))
+    :labeled (tail-stmt? (:stmt s))
+    (not (contains-return? s))))
+
+;; ---------------------------------------------------------------------------
+;; guards
+;; ---------------------------------------------------------------------------
+
+(defn- guards-form
+  "`(not (or (deref g) ...))` for the guard symbols in `guards`, or nil."
+  [guards]
+  (when (seq guards)
+    (list 'not
+          (if (= 1 (count guards))
+            (list 'deref (first guards))
+            (list* 'or (map #(list 'deref %) guards))))))
+
+(defn- guard-test [ctx]
+  (guards-form (:guards ctx)))
+
+;; ---------------------------------------------------------------------------
+;; declarations
+;; ---------------------------------------------------------------------------
+
+(defn- stmt-stmts [s]
+  (if (= :block (:ir s)) (:stmts s) [s]))
+
+(defn- decl? [s]
+  (contains? #{:var-decl :fn-decl :pattern-var-decl-stmt} (:ir s)))
+
+(defn- pattern-bind-vec
+  "Flatten pattern `binds` ([[sym form] ...]) into a `let` binding vector.
+  Names the mutability analysis marked are boxed (R1) so reads/writes emit
+  `deref`/`vreset!` consistently."
+  [binds ctx]
+  (vec (mapcat (fn [[n form]]
+                 (let [s (if (symbol? n) n (symbol n))
+                       nm (name s)]
+                   (if (contains? (:mutable ctx) nm)
+                     [s (list (if (contains? (:captured ctx) nm)
+                                'atom 'volatile!)
+                              form)]
+                     [s form])))
+               binds)))
+
+(defn- local-fn-form [d ctx]
+  (when-not (= :fn (:kind d))
+    (fail! d "local getters/setters are not supported"))
+  (let [{:keys [params body async]} (core/emit-callable d ctx)]
+    (with-meta (list* 'fn (symbol (:name d)) params body)
+      (when async {:async true}))))
+
+(defn- decl->parts
+  "A declaration statement -> {:bindings [...] :checks [form ...]}."
+  [d ctx]
+  (case (:ir d)
+    :var-decl
+    {:bindings
+     (vec (mapcat (fn [v]
+                    (let [n (:name v)
+                          init (when (:init v) (emit-expr (:init v) ctx))]
+                      [(symbol n)
+                       (if (contains? (:mutable ctx) n)
+                         (list (if (contains? (:captured ctx) n)
+                                 'atom 'volatile!)
+                               init)
+                         init)]))
+                  (:vars d)))
+     :checks []}
+
+    :fn-decl
+    {:bindings [(symbol (:name d)) (local-fn-form d ctx)] :checks []}
+
+    :pattern-var-decl-stmt
+    (let [subj (symbol "d2c$pat")
+          alts (pattern/alternatives (:pattern (:decl d)) subj ctx
+                                     {:structural-tests? false})]
+      (when (not= 1 (count alts))
+        (fail! d "or-patterns are not supported in variable declarations"))
+      (let [{:keys [tests binds]} (first alts)]
+        {:bindings (into [subj (emit-expr (:expr (:decl d)) ctx)]
+                         (pattern-bind-vec binds ctx))
+         :checks (map #(list 'assert %) tests)}))))
+
+(defn- decl-run-form [decls rest-forms ctx]
+  (let [parts (map #(decl->parts % ctx) decls)
+        bindings (vec (mapcat :bindings parts))
+        checks (vec (mapcat :checks parts))
+        body (concat checks rest-forms)]
+    (if (seq body)
+      (list* 'let bindings body)
+      (list 'let bindings nil))))
+
+;; ---------------------------------------------------------------------------
+;; direct mode
+;; ---------------------------------------------------------------------------
+
+(defn- emit-direct [stmts ctx]
+  (loop [ss (seq stmts) out []]
+    (if-not ss
+      out
+      (let [s (first ss)
+            last? (nil? (next ss))
+            sctx (assoc ctx :tail? (and last? (boolean (:tail? ctx))))]
+        (case (:ir s)
+          (:var-decl :fn-decl :pattern-var-decl-stmt)
+          (let [[decls more] (split-with decl? ss)]
+            (conj out (decl-run-form decls (emit-direct more ctx) ctx)))
+
+          :return
+          (if last?
+            (conj out (when (:expr s) (emit-expr (:expr s) ctx)))
+            (fail! s "early return is not supported here"))
+
+          (recur (next ss) (conj out (emit-stmt s sctx))))))))
+
+;; ---------------------------------------------------------------------------
+;; guarded mode
+;; ---------------------------------------------------------------------------
+
+(defn- emit-guarded-seq [stmts ctx]
+  (if (empty? stmts)
+    nil
+    (let [s (first stmts)
+          rest-stmts (next stmts)
+          g (guard-test ctx)
+          recur-seq #(emit-guarded-seq % ctx)]
+      (case (:ir s)
+        (:var-decl :fn-decl :pattern-var-decl-stmt)
+        (let [[decls more] (split-with decl? stmts)
+              form (decl-run-form decls (when (seq more) [(recur-seq more)]) ctx)]
+          (if g (list 'if g nil form) form))
+
+        :return
+        (let [sets (list 'do
+                         (list 'vreset! (:result ctx)
+                               (when (:expr s) (emit-expr (:expr s) ctx)))
+                         (list 'vreset! (:done ctx) true))]
+          (if-let [inner (recur-seq rest-stmts)]
+            (list 'do sets inner)
+            sets))
+
+        :break
+        (let [sym (if-let [l (:label s)]
+                    (get (:break-syms ctx) l)
+                    (:break-sym ctx))]
+          (when-not sym (fail! s "break outside a supported loop"))
+          (let [form (list 'vreset! sym true)]
+            (if-let [inner (recur-seq rest-stmts)]
+              (list 'do form inner)
+              form)))
+
+        :continue
+        (let [sym (if-let [l (:label s)]
+                    (get (:continue-syms ctx) l)
+                    (:continue-sym ctx))]
+          (when-not sym (fail! s "continue outside a supported loop"))
+          (let [form (list 'vreset! sym true)]
+            (if-let [inner (recur-seq rest-stmts)]
+              (list 'do form inner)
+              form)))
+
+        (let [form (emit-stmt s (assoc ctx :tail? false))]
+          (if-let [inner (recur-seq rest-stmts)]
+            (let [body (list 'do form inner)]
+              (if g (list 'when g body) body))
+            (if g (list 'when g form) form)))))))
+
+(defn- emit-body-forms [stmts ctx]
+  (if (seq (:guards ctx))
+    [(or (emit-guarded-seq stmts ctx) nil)]
+    (emit-direct stmts ctx)))
 
 (defn emit-body
   "Dart statements -> vector of cljd forms (function/loop/block bodies)."
   [stmts ctx]
-  (loop [ss (seq stmts) out []]
-    (if-not ss
-      out
-      (let [s (first ss)]
-        (case (:ir s)
-          :var-decl
-          (let [[decls rest-stmts] (split-with #(= :var-decl (:ir %)) ss)
-                bindings (vec (mapcat (fn [d]
-                                        (mapcat (fn [v]
-                                                  [(symbol (:name v))
-                                                   (when (:init v) (emit-expr (:init v) ctx))])
-                                                (:vars d)))
-                                      decls))
-                rest-forms (emit-body rest-stmts ctx)]
-            (conj out (if (seq rest-forms)
-                        (list* 'let bindings rest-forms)
-                        (list 'let bindings nil))))
-
-          :return
-          (if (next ss)
-            (core/fail! s "early return is not supported yet")
-            (conj out (when (:expr s) (emit-expr (:expr s) ctx))))
-
-          (recur (next ss) (conj out (emit-stmt s ctx))))))))
+  (if (:fn-body? ctx)
+    (let [has-ret (boolean (some contains-return? stmts))]
+      (if (and has-ret (not (all-returns-tail? stmts)))
+        (let [result 'd2c$result
+              done 'd2c$done
+              ctx' (assoc ctx
+                          :result result
+                          :done done
+                          :guards (conj (vec (:guards ctx)) done))]
+          [(list 'let [result (list 'volatile! nil)
+                       done (list 'volatile! false)]
+                 (or (emit-guarded-seq stmts ctx') nil)
+                 (list 'deref result))])
+        (emit-direct stmts ctx)))
+    (emit-body-forms stmts ctx)))
 
 ;; ---------------------------------------------------------------------------
-;; statements
+;; if / pattern matching
 ;; ---------------------------------------------------------------------------
+
+(defn- match-form
+  "Form evaluating `then` when pattern `p` matches `subject`, else `else`."
+  [p subject ctx then else]
+  (let [alts (pattern/alternatives p subject ctx)
+        guard (pattern/guard-expr p)
+        alt-form (fn [a]
+                   (let [tests (:tests a)
+                         binds (:binds a)
+                         inner (if guard
+                                 (list 'if (emit-expr guard ctx) then else)
+                                 then)
+                         inner (if (seq binds)
+                                 (list 'let (pattern-bind-vec binds ctx) inner)
+                                 inner)]
+                     (if (seq tests)
+                       (list 'if (list* 'and tests) inner else)
+                       inner)))]
+    (if (= 1 (count alts))
+      (alt-form (first alts))
+      (list* 'or (concat (map alt-form alts) [else])))))
+
+(defn- emit-if-case [s ctx]
+  (let [p (:pattern (:case s))
+        subj (symbol "d2c$subj")
+        then (if (seq (:guards ctx))
+               (or (emit-guarded-seq (stmt-stmts (:then s)) ctx) nil)
+               (emit-stmt (:then s) ctx))
+        else (when (:else s)
+               (if (seq (:guards ctx))
+                 (or (emit-guarded-seq (stmt-stmts (:else s)) ctx) nil)
+                 (emit-stmt (:else s) ctx)))]
+    (list 'let [subj (emit-expr (:cond s) ctx)]
+          (match-form p subj ctx then else))))
 
 (defn- emit-if [s ctx]
   (let [c (emit-expr (:cond s) ctx)
-        then (emit-stmt (:then s) ctx)
-        els (:else s)]
+        then-s (:then s)
+        els (:else s)
+        branch (fn [st]
+                 (if (seq (:guards ctx))
+                   (or (emit-guarded-seq (stmt-stmts st) ctx) nil)
+                   (emit-stmt st (assoc ctx :tail? (boolean (:tail? ctx))))))]
     (cond
-      (:case s) (core/fail! s "pattern if is not supported yet")
+      (:case s) (emit-if-case s ctx)
 
-      (nil? els) (list 'when c then)
+      (seq (:guards ctx))
+      (cond
+        (nil? els) (list 'when c (branch then-s))
+        (= :if (:ir els))
+        (let [clauses (loop [n els acc [c (branch then-s)]]
+                        (let [c2 (emit-expr (:cond n) ctx)
+                              t2 (branch (:then n))
+                              acc (conj acc c2 t2)]
+                          (if-let [e (:else n)]
+                            (if (= :if (:ir e))
+                              (recur e acc)
+                              (conj acc :else (branch e)))
+                            acc)))]
+          (list* 'cond clauses))
+        :else (list 'if c (branch then-s) (branch els)))
 
-      (= :if (:ir els))
-      (let [clauses (loop [n els acc [c then]]
-                      (let [c2 (emit-expr (:cond n) ctx)
-                            t2 (emit-stmt (:then n) ctx)
-                            acc (conj acc c2 t2)]
-                        (if-let [e (:else n)]
-                          (if (= :if (:ir e))
-                            (recur e acc)
-                            (conj acc :else (emit-stmt e ctx)))
-                          acc)))]
-        (list* 'cond clauses))
+      :else
+      (cond
+        (nil? els) (list 'when c (branch then-s))
+        (= :if (:ir els))
+        (let [clauses (loop [n els acc [c (branch then-s)]]
+                        (let [c2 (emit-expr (:cond n) ctx)
+                              t2 (branch (:then n))
+                              acc (conj acc c2 t2)]
+                          (if-let [e (:else n)]
+                            (if (= :if (:ir e))
+                              (recur e acc)
+                              (conj acc :else (branch e)))
+                            acc)))]
+          (list* 'cond clauses))
+        :else (list 'if c (branch then-s) (branch els))))))
 
-      :else (list 'if c then (emit-stmt els ctx)))))
+;; ---------------------------------------------------------------------------
+;; loops
+;; ---------------------------------------------------------------------------
 
-(defn- emit-for [s ctx]
+(defn- merge-jumps [a b] (merge-with #(or %1 %2) a b))
+
+(defn- jump-info
+  "Find break/continue statements that target the loop being emitted.
+  `nested?` is true inside a nested loop, where unlabeled jumps target that
+  loop instead. Jumps inside nested functions never escape."
+  [node labels nested?]
+  (cond
+    (map? node)
+    (case (:ir node)
+      (:fn :fn-decl) {}
+      :break (if (or (and (nil? (:label node)) (not nested?))
+                     (contains? labels (:label node)))
+               {:break? true} {})
+      :continue (if (or (and (nil? (:label node)) (not nested?))
+                        (contains? labels (:label node)))
+                  {:continue? true} {})
+      (:for :while :do-while) (jump-info (:body node) labels true)
+      :labeled (jump-info (:stmt node) (into labels (:labels node)) nested?)
+      (reduce (fn [acc v] (merge-jumps acc (jump-info v labels nested?)))
+              {} (vals (dissoc node :ir :src :annotations))))
+    (coll? node) (reduce (fn [acc v] (merge-jumps acc (jump-info v labels nested?)))
+                         {} node)
+    :else {}))
+
+(defn- flag-sym [base labels]
+  (symbol (str "d2c$" base (when (seq labels) (str "$" (first (sort labels)))))))
+
+(defn- loop-ctx
+  "Extend ctx with the guard flags needed by the loop body."
+  [s ctx labels]
+  (let [{:keys [break? continue?]} (jump-info (:body s) labels false)
+        brk (when break? (flag-sym "brk" labels))
+        cont (when continue? (flag-sym "cont" labels))
+        guards (vec (concat (:guards ctx) (when brk [brk]) (when cont [cont])))]
+    {:ctx (assoc ctx
+                 :guards guards
+                 :break-sym brk
+                 :continue-sym cont
+                 :break-syms (into (or (:break-syms ctx) {})
+                                   (for [l labels] [l brk]))
+                 :continue-syms (into (or (:continue-syms ctx) {})
+                                      (for [l labels] [l cont])))
+     :brk brk
+     :cont cont}))
+
+(defn- loop-wrapper [flags form]
+  (if (seq flags)
+    (list 'let (vec (mapcat (fn [f] [f (list 'volatile! false)]) flags)) form)
+    form))
+
+(defn- emit-loop-body [body ctx]
+  (do-form (emit-body-forms (stmt-stmts body) ctx)))
+
+(defn- recur-form [ctx cont]
+  (let [gs (remove #{cont} (:guards ctx))
+        g (guards-form gs)]
+    (if g (list 'when g (list 'recur)) (list 'recur))))
+
+(defn- emit-while [s ctx labels]
+  (let [{:keys [ctx brk cont]} (loop-ctx s ctx labels)
+        body (emit-loop-body (:body s) ctx)
+        cond (emit-expr (:cond s) ctx)
+        form (list* 'loop []
+                    (concat (when cont [(list 'vreset! cont false)])
+                            [(list 'when (and-form (guards-form (:guards ctx)) cond)
+                                   body
+                                   (recur-form ctx cont))]))]
+    (loop-wrapper (keep identity [brk cont]) form)))
+
+(defn- emit-do-while [s ctx labels]
+  (let [{:keys [ctx brk cont]} (loop-ctx s ctx labels)
+        body (emit-loop-body (:body s) ctx)
+        cond (emit-expr (:cond s) ctx)
+        recur-guards (vec (remove #{cont} (:guards ctx)))
+        form (list* 'loop []
+                    (concat (when cont [(list 'vreset! cont false)])
+                            [body
+                             (list 'when (and-form (guards-form recur-guards) cond)
+                                   (list 'recur))]))]
+    (loop-wrapper (keep identity [brk cont]) form)))
+
+(defn- updater-new-value
+  "For a C-style for loop: [name new-value-form] for an updater on a loop
+  variable, or :expression when the updater is a plain expression."
+  [u loop-names ctx]
+  (let [target (case (:ir u)
+                 (:postfix :prefix) (:operand u)
+                 :assign (:lhs u)
+                 nil)]
+    (cond
+      (and (= :id (:ir target)) (contains? loop-names (:name target)))
+      (let [n (:name target)]
+        [n (case (:ir u)
+             :postfix (list (if (= "++" (:op u)) 'inc 'dec) (symbol n))
+             :prefix (list (if (= "++" (:op u)) 'inc 'dec) (symbol n))
+             :assign (case (:op u)
+                       "=" (emit-expr (:rhs u) ctx)
+                       "??" (list 'or (symbol n) (emit-expr (:rhs u) ctx))
+                       "&&" (list 'and (symbol n) (emit-expr (:rhs u) ctx))
+                       "||" (list 'or (symbol n) (emit-expr (:rhs u) ctx))
+                       (list (core/compound-fn (:op u)) (symbol n)
+                             (emit-expr (:rhs u) ctx))))])
+
+      (empty? loop-names)
+      :expression
+
+      :else (fail! u "for-loop updater must assign a loop variable"))))
+
+(defn- emit-for-parts [s ctx labels]
   (let [loop (:loop s)
-        body (emit-stmt (:body s) ctx)]
-    (case (:ir loop)
-      :for-in
-      (if-let [v (:var loop)]
-        (list 'doseq [(symbol (:name v)) (emit-expr (:iterable loop) ctx)] body)
-        (core/fail! loop "pattern for-in is not supported yet"))
-      :for-parts (core/fail! loop "C-style for loops are not supported yet")
-      (core/fail! loop (str "unsupported for loop " (:ir loop))))))
+        init (:init loop)
+        decl-vars (when (and init (= :var-decl (:ir init))) (:vars init))]
+    (when (and init (not= :var-decl (:ir init)))
+      (fail! init "for-loop initializer must be a declaration"))
+    (when (and init (nil? decl-vars))
+      (fail! init "for-loop pattern declarations are not supported"))
+    (let [loop-names (set (map :name decl-vars))
+          ctx (-> ctx
+                  (update :mutable #(apply disj % loop-names))
+                  (update :captured #(apply disj % loop-names)))
+          _ (doseq [v decl-vars]
+              (when (mutable/assigns? (:body s) (:name v))
+                (fail! (:body s) (str "assignment to for-loop variable "
+                                      (:name v) " is not supported"))))
+          {:keys [ctx brk cont]} (loop-ctx s ctx labels)
+          bindings (vec (mapcat (fn [v]
+                                  [(symbol (:name v))
+                                   (when (:init v) (emit-expr (:init v) ctx))])
+                                decl-vars))
+          new-vals (map (fn [v]
+                          (let [u (some #(let [r (updater-new-value % loop-names ctx)]
+                                           (when (vector? r) r))
+                                        (:updaters loop))]
+                            (or (second u) (symbol (:name v)))))
+                        decl-vars)
+          updaters (keep (fn [u]
+                           (let [r (updater-new-value u loop-names ctx)]
+                             (when (= :expression r) (emit-expr u ctx))))
+                         (:updaters loop))
+          body (emit-loop-body (:body s) ctx)
+          cond (when (:cond loop) (emit-expr (:cond loop) ctx))
+          recur-body (if (seq decl-vars)
+                       (list* 'recur new-vals)
+                       (do-form (concat updaters [(list 'recur)])))
+          form (list* 'loop bindings
+                      (concat (when cont [(list 'vreset! cont false)])
+                              [(list 'when (and-form (guards-form (:guards ctx)) cond)
+                                     body
+                                     (list 'when (guards-form (remove #{cont} (:guards ctx)))
+                                           recur-body))]))]
+      (loop-wrapper (keep identity [brk cont]) form))))
+
+(defn- emit-for-in [s ctx labels]
+  (let [loop (:loop s)
+        v (:var loop)]
+    (when (nil? v)
+      (fail! loop "pattern for-in loops are not supported"))
+    (let [name (:name v)
+          ctx (-> ctx
+                  (update :mutable disj name)
+                  (update :captured disj name))
+          _ (when (mutable/assigns? (:body s) name)
+              (fail! (:body s) (str "assignment to for-in variable " name
+                                    " is not supported")))
+          {:keys [break? continue?]} (jump-info (:body s) labels false)
+          iterable (emit-expr (:iterable loop) ctx)]
+      (if (and (empty? (:guards ctx)) (not break?) (not continue?))
+        (list 'doseq [(symbol name) iterable]
+              (do-form (emit-body-forms (stmt-stmts (:body s)) ctx)))
+        (let [{:keys [ctx brk cont]} (loop-ctx s ctx labels)
+              seq-sym (symbol "d2c$seq")
+              body (emit-loop-body (:body s) (assoc ctx :guards (:guards ctx)))
+              form (list* 'loop [seq-sym (list 'seq iterable)]
+                          (concat (when cont [(list 'vreset! cont false)])
+                                  [(list 'when (and-form (guards-form (:guards ctx)) seq-sym)
+                                         (list 'let [(symbol name) (list 'first seq-sym)]
+                                               body
+                                               (list 'when (guards-form (remove #{cont} (:guards ctx)))
+                                                     (list 'recur (list 'next seq-sym)))))]))]
+          (loop-wrapper (keep identity [brk cont]) form))))))
+
+(defn- loop-stmt? [s] (contains? #{:for :while :do-while} (:ir s)))
+
+(defn- emit-loop [s ctx labels]
+  (case (:ir s)
+    :for (case (:ir (:loop s))
+           :for-in (emit-for-in s ctx labels)
+           :for-parts (emit-for-parts s ctx labels)
+           (fail! s (str "unsupported for loop " (:ir (:loop s)))))
+    :while (emit-while s ctx labels)
+    :do-while (emit-do-while s ctx labels)
+    (fail! s (str "not a loop: " (:ir s)))))
+
+;; ---------------------------------------------------------------------------
+;; switch
+;; ---------------------------------------------------------------------------
 
 (defn- unguard [p]
-  (if (= :guarded-pattern (:ir p))
+  (if (and (map? p) (= :guarded-pattern (:ir p)))
     [(:pattern p) (:when p)]
     [p nil]))
 
-(defn- strip-terminator [stmts c]
+(defn- literal? [l]
+  (or (number? l) (string? l) (boolean? l) (nil? l) (keyword? l)))
+
+(defn- case-terminator
+  "Strip a trailing switch-terminator `break`. Pattern cases never fall
+  through, so they do not require a terminator."
+  [stmts _ctx {:keys [last? pattern-case?]}]
   (let [v (vec stmts)
         last-s (peek v)]
-    (case (:ir last-s)
-      :break (if (:label last-s)
-               (core/fail! c "labeled break is not supported yet")
-               (pop v))
-      :return (core/fail! c "return inside switch is not supported yet")
-      (:throw :rethrow) v
-      (core/fail! c "switch case must end with break/return/throw; fallthrough is unsupported"))))
+    (cond
+      (nil? last-s) v
+      (= :break (:ir last-s))
+      (if (:label last-s)
+        (fail! last-s "labeled break as switch terminator is not supported")
+        (pop v))
+      (contains? #{:return :throw :rethrow :continue} (:ir last-s)) v
+      (or last? pattern-case?) v
+      :else (fail! last-s "switch case must end with break/return/throw/continue"))))
+
+(defn- switch-body [stmts ctx opts]
+  (let [stmts (case-terminator stmts ctx opts)]
+    (do-form (emit-body-forms stmts ctx))))
+
+(defn- switch-clauses
+  "Expand switch cases into {:kind :literal|:pattern ...} clauses plus a
+  default body. Empty cases attach their labels to the next non-empty case."
+  [s ctx]
+  (loop [cs (seq (:cases s)) pending [] out [] default nil]
+    (if-not cs
+      {:clauses (into out (map (fn [l] {:kind :literal :label l :body nil}))
+                      pending)
+       :default default}
+      (let [c (first cs)
+            ir (:ir c)]
+        (cond
+          (contains? #{:switch-case :switch-pattern-case} ir)
+          (let [stmts (:stmts c)
+                pattern (when (= :switch-pattern-case ir) (:pattern c))
+                [p w] (unguard pattern)
+                label (if (= :switch-case ir)
+                        (emit-expr (:expr c) ctx)
+                        (when (= :const-pattern (:ir p))
+                          (emit-expr (:expr p) ctx)))
+                last? (nil? (next cs))
+                body-opts {:last? last? :pattern-case? (= :switch-pattern-case ir)}
+                _ (when (and w (empty? stmts))
+                    (fail! c "guarded empty switch cases cannot share a body"))]
+            (cond
+              (empty? stmts)
+              (recur (next cs) (conj pending label) out default)
+
+              (= :switch-case ir)
+              (recur (next cs) []
+                     (into out (for [l (conj pending label)]
+                                 {:kind :literal :label l
+                                    :body (switch-body stmts ctx body-opts)}))
+                     default)
+
+              (and (= :const-pattern (:ir p)) (nil? w))
+              (recur (next cs) []
+                     (into out (for [l (conj pending label)]
+                                 {:kind :literal :label l
+                                    :body (switch-body stmts ctx body-opts)}))
+                     default)
+
+              :else
+              (let [alts (pattern/alternatives p (symbol "d2c$subj") ctx)
+                    body (switch-body stmts ctx body-opts)]
+                (recur (next cs) []
+                       (into out (map (fn [a]
+                                        {:kind :pattern
+                                         :tests (:tests a)
+                                         :binds (:binds a)
+                                         :guard w
+                                         :body body})
+                                      alts))
+                       default))))
+
+          (= :switch-default ir)
+          (recur (next cs) [] out (switch-body (:stmts c) ctx {:last? (nil? (next cs))}))
+
+          :else
+          (fail! c (str "unsupported switch case " ir)))))))
 
 (defn- emit-switch [s ctx]
-  (let [subject (emit-expr (:expr s) ctx)]
-    (loop [cs (seq (:cases s)) pending [] pairs [] default nil]
-      (if-not cs
-        (let [pairs (into pairs (map (fn [l] [l nil]) pending))
-              labels (map first pairs)
-              literal? (fn [l] (or (number? l) (string? l) (boolean? l)
-                                   (nil? l) (keyword? l)))]
-          (if (every? literal? labels)
-            (list* 'case subject
-                   (concat (mapcat (fn [[l b]] [l b]) pairs) [default]))
-            (list* 'cond
-                   (concat (mapcat (fn [[l b]] [(list '= subject l) b]) pairs)
-                           [:else default]))))
-        (let [c (first cs)
-              ir (:ir c)]
-          (case ir
-            :switch-pattern-case
-            (let [[p w] (unguard (:pattern c))]
-              (when w (core/fail! c "switch pattern guards are not supported yet"))
-              (when-not (= :const-pattern (:ir p))
-                (core/fail! c "only constant switch cases are supported yet"))
-              (let [label (emit-expr (:expr p) ctx)
-                    stmts (:stmts c)]
-                (if (empty? stmts)
-                  (recur (next cs) (conj pending label) pairs default)
-                  (let [body (do-form (emit-body (strip-terminator stmts c) ctx))]
-                    (recur (next cs) []
-                           (into pairs (for [l (conj pending label)] [l body]))
-                           default)))))
+  (let [{:keys [clauses default]} (switch-clauses s ctx)
+        literals? (every? #(= :literal (:kind %)) clauses)
+        subject (emit-expr (:expr s) ctx)]
+    (if (and literals? (every? #(literal? (:label %)) clauses))
+      (list* 'case subject
+             (concat (mapcat (fn [{:keys [label body]}] [label body]) clauses)
+                     [default]))
+      (let [subj (symbol "d2c$subj")
+            clauses' (map (fn [{:keys [kind label tests binds guard body]}]
+                            (case kind
+                              :literal [(list '= subj label) body]
+                              :pattern
+                              (let [test (if (seq tests)
+                                           (list* 'and tests)
+                                           true)
+                                    inner (if guard
+                                            (list 'if (emit-expr guard ctx) body nil)
+                                            body)
+                                    inner (if (seq binds)
+                                            (list 'let (pattern-bind-vec binds ctx) inner)
+                                            inner)]
+                                [(if (= true test) :else test) inner])))
+                          clauses)]
+        (list 'let [subj subject]
+              (if (seq clauses')
+                (list* 'cond (concat (mapcat identity clauses')
+                                     (when default [:else default])))
+                default))))))
 
-            :switch-case
-            (let [label (emit-expr (:expr c) ctx)
-                  stmts (:stmts c)]
-              (if (empty? stmts)
-                (recur (next cs) (conj pending label) pairs default)
-                (let [body (do-form (emit-body (strip-terminator stmts c) ctx))]
-                  (recur (next cs) []
-                         (into pairs (for [l (conj pending label)] [l body]))
-                         default))))
-
-            :switch-default
-            (let [body (do-form (emit-body (:stmts c) ctx))]
-              (recur (next cs) pending pairs body))
-
-            (core/fail! c (str "unsupported switch case " ir))))))))
+;; ---------------------------------------------------------------------------
+;; try / catch
+;; ---------------------------------------------------------------------------
 
 (defn- emit-catch [c ctx]
   (let [ty (if (:exception-type c)
@@ -156,45 +677,113 @@
              'dynamic)
         e (symbol (or (:exception-var c) "_"))
         st (:stack-var c)
-        body (emit-body (:stmts (:body c)) (assoc ctx :catch-exception e))]
+        ctx' (assoc ctx :catch-exception e)
+        body (emit-body-forms (:stmts (:body c)) ctx')]
     (list* 'catch ty e (concat (when st [(symbol st)]) body))))
 
 (defn- emit-try [s ctx]
-  (let [body (emit-body (:stmts (:body s)) ctx)
+  (let [body (emit-body-forms (:stmts (:body s)) ctx)
         catches (map #(emit-catch % ctx) (:catches s))
         fin (:finally s)]
     (list* 'try
            (concat body catches
                    (when fin
-                     [(list* 'finally (emit-body (:stmts fin) ctx))])))))
+                     [(list* 'finally (emit-body-forms (:stmts fin) ctx))])))))
+
+;; ---------------------------------------------------------------------------
+;; pattern statements
+;; ---------------------------------------------------------------------------
+
+(defn- emit-pattern-assign [s ctx]
+  (let [subj (symbol "d2c$pat")
+        alts (pattern/alternatives (:pattern s) subj ctx
+                                   {:structural-tests? false})]
+    (when (not= 1 (count alts))
+      (fail! s "or-patterns are not supported in assignments"))
+    (let [{:keys [tests binds]} (first alts)]
+      (list 'let (into [subj (emit-expr (:expr s) ctx)] [])
+            (do-form
+             (concat
+              (map (fn [t] (list 'assert t)) tests)
+              (map (fn [[n path]]
+                     (core/assign-write {:ir :id :name (name n) :src (:src s)}
+                                        "=" path ctx))
+                   binds)))))))
+
+;; ---------------------------------------------------------------------------
+;; switch expressions
+;; ---------------------------------------------------------------------------
+
+(defn emit-switch-expr [node ctx]
+  (let [subject (emit-expr (:expr node) ctx)
+        subj (symbol "d2c$subj")]
+    (list
+     'let [subj subject]
+     (list* 'cond
+            (mapcat (fn [c]
+                      (let [[p w] (unguard (:pattern c))
+                            alts (pattern/alternatives p subj ctx)]
+                        (mapcat (fn [a]
+                                  (let [tests (:tests a)
+                                        binds (:binds a)
+                                        test (if (seq tests) (list* 'and tests) true)
+                                        body (emit-expr (:expr c) ctx)
+                                        inner (if w
+                                                (list 'if (emit-expr w ctx) body nil)
+                                                body)
+                                        inner (if (seq binds)
+                                                (list 'let (pattern-bind-vec binds ctx) inner)
+                                                inner)]
+                                    [(if (= true test) :else test) inner]))
+                                alts)))
+                    (:cases node))))))
+
+;; ---------------------------------------------------------------------------
+;; statement dispatch
+;; ---------------------------------------------------------------------------
+
+(defn- labeled-loop [s ctx]
+  (let [labels (loop [n s acc #{}]
+                 (if (= :labeled (:ir n))
+                   (recur (:stmt n) (into acc (:labels n)))
+                   [acc n]))
+        [labels inner] labels]
+    (when-not (loop-stmt? inner)
+      (fail! s "labels are only supported on loops"))
+    (emit-loop inner ctx labels)))
 
 (defn emit-stmt
   "Emit one IR statement as a cljd form."
   [s ctx]
   (case (:ir s)
-    :block (do-form (emit-body (:stmts s) ctx))
-    :expr-stmt (emit-expr (:expr s) ctx)
-    :var-decl (first (emit-body [s] ctx))
+    :block (do-form (emit-body-forms (:stmts s) ctx))
+    :expr-stmt (if (= :pattern-assign (:ir (:expr s)))
+                 (emit-pattern-assign (:expr s) ctx)
+                 (core/emit-expr-stmt (:expr s) ctx))
+    :var-decl (first (emit-body [s] (assoc ctx :fn-body? false)))
+    :fn-decl (first (emit-body [s] (assoc ctx :fn-body? false)))
+    :pattern-var-decl-stmt (first (emit-body [s] (assoc ctx :fn-body? false)))
     :if (emit-if s ctx)
-    :for (emit-for s ctx)
+    :for (emit-loop s ctx #{})
+    :while (emit-loop s ctx #{})
+    :do-while (emit-loop s ctx #{})
+    :labeled (labeled-loop s ctx)
     :switch-stmt (emit-switch s ctx)
     :try (emit-try s ctx)
-    :return (core/fail! s "return outside of a function body")
+    :return (if (:tail? ctx)
+              (when (:expr s) (emit-expr (:expr s) ctx))
+              (fail! s "return outside of a function body"))
     :throw (list 'throw (emit-expr (:expr s) ctx))
     :rethrow (if-let [e (:catch-exception ctx)]
                (list 'throw e)
-               (core/fail! s "rethrow outside of a catch clause"))
+               (fail! s "rethrow outside of a catch clause"))
     :assert-stmt (if (:message s)
-                   (list 'assert (emit-expr (:cond s) ctx) (emit-expr (:message s) ctx))
+                   (list 'assert (emit-expr (:cond s) ctx)
+                         (emit-expr (:message s) ctx))
                    (list 'assert (emit-expr (:cond s) ctx)))
+    :pattern-assign (emit-pattern-assign s ctx)
     :empty-stmt nil
-    :break (core/fail! s "break outside a supported switch case")
-    :continue (core/fail! s "continue is not supported yet")
-    :labeled (core/fail! s "labeled statements are not supported yet")
-    :yield (core/fail! s "yield is not supported yet")
-    :fn-decl (core/fail! s "local function declarations are not supported yet")
-    :while (core/fail! s "while loops are not supported yet")
-    :do-while (core/fail! s "do-while loops are not supported yet")
-    :pattern-var-decl-stmt (core/fail! s "pattern declarations are not supported yet")
-    :pattern-assign (core/fail! s "pattern assignments are not supported yet")
-    (core/fail! s (str "unsupported statement " (:ir s)))))
+    :break (fail! s "break outside a supported loop or switch")
+    :continue (fail! s "continue outside a supported loop")
+    :yield (fail! s "generators (yield/async*/sync*) are not supported by ClojureDart")
+    (fail! s (str "unsupported statement " (:ir s)))))

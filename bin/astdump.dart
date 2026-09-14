@@ -371,6 +371,7 @@ String dump(AstNode node, LineInfo li) {
           ':const ${b(p.constKeyword != null)} '
           ':covariant ${b(p.covariantKeyword != null)} '
           ':default ${p.defaultClause == null ? 'nil' : dump(p.defaultClause!.value, li)} '
+          ':required ${b(p.isRequiredNamed)} '
           ':super ${b(p is SuperFormalParameter)} '
           ':this ${b(p is FieldFormalParameter)} '
           ':fn-typed ${p.functionTypedSuffix == null ? 'nil' : '{:type-params ${p.functionTypedSuffix!.typeParameters == null ? 'nil' : vec(p.functionTypedSuffix!.typeParameters!.typeParameters.map((t) => dump(t, li)))} :params ${dump(p.functionTypedSuffix!.formalParameters, li)} :nullable ${b(p.functionTypedSuffix!.question != null)}}'} ');

@@ -21,11 +21,13 @@
 
 (defn- pad [n] (apply str (repeat n " ")))
 
+(declare atom-str)
+
 (def ^:private printable-meta
   "Metadata keys the printer renders. Reader :line/:column and other
   incidental keys are ignored."
   #{:tag :const :async :mutable :getter :setter :abstract :mixin :type-only
-    :private :dynamic :macro-support :builder :override})
+    :private :dynamic :macro-support :builder :override :deprecated})
 
 (defn- meta-prefix
   "Render whitelisted metadata as ^tag / ^:flag prefixes (sorted for
@@ -34,10 +36,17 @@
   (when-let [m (meta x)]
     (apply str
            (for [[k v] (sort-by (comp str key) m)
-                 :when (and v (printable-meta k))]
-             (if (= k :tag)
-               (str "^" v " ")
-               (str "^:" (name k) " "))))))
+                 :when v]
+             (cond
+               (= k :tag) (str "^" v " ")
+               (= k :type-params)
+               (str "^{:type-params ["
+                    (str/join " " (map atom-str v)) "]} ")
+               (= k :dart/annotations)
+               (str "^{:dart/annotations ["
+                    (str/join " " (map pr-str v)) "]} ")
+               (printable-meta k) (str "^:" (name k) " ")
+               :else nil)))))
 
 (defn atom-str
   "Deterministic rendering of an atom (with metadata prefix for symbols)."
@@ -60,6 +69,13 @@
 
     (form/hint? x)
     (str "^" (atom-str (:tag x)) " " (flat (:form x)))
+
+    (form/record-lit? x)
+    (str "#dart ("
+         (str/join " " (map (fn [[n v]]
+                              (if n (str "." n " " (flat v)) (flat v)))
+                            (:fields x)))
+         ")")
 
     (seq? x)
     (str (meta-prefix x) "(" (str/join " " (map flat x)) ")")
@@ -195,10 +211,17 @@
        (str/join "\n" (map #(pp % (+ indent 2)) (rest x))) ")"))
 
 (defn- pp-cond [x indent]
-  (let [[head & clauses] x]
+  (let [[head & clauses] x
+        lines (loop [cs clauses out []]
+                (if (empty? cs)
+                  out
+                  (if (next cs)
+                    (recur (nnext cs) (conj out (pair-line (first cs)
+                                                           (second cs)
+                                                           (+ indent 2))))
+                    (recur nil (conj out (pp (first cs) (+ indent 2)))))))]
     (str (pad indent) "(" head
-         (str/join "" (map (fn [[c r]] (str "\n" (pair-line c r (+ indent 2))))
-                           (partition 2 clauses)))
+         (str/join "" (map #(str "\n" %) lines))
          ")")))
 
 (defn- pp-case [x indent]
@@ -266,6 +289,21 @@
         (str (pad indent) "(" head-str "\n"
              (str/join "\n" ls))))))
 
+(defn- pp-deftype [x indent]
+  (let [[head name fields & body] x
+        lines (loop [es (seq body) out []]
+                (if-not es
+                  out
+                  (let [e (first es)]
+                    (if (and (keyword? e) (next es))
+                      (recur (nnext es)
+                             (conj out (pair-line e (second es) (+ indent 2))))
+                      (recur (next es) (conj out (pp e (+ indent 2))))))))]
+    (str (pad indent) "(" head " " (flat name) "\n"
+         (pp fields (+ indent 2))
+         (str/join "" (map #(str "\n" %) lines))
+         ")")))
+
 (defn- pp-seq [x indent]
   (let [h (when (symbol? (first x)) (name (first x)))
         prefix (meta-prefix x)
@@ -280,6 +318,7 @@
                "do" (pp-do x indent)
                "cond" (pp-cond x indent)
                "case" (pp-case x indent)
+               "deftype" (pp-deftype x indent)
                "try" (pp-try x indent)
                "catch" (pp-catch x indent)
                ("->" "->>" "some->" "some->>" "doto") (pp-thread x indent)
@@ -295,13 +334,14 @@
     ;; these always use their multi-line layout, even when short
     (and (seq? x)
          (symbol? (first x))
-         (contains? #{"ns" "defn" "defn-" "defmacro"} (name (first x))))
+         (contains? #{"ns" "defn" "defn-" "defmacro" "deftype"} (name (first x))))
     (pp-seq x indent)
 
     (fits? x indent) (str (pad indent) (flat x))
     (form/hint? x) (let [tag (atom-str (:tag x))]
                      (str (pad indent) "^" tag " "
                           (str/triml (pp (:form x) (+ indent 1 (count tag) 1)))))
+    (form/record-lit? x) (str (pad indent) (flat x))
     (seq? x) (pp-seq x indent)
     (vector? x) (hang "[" (seq x) "]" indent (inc indent))
     (form/set-lit? x) (hang "#{" (:elems x) "}" indent (+ indent 2))

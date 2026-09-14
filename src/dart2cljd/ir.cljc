@@ -56,6 +56,7 @@
    [:const :scalar]
    [:covariant :scalar]
    [:default :child]
+   [:required :scalar]
    [:super :scalar]
    [:this :scalar]
    [:fn-typed :fn-suffix]])
