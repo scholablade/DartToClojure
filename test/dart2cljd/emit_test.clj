@@ -82,8 +82,8 @@
            "p37_static_index" "(get m/Colors.red 500)"
            "p38_static_call" "(m/BorderRadius.circular 8)"
            "p39_static_chain" "m/Colors.grey.shade300"
-           "p40_lambda" "(fn [a] (+ a 1))"
-           "p41_lambda_block" "(fn [a] (+ a 1))"
+            "p40_lambda" "(fn [^int a] (+ a 1))"
+            "p41_lambda_block" "(fn [^int a] (+ a 1))"
            "p43_throw_expr" "(or x (throw (StateError \"boom\")))"
            "p44_cascade" "(doto (m/Point 1 2) (.-x! 3) (.-y! 4))"
            "p45_cascade_call" "(doto list (.add 1) (.add 2))"
@@ -123,17 +123,17 @@
 
 (deftest statement-parity
   (doseq [[name expected]
-          {"s_if" "(defn s_if [a]\n  (when (> a 0) (print \"pos\")))"
-           "s_if_else" "(defn s_if_else [a]\n  (if (> a 0) (print \"pos\") (print \"neg\")))"
-           "s_else_if" "(defn s_else_if [a]\n  (cond (> a 0) (print \"pos\") (< a 0) (print \"neg\") :else (print \"zero\")))"
+          {"s_if" "(defn s_if [^int a]\n  (when (> a 0) (print \"pos\")))"
+           "s_if_else" "(defn s_if_else [^int a]\n  (if (> a 0) (print \"pos\") (print \"neg\")))"
+           "s_else_if" "(defn s_else_if [^int a]\n  (cond (> a 0) (print \"pos\") (< a 0) (print \"neg\") :else (print \"zero\")))"
            "s_for_in" "(defn s_for_in [xs]\n  (doseq [x xs] (print x)))"
-           "s_switch" "(defn s_switch [x]\n  (case x 1 (print \"one\") 2 (print \"2or3\") 3 (print \"2or3\") (print \"other\")))"
+           "s_switch" "(defn s_switch [^int x]\n  (case x 1 (print \"one\") 2 (print \"2or3\") 3 (print \"2or3\") (print \"other\")))"
            "s_try" "(defn s_try []\n  (try (print 1) (catch StateError e st (print e)) (catch dynamic e (print e)) (finally (print 2))))"
-           "s_return" "(defn s_return [a]\n  (+ a 1))"
-           "s_expr_body" "(defn s_expr_body [a]\n  (* a 2))"
+           "s_return" "(defn s_return [^int a]\n  (+ a 1))"
+           "s_expr_body" "(defn s_expr_body [^int a]\n  (* a 2))"
            "s_vars" "(defn s_vars []\n  (let [a 1 b 2] (print (+ a b))))"
-           "s_assert" "(defn s_assert [a]\n  (assert (> a 0) \"positive\"))"
-           "s_nested_block" "(defn s_nested_block [a]\n  (print a))"
+           "s_assert" "(defn s_assert [^int a]\n  (assert (> a 0) \"positive\"))"
+           "s_nested_block" "(defn s_nested_block [^int a]\n  (print a))"
            "s_await" "(defn ^:async s_await [f]\n  (await f))"}]
     (testing name
       (is (= expected (emit-defn-str name))))))

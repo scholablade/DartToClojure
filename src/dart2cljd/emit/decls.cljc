@@ -228,6 +228,7 @@
                                m (assoc ctx :params (:params m)))
         body (cond
                (:abstract m) (if concrete-stubs? [(abstract-stub)] [])
+               (= :setter (:kind m)) (conj (vec body) nil)
                :else body)]
     (with-annotations
      (list* (method-symbol m ctx) (into ['this] params) body)
@@ -311,10 +312,36 @@
                             [(:name p) (symbol (:name p))]))]
     (merge by-decl by-list by-param)))
 
+(defn- ctor-defn-name
+  "Ns-level make-fn name for a constructor, tagged with the class as return
+  type when the class is not generic (so locals bound to constructor calls
+  are statically typed, which makes Dart convert int literals for `double`
+  fields)."
+  [d cname async]
+  (let [sym (core/ctor-symbol-for (:name d) cname)
+        sym (if (seq (keep :name (:type-params d)))
+              sym
+              (vary-meta sym assoc :tag (symbol (:name d))))]
+    (with-async sym async)))
+
+(defn- fill-field-formal-types
+  "Field-formal parameters (`this.x`) carry no type in the Dart AST; copy the
+  declared field type onto them so the make-fn parameter gets its `^Type`
+  hint."
+  [ctor fields]
+  (let [field-types (into {} (keep (fn [f] (when (:type f) [(:name f) (:type f)])))
+                          fields)]
+    (mapv (fn [p]
+            (if (and (:this p) (nil? (:type p)) (contains? field-types (:name p)))
+              (assoc p :type (get field-types (:name p)))
+              p))
+          (:params ctor))))
+
 (defn- emit-ctor [d ctor fields ctx]
   (let [class (:name d)
         cname (:name ctor)
-        params (:params ctor)
+        params (fill-field-formal-types ctor fields)
+        ctor' (assoc ctor :params params)
         ctx (update ctx :locals set/union (set (keep :name params)))
         shape (:super-shape d)
         super-values (when shape
@@ -327,24 +354,22 @@
         redirect (some #(when (= :redirect-init (:ir %)) %) (:initializers ctor))]
     (cond
       redirect
-      (let [{:keys [params]} (core/emit-callable ctor (assoc ctx :params params))
+      (let [{:keys [params]} (core/emit-callable ctor' ctx)
             target (core/ctor-symbol-for class (:name redirect))]
         [(with-annotations
-          (list 'defn (core/ctor-symbol-for class cname) params
+          (list 'defn (ctor-defn-name d cname nil) params
                 (list* target (core/emit-args (:args redirect) ctx)))
           ctor)])
 
       (:factory ctor)
-      (let [{:keys [params body async]} (core/emit-callable
-                                         ctor (assoc ctx :params params))]
+      (let [{:keys [params body async]} (core/emit-callable ctor' ctx)]
         [(with-annotations
-          (list* 'defn (with-async (core/ctor-symbol-for class cname) async)
+          (list* 'defn (ctor-defn-name d cname async)
                  params body)
           ctor)])
 
       :else
-      (let [{:keys [params body async]} (core/emit-callable
-                                         ctor (assoc ctx :params params))
+      (let [{:keys [params body async]} (core/emit-callable ctor' ctx)
             this (symbol "this")
             all-fields (concat field-names
                                (when shape (map super-field-name (:keys shape))))
@@ -361,7 +386,7 @@
                    []
                    body)]
         [(with-annotations
-          (list 'defn (with-async (core/ctor-symbol-for class cname) async)
+          (list 'defn (ctor-defn-name d cname async)
                 params
                 (list* 'let (into field-bindings [this ctor-call])
                        (concat (map #(list 'assert

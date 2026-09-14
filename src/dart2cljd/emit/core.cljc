@@ -18,6 +18,7 @@
     :class-name  current class (for bare static references in methods)
     :unit-info   whole-unit class/typedef/getter table built by emit.decls
     :type-vars   type parameters in scope (kept bare in type positions)
+    :local-types map of local name -> unit class name, from dart2cljd.typeinfo
 
   Anything not representable fails loudly via `fail!` with the source
   position; no placeholder markers are emitted."
@@ -25,7 +26,8 @@
             [clojure.string :as str]
             [dart2cljd.alias :as alias]
             [dart2cljd.form :as form]
-            [dart2cljd.mutable :as mutable]))
+            [dart2cljd.mutable :as mutable]
+            [dart2cljd.typeinfo :as typeinfo]))
 
 (declare emit-expr emit-increment type-symbol)
 
@@ -46,11 +48,12 @@
           :captured #{}
           :fields #{}
           :locals #{}
+          :local-types {}
           :type-vars #{}}
          (select-keys opts [:mode :emit-body :emit-stmt :emit-switch-expr
                             :mutable :captured :fields :locals :static-names
                             :class-name :unit-info :type-vars :this-sym
-                            :instance-methods :instance-getters
+                            :local-types :instance-methods :instance-getters
                             :instance-setters])))
 
 ;; ---------------------------------------------------------------------------
@@ -158,13 +161,26 @@
 ;; parameters
 ;; ---------------------------------------------------------------------------
 
+(def ^:private param-hint-types
+  "Dart scalar types emitted as `^Type` metadata on cljd fn parameters.
+  They are required so that Dart int literals reaching `double` slots are
+  converted at the static call boundary, matching Dart's implicit
+  int-literal-to-double conversion (dynamic calls would fail at runtime)."
+  #{"int" "double" "num" "bool" "String"})
+
 (defn param-symbol
   "cljd binding symbol for a Dart formal parameter (after renaming, when the
-  parameter is a reassigned local). Type annotations are not emitted: the
-  generated code relies on ClojureDart's dynamic member resolution, and
-  hints would break when a Dart type has no cljd counterpart."
+  parameter is a reassigned local). Scalar Dart types are emitted as `^Type`
+  hints; other types are left unhinted, since an unresolvable cljd type hint
+  would break compilation."
   [p rename _ctx]
-  (symbol (get rename (:name p) (:name p))))
+  (let [s (symbol (get rename (:name p) (:name p)))
+        ty (:type p)
+        n (when (and (= :named-type (:ir ty)) (nil? (:prefix ty)))
+            (str (:name ty)))]
+    (if (and (contains? param-hint-types n) (not (:nullable ty)))
+      (vary-meta s assoc :tag (symbol n))
+      s)))
 
 (defn emit-params
   "Dart formal parameter list -> cljd fn parameter vector.
@@ -229,6 +245,9 @@
             ctx' (assoc ctx
                         :mutable (:mutable info)
                         :captured (:captured info)
+                        :local-types (typeinfo/local-types
+                                      (:block body)
+                                      (get-in ctx [:unit-info :classes]))
                         :locals (set/union (:locals ctx) (:declared info)))
             body-forms ((:emit-body ctx') stmts (assoc ctx' :fn-body? true))
             bindings (vec (mapcat (fn [n]
@@ -456,6 +475,42 @@
 (defn- strip-paren [node]
   (if (= :paren (:ir node)) (recur (:expr node)) node))
 
+(def ^:private operator-call-names
+  "Dart binary operators that can be user-defined, as cljd method names.
+  `^`, `~` and `~/` are emitted as string member names because they are not
+  readable as Clojure symbols in that position."
+  {"==" "==" "!=" "!=" "<" "<" ">" ">" "<=" "<=" ">=" ">="
+   "+" "+" "-" "-" "*" "*" "/" "/" "%" "%" "~/" "~/"
+   "&" "&" "|" "|" "^" "^" "<<" "<<" ">>" ">>" ">>>" ">>>"})
+
+(def ^:private string-member-ops #{"^" "~" "~/"})
+
+(defn- operator-method-symbol [m]
+  (if (contains? string-member-ops m) m (symbol m)))
+
+(defn- bare-operator [op]
+  (if (and (string? op) (str/ends-with? op "=")) (subs op 0 (dec (count op))) op))
+
+(defn- user-op-form
+  "`(. receiver op argument)` when `op` (possibly compound) names a
+  user-overloadable operator, else nil."
+  [receiver op argument]
+  (when-let [m (get operator-call-names (bare-operator op))]
+    (list '. receiver (operator-method-symbol m) argument)))
+
+(defn- local-class-receiver
+  "Class name when `node` is an identifier known to hold an instance of a
+  class declared in this unit (see dart2cljd.typeinfo)."
+  [node ctx]
+  (let [n (strip-paren node)]
+    (when (= :id (:ir n))
+      (get (:local-types ctx) (:name n)))))
+
+(defn- emit-user-operator [node ctx]
+  (let [m (get operator-call-names (:op node))]
+    (list '. (emit-expr (:lhs node) ctx) (operator-method-symbol m)
+          (emit-expr (:rhs node) ctx))))
+
 (defn- flatten-same [op node ctx]
   (let [n (strip-paren node)]
     (if (and (= :binary (:ir n)) (= op (:op n)))
@@ -465,6 +520,10 @@
 (defn- emit-binary [node ctx]
   (let [op (:op node)]
     (cond
+      (and (local-class-receiver (:lhs node) ctx)
+           (contains? operator-call-names op))
+      (emit-user-operator node ctx)
+
       (= op "%")
       (list '. (emit-expr (:lhs node) ctx) (symbol "%") (emit-expr (:rhs node) ctx))
 
@@ -476,8 +535,12 @@
 (defn- emit-prefix [node ctx]
   (case (:op node)
     "!" (list 'not (emit-expr (:operand node) ctx))
-    "-" (list '- (emit-expr (:operand node) ctx))
-    "~" (list 'bit-not (emit-expr (:operand node) ctx))
+    "-" (if (local-class-receiver (:operand node) ctx)
+          (list (symbol ".unary-") (emit-expr (:operand node) ctx))
+          (list '- (emit-expr (:operand node) ctx)))
+    "~" (if (local-class-receiver (:operand node) ctx)
+          (list '. (emit-expr (:operand node) ctx) "~")
+          (list 'bit-not (emit-expr (:operand node) ctx)))
     ("++" "--") (emit-increment node ctx true)
     (fail! node (str "unsupported prefix operator " (:op node)))))
 
@@ -503,6 +566,18 @@
       :id
       (let [n (:name target)]
         (cond
+          (contains? (:local-types ctx) n)
+          (do
+            (when (contains? (:mutable ctx) n)
+              (fail! node (str "increment/decrement of reassigned class-typed local "
+                               n " is not supported")))
+            (let [form (user-op-form (symbol n) (:op node) 1)]
+              (if prefix?
+                (list 'set! (symbol n) form)
+                (list 'let [(symbol "d2c$old") (symbol n)]
+                      (list 'set! (symbol n) form)
+                      (symbol "d2c$old")))))
+
           (contains? (:mutable ctx) n)
           (let [write (list (if (contains? (:captured ctx) n) 'swap! 'vswap!)
                             (symbol n) op)]
@@ -540,13 +615,24 @@
       (contains? (:mutable ctx) n)
       (let [setter (if (contains? (:captured ctx) n) 'swap! 'vswap!)
             resetter (if (contains? (:captured ctx) n) 'reset! 'vreset!)
-            d (list 'deref (symbol n))]
+            d (list 'deref (symbol n))
+            m (when (contains? (:local-types ctx) n)
+                (get operator-call-names (bare-operator op)))]
         (case op
           nil (list resetter (symbol n) rhs)
           "??" (list 'if (list 'nil? d) (list resetter (symbol n) rhs) d)
           "&&" (list 'if d (list resetter (symbol n) rhs) d)
           "||" (list 'if d d (list resetter (symbol n) rhs))
-          (list setter (symbol n) (compound-fn op) rhs)))
+          (if m
+            (list setter (symbol n)
+                  (list 'fn ['d2c$a 'd2c$b]
+                        (list '. 'd2c$a (operator-method-symbol m) 'd2c$b))
+                  rhs)
+            (list setter (symbol n) (compound-fn op) rhs))))
+
+      (and (contains? (:local-types ctx) n)
+           (contains? operator-call-names (bare-operator op)))
+      (list 'set! (symbol n) (user-op-form (symbol n) op rhs))
 
       (contains? (get-in ctx [:unit-info :top-setters]) n)
       (list (symbol (str "set-" n "!")) rhs)
@@ -793,14 +879,29 @@
                (list 'get target index)))
     :cascade (emit-cascade node ctx)))
 
+(def ^:private literal-ir?
+  "True for IR nodes that are always compile-time literals."
+  #(contains? #{:int-lit :double-lit :string-lit :bool-lit :null-lit} (:ir %)))
+
+(defn- const-record?
+  "A record literal whose fields are all literals is `:dart/const` in
+  ClojureDart (bound records are inlined, so the upstream record-type
+  rendering bug is not hit). Records with computed fields are wrapped in
+  `cljd.core/identity` because ClojureDart's `write-type` crashes on the
+  positional/named field types it itself builds for non-const records."
+  [node]
+  (every? #(literal-ir? (:expr %)) (:fields node)))
+
 (defn- emit-expr-coll [node ctx]
   (case (:ir node)
-    :record-lit (form/record-lit
-                 (map (fn [f]
-                        (case (:ir f)
-                          :record-pos-field [nil (emit-elem (:expr f) ctx)]
-                          :record-named-field [(:name f) (emit-elem (:expr f) ctx)]))
-                      (:fields node)))
+    :record-lit
+    (let [rec (form/record-lit
+               (map (fn [f]
+                      (case (:ir f)
+                        :record-pos-field [nil (emit-elem (:expr f) ctx)]
+                        :record-named-field [(:name f) (emit-elem (:expr f) ctx)]))
+                    (:fields node)))]
+      (if (const-record? node) rec (list 'cljd.core/identity rec)))
     :list-lit (emit-list node ctx)
     :set-lit (emit-set node ctx)
     :map-lit (emit-map node ctx)

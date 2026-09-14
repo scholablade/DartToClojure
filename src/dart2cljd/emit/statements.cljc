@@ -199,18 +199,19 @@
     (let [s (first stmts)
           rest-stmts (next stmts)
           g (guard-test ctx)
+          guard #(if g (list 'when g %) %)
           recur-seq #(emit-guarded-seq % ctx)]
       (case (:ir s)
         (:var-decl :fn-decl :pattern-var-decl-stmt)
         (let [[decls more] (split-with decl? stmts)
               form (decl-run-form decls (when (seq more) [(recur-seq more)]) ctx)]
-          (if g (list 'if g nil form) form))
+          (guard form))
 
         :return
-        (let [sets (list 'do
-                         (list 'vreset! (:result ctx)
-                               (when (:expr s) (emit-expr (:expr s) ctx)))
-                         (list 'vreset! (:done ctx) true))]
+        (let [sets (guard (list 'do
+                                (list 'vreset! (:result ctx)
+                                      (when (:expr s) (emit-expr (:expr s) ctx)))
+                                (list 'vreset! (:done ctx) true)))]
           (if-let [inner (recur-seq rest-stmts)]
             (list 'do sets inner)
             sets))
@@ -220,7 +221,7 @@
                     (get (:break-syms ctx) l)
                     (:break-sym ctx))]
           (when-not sym (fail! s "break outside a supported loop"))
-          (let [form (list 'vreset! sym true)]
+          (let [form (guard (list 'vreset! sym true))]
             (if-let [inner (recur-seq rest-stmts)]
               (list 'do form inner)
               form)))
@@ -230,16 +231,15 @@
                     (get (:continue-syms ctx) l)
                     (:continue-sym ctx))]
           (when-not sym (fail! s "continue outside a supported loop"))
-          (let [form (list 'vreset! sym true)]
+          (let [form (guard (list 'vreset! sym true))]
             (if-let [inner (recur-seq rest-stmts)]
               (list 'do form inner)
               form)))
 
-        (let [form (emit-stmt s (assoc ctx :tail? false))]
+        (let [form (guard (emit-stmt s (assoc ctx :tail? false)))]
           (if-let [inner (recur-seq rest-stmts)]
-            (let [body (list 'do form inner)]
-              (if g (list 'when g body) body))
-            (if g (list 'when g form) form)))))))
+            (list 'do form inner)
+            form))))))
 
 (defn- emit-body-forms [stmts ctx]
   (if (seq (:guards ctx))
