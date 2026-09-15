@@ -29,7 +29,8 @@
             [dart2cljd.alias :as alias]
             [dart2cljd.emit.core :as core]
             [dart2cljd.emit.statements :as st]
-            [dart2cljd.idiomatic :as idiomatic]))
+            [dart2cljd.idiomatic :as idiomatic]
+            [dart2cljd.typeinfo :as typeinfo]))
 
 (defn ctx-for
   "Build an emission context for a unit (options may carry :aliases)."
@@ -183,6 +184,9 @@
   (merge (assoc ctx
                 :class-name class-name
                 :fields (set (map :name fields))
+                :scalar-fields (set (for [f fields
+                                          :when (typeinfo/scalar-type? (:type f))]
+                                      (:name f)))
                 :static-names statics
                 :type-vars (set type-vars)
                 :this-sym 'this)
@@ -665,11 +669,40 @@
                                            (= :method (:kind m)))]
                             (:name m)))}))
 
+(defn- own-operators [d]
+  (for [m (:members d)
+        :when (and (= :method (:ir m)) (:operator m))]
+    [(str (:name m)) (count (:params m))]))
+
+(defn- operator-classes
+  "Map [op arity] -> vector of unit class names declaring (or inheriting)
+  that operator, in declaration order. Used for runtime `dart/is?` dispatch
+  when an operator receiver's type is not statically known."
+  [unit]
+  (let [classes (filter #(contains? #{:class :enum} (:ir %)) (:decls unit))
+        by-name (into {} (map (juxt :name identity)) classes)
+        with-inherited (fn with-inherited
+                         ([d] (with-inherited d #{}))
+                         ([d seen]
+                          (when-not (contains? seen (:name d))
+                            (let [sup (some-> d :extends :name str (get by-name))]
+                              (concat (own-operators d)
+                                      (when sup
+                                        (with-inherited sup (conj seen (:name d)))))))))]
+    (reduce (fn [acc d]
+              (reduce (fn [acc [op arity]]
+                        (update acc [op arity] (fnil conj []) (:name d)))
+                      acc
+                      (distinct (with-inherited d))))
+            {}
+            classes)))
+
 (defn- unit-info [unit]
   {:classes (into {}
                   (for [d (:decls unit)
                         :when (contains? #{:class :enum} (:ir d))]
                     [(:name d) (class-unit-info d)]))
+   :operator-classes (operator-classes unit)
    :typedefs (into {}
                    (for [d (:decls unit)
                          :when (= :type-alias (:ir d))]

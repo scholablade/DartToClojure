@@ -50,6 +50,10 @@
 (deftest loops
   (g/loops))
 
+(deftest dynamic-operator-dispatch
+  (is (= "Point(3.0, 3.0)"
+         (str (g/addAny (g/Point-make 1) (g/Point-make 2))))))
+
 (deftest async-work
   (is (= 6 (await (g/work 5)))))
 

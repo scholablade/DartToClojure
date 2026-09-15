@@ -64,6 +64,10 @@ int fib(int n) {
   return fib(n - 1) + fib(n - 2);
 }
 
+// Untyped parameters: the receiver type is not statically known, so the
+// translation must guard operator dispatch at runtime.
+Point addAny(a, b) => a + b;
+
 void loops() {
   var sum = 0;
   for (var i = 0; i < 10; i++) {

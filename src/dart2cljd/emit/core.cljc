@@ -18,7 +18,9 @@
     :class-name  current class (for bare static references in methods)
     :unit-info   whole-unit class/typedef/getter table built by emit.decls
     :type-vars   type parameters in scope (kept bare in type positions)
-    :local-types map of local name -> unit class name, from dart2cljd.typeinfo
+    :local-types {:classes map of local name -> unit class name,
+                  :scalars set of names known to be Dart scalars}, from
+                 dart2cljd.typeinfo (unit-info :classes feeds it)
 
   Anything not representable fails loudly via `fail!` with the source
   position; no placeholder markers are emitted."
@@ -260,7 +262,8 @@
                         :captured (:captured info)
                         :local-types (typeinfo/local-types
                                       (:block body)
-                                      (get-in ctx [:unit-info :classes]))
+                                      (get-in ctx [:unit-info :classes])
+                                      params)
                         :locals (set/union (:locals ctx) (:declared info)))
             body-forms ((:emit-body ctx') stmts (assoc ctx' :fn-body? true))
             bindings (vec (mapcat (fn [n]
@@ -529,18 +532,112 @@
   (when-let [m (get operator-call-names (bare-operator op))]
     (list '. receiver (operator-method-symbol m) argument)))
 
-(defn- local-class-receiver
+(defn- local-class-name
   "Class name when `node` is an identifier known to hold an instance of a
   class declared in this unit (see dart2cljd.typeinfo)."
   [node ctx]
   (let [n (strip-paren node)]
     (when (= :id (:ir n))
-      (get (:local-types ctx) (:name n)))))
+      (get-in (:local-types ctx) [:classes (:name n)]))))
+
+(defn- local-class-receiver [node ctx]
+  (local-class-name node ctx))
+
+(defn- scalar-receiver?
+  "True when `node` is an identifier known to be a Dart scalar: a scalar
+  local/parameter or an implicit-this field of scalar type."
+  [node ctx]
+  (let [n (strip-paren node)]
+    (and (= :id (:ir n))
+         (or (contains? (get-in (:local-types ctx) [:scalars]) (:name n))
+             (contains? (:scalar-fields ctx) (:name n))))))
 
 (defn- emit-user-operator [node ctx]
   (let [m (get operator-call-names (:op node))]
     (list '. (emit-expr (:lhs node) ctx) (operator-method-symbol m)
           (emit-expr (:rhs node) ctx))))
+
+(def ^:private guarded-binary-ops
+  "User-overloadable operators whose fallback is a plain cljd/numeric form,
+  so an unknown receiver needs a runtime `dart/is?` dispatch guard. `==`/`!=`
+  are excluded: cljd `=` already falls back to Dart `==` (IEquiv fallback)."
+  #{"+" "-" "*" "/" "~/" "%" "&" "|" "^" "<<" ">>" ">>>"})
+
+(def ^:private guarded-prefix-ops #{"-" "~"})
+
+(defn- operator-candidates
+  "Unit classes declaring operator `op` with `arity` (0 unary, 1 binary), in
+  declaration order (from dart2cljd.emit.decls' unit-info)."
+  [ctx op arity]
+  (get-in ctx [:unit-info :operator-classes [op arity]]))
+
+(defn- type-symbol-for [class ctx]
+  (type-symbol {:ir :named-type :prefix nil :name class
+                :type-args [] :nullable false}
+               ctx))
+
+(defn- plain-binary-form
+  "Two-argument fallback for an overloadable operator. No same-operator
+  flattening here: guarded operands are pre-bound locals."
+  [op ctx a b]
+  (if (= op "%")
+    (if (= :idiomatic (:mode ctx))
+      (list 'mod a b)
+      (list '. a (symbol "%") b))
+    (list (binary-ops op) a b)))
+
+(defn- unknown-id-receiver?
+  "True when `node` is an identifier whose type is not known (not a unit
+  class, not a scalar). Guards are restricted to identifiers: guarding
+  arbitrary expressions would add `dart/is?` checks to ordinary numeric
+  arithmetic (e.g. `(+ (fib (- n 1)) …)`)."
+  [node ctx]
+  (let [n (strip-paren node)]
+    (and (= :id (:ir n))
+         (not (local-class-receiver n ctx))
+         (not (scalar-receiver? n ctx)))))
+
+(defn- guard-binary? [node ctx]
+  (and (contains? guarded-binary-ops (:op node))
+       (seq (operator-candidates ctx (:op node) 1))
+       (unknown-id-receiver? (:lhs node) ctx)))
+
+(defn- emit-guarded-binary
+  "Runtime dispatch for an operator whose receiver type is unknown:
+  `(let [d2c$a A d2c$b B] (if (dart/is? d2c$a C1) (. d2c$a + d2c$b) … fallback))`."
+  [node ctx]
+  (let [a 'd2c$a b 'd2c$b
+        method (operator-method-symbol (get operator-call-names (:op node)))
+        fallback (plain-binary-form (:op node) ctx a b)
+        chain (reduce (fn [else class]
+                        (list 'if
+                              (list 'dart/is? a (type-symbol-for class ctx))
+                              (list '. a method b)
+                              else))
+                      fallback
+                      (reverse (operator-candidates ctx (:op node) 1)))]
+    (list 'let [a (emit-expr (:lhs node) ctx)
+                b (emit-expr (:rhs node) ctx)]
+          chain)))
+
+(defn- guard-prefix? [node ctx]
+  (and (contains? guarded-prefix-ops (:op node))
+       (seq (operator-candidates ctx (:op node) 0))
+       (unknown-id-receiver? (:operand node) ctx)))
+
+(defn- emit-guarded-prefix [node ctx]
+  (let [a 'd2c$a
+        unary? (= "-" (:op node))
+        user-form (if unary? (list '.unary- a) (list '. a "~"))
+        fallback (if unary? (list '- a) (list 'bit-not a))
+        chain (reduce (fn [else class]
+                        (list 'if
+                              (list 'dart/is? a (type-symbol-for class ctx))
+                              user-form
+                              else))
+                      fallback
+                      (reverse (operator-candidates ctx (:op node) 0)))]
+    (list 'let [a (emit-expr (:operand node) ctx)] chain)))
 
 (defn- flatten-same [op node ctx]
   (let [n (strip-paren node)]
@@ -555,6 +652,9 @@
            (contains? operator-call-names op))
       (emit-user-operator node ctx)
 
+      (guard-binary? node ctx)
+      (emit-guarded-binary node ctx)
+
       (= op "%")
       (if (= :idiomatic (:mode ctx))
         (list 'mod (emit-expr (:lhs node) ctx) (emit-expr (:rhs node) ctx))
@@ -568,12 +668,18 @@
 (defn- emit-prefix [node ctx]
   (case (:op node)
     "!" (list 'not (emit-expr (:operand node) ctx))
-    "-" (if (local-class-receiver (:operand node) ctx)
+    "-" (cond
+          (local-class-receiver (:operand node) ctx)
           (list (symbol ".unary-") (emit-expr (:operand node) ctx))
-          (list '- (emit-expr (:operand node) ctx)))
-    "~" (if (local-class-receiver (:operand node) ctx)
+          (guard-prefix? node ctx)
+          (emit-guarded-prefix node ctx)
+          :else (list '- (emit-expr (:operand node) ctx)))
+    "~" (cond
+          (local-class-receiver (:operand node) ctx)
           (list '. (emit-expr (:operand node) ctx) "~")
-          (list 'bit-not (emit-expr (:operand node) ctx)))
+          (guard-prefix? node ctx)
+          (emit-guarded-prefix node ctx)
+          :else (list 'bit-not (emit-expr (:operand node) ctx)))
     ("++" "--") (emit-increment node ctx true)
     (fail! node (str "unsupported prefix operator " (:op node)))))
 
@@ -599,7 +705,7 @@
       :id
       (let [n (:name target)]
         (cond
-          (contains? (:local-types ctx) n)
+          (contains? (get-in (:local-types ctx) [:classes]) n)
           (do
             (when (contains? (:mutable ctx) n)
               (fail! node (str "increment/decrement of reassigned class-typed local "
@@ -657,7 +763,7 @@
       (let [setter (if (contains? (:captured ctx) n) 'swap! 'vswap!)
             resetter (if (contains? (:captured ctx) n) 'reset! 'vreset!)
             d (list 'deref (symbol n))
-            m (when (contains? (:local-types ctx) n)
+            m (when (contains? (get-in (:local-types ctx) [:classes]) n)
                 (get operator-call-names (bare-operator op)))]
         (case op
           nil (list resetter (symbol n) rhs)
@@ -681,7 +787,7 @@
           "||" (list 'if d d (list 'reset! a rhs))
           (list 'swap! a (compound-fn op) rhs)))
 
-      (and (contains? (:local-types ctx) n)
+      (and (contains? (get-in (:local-types ctx) [:classes]) n)
            (contains? operator-call-names (bare-operator op)))
       (list 'set! (symbol n) (user-op-form (symbol n) op rhs))
 

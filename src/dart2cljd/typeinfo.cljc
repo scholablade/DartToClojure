@@ -3,9 +3,12 @@
 
   Records which locals are known to hold instances of classes declared in
   the current unit, e.g. `final p = Point(1, 2);` or typed declarations
-  `Point p = ...`. The emitter uses this to call Dart operators as cljd
-  interop method calls (`(.+ a b)`), because ClojureDart's numeric
-  functions do not dispatch to user-defined operators.
+  `Point p = ...`, and which locals are known to be Dart scalars
+  (`int`/`double`/`num`/`bool`/`String` declarations and literal
+  initializers). The emitter uses this both to call Dart operators as cljd
+  interop method calls (`(.+ a b)`), because ClojureDart's numeric functions
+  do not dispatch to user-defined operators, and to skip runtime type-guard
+  dispatch for receivers that cannot be unit classes.
 
   Like dart2cljd.mutable the analysis is purely syntactic and
   over-approximates shadowing scopes (a name bound in an inner scope may
@@ -13,6 +16,20 @@
 
   No type information beyond the current unit is needed, so no resolution
   pass is required.")
+
+(def ^:private scalar-type-names
+  #{"int" "double" "num" "bool" "String"})
+
+(def ^:private literal-irs
+  #{:int-lit :double-lit :string-lit :bool-lit :null-lit})
+
+(defn scalar-type?
+  "True when a normalized type node names a Dart scalar type."
+  [ty]
+  (and (map? ty)
+       (= :named-type (:ir ty))
+       (nil? (:prefix ty))
+       (contains? scalar-type-names (str (:name ty)))))
 
 (defn- strip-paren [node]
   (if (= :paren (:ir node)) (recur (:expr node)) node))
@@ -54,24 +71,37 @@
         nil))))
 
 (defn local-types
-  "Map of local name -> class name for locals constructed from unit classes.
+  "Map of local name -> unit class name for locals constructed from unit
+  classes, plus the set of locals known to be scalars.
 
-  `classes` is the unit-info `:classes` map (class name -> info map)."
-  [block classes]
-  (let [types (volatile! {})]
+  `classes` is the unit-info `:classes` map (class name -> info map) and
+  `params` the function parameters (`:type` carries scalar declarations).
+  Returns {:classes {name class} :scalars #{name}}."
+  [block classes params]
+  (let [types (volatile! {})
+        scalars (volatile! #{})]
+    (doseq [p params]
+      (if-let [c (unit-class (:type p) classes)]
+        (vswap! types assoc (:name p) c)
+        (when (scalar-type? (:type p))
+          (vswap! scalars conj (:name p)))))
     (letfn [(scan [n]
               (cond
                 (map? n)
                 (case (:ir n)
                   :var-decl
                   (doseq [v (:vars n)]
-                    (when-let [c (or (unit-class (:type v) classes)
-                                     (init-class (:init v) @types classes))]
-                      (vswap! types assoc (:name v) c)))
+                    (if-let [c (or (unit-class (:type v) classes)
+                                   (init-class (:init v) @types classes))]
+                      (vswap! types assoc (:name v) c)
+                      (when (or (scalar-type? (:type v))
+                                (contains? literal-irs
+                                           (:ir (strip-paren (:init v)))))
+                        (vswap! scalars conj (:name v)))))
                   (:fn :fn-decl) nil
                   (doseq [v (vals (dissoc n :ir :src :annotations))]
                     (scan v)))
 
                 (coll? n) (doseq [v n] (scan v))))]
       (scan block)
-      @types)))
+      {:classes @types :scalars @scalars})))

@@ -99,6 +99,9 @@
         (do (vreset! d2c$result (+ (fib (- n 1)) (fib (- n 2)))) (vreset! d2c$done true))))
     (deref d2c$result)))
 
+(defn addAny [a b]
+  (let [d2c$a a d2c$b b] (if (dart/is? d2c$a Point) (. d2c$a + d2c$b) (+ d2c$a d2c$b))))
+
 (defn loops []
   (let [sum (volatile! 0)]
     (let [d2c$brk (volatile! false)
