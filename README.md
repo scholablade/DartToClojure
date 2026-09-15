@@ -101,7 +101,10 @@ class Point {
 become builder fns, `StatefulWidget`+`State` pairs become one fn with state
 atoms subscribed through `f/widget :watch`, `.child`/`.body`/`.home` chains of
 three or more widgets are threaded by `f/widget`, and `%` uses `mod`.
-Unrecognized widget shapes fall back to the faithful `deftype` output.
+Constructor `key` params are kept (the builder fn takes `.key` and wraps in
+`KeyedSubtree`), and every `setState` bumps a hidden tick atom, so callbacks
+that write no state atom still rebuild. Unrecognized widget shapes fall back
+to the faithful `deftype` output.
 
 ```dart
 class Greeting extends StatelessWidget {
@@ -189,7 +192,5 @@ These are deliberate and recorded with their probe evidence in
 - Non-const records are wrapped in `cljd.core/identity` (upstream compiler bug).
 - User-operator dispatch at call sites uses a syntactic local-type pass; types
   flowing through arbitrary expressions fall back to numeric operators.
-- Idiomatic `key` constructor params are dropped; rebuilds are driven by state
-  atom swaps, so a `setState` that writes no state does not rebuild.
 - Mutability/type analyses are name-based and over-approximate shadowing
   (worst case: an unnecessary `volatile!` box).
