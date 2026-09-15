@@ -1,0 +1,51 @@
+(ns verify.checks
+  "Runtime checks for the corpus translations compiled by this project.
+
+  `verify.gen.m3` is the dart2cljd translation of `corpus/m3.dart`; these tests
+  assert the translated code behaves like the Dart original at runtime,
+  including the async path. They run under `flutter test`, driven by the one
+  `clj -M:cljd test verify.checks` invocation of the gate (see `make verify`).
+
+  `verify.main` is required, without an alias, so that same invocation also
+  compiles every generated corpus namespace (main requires them all). Test
+  namespaces are renamed by the compiler, which leaves bogus imports in the
+  generated `lib/` Dart; the harness strips those before `dart analyze`
+  (RESEARCH M5.6)."
+  (:require [cljd.test :refer [deftest is]]
+            [verify.main]
+            [verify.gen.m3 :as g]))
+
+(deftest fib
+  (is (= 5 (g/fib 5)))
+  (is (= 0 (g/fib 0)))
+  (is (= 1 (g/fib 2))))
+
+(deftest operators
+  (let [p (g/Point-new 1 2)
+        q (g/Point-make 1)]
+    (is (= "Point(1.0, 2.0)" (str p)))
+    (is (= "Point(2.0, 3.0)" (str (. p + q))))
+    (is (= "Point(-1.0, -2.0)" (str (.unary- p))))))
+
+(deftest fields-and-setters
+  (let [p (g/Point-new 1 2)]
+    (.-x! p 3)
+    (.-norm! p 4)
+    (is (= 4.0 (.-x p)))
+    (is (= 32.0 (.-norm p)))
+    (is (= "Point(4.0, 4.0)" (str p)))))
+
+(deftest statics-and-enums
+  (is (= "Point(0.0, 0.0)" (str g/Point-zero)))
+  (is (= "Point(3.0, 3.0)" (str (g/Point-make 3))))
+  (is (= "red" (.-name g/Color-red)))
+  (is (= 0 (.-index g/Color-red)))
+  (is (= 2 (.-value g/Suit-hearts)))
+  (is (= 3 (count g/Color-values)))
+  (is (= 1 g/oldName)))
+
+(deftest loops
+  (g/loops))
+
+(deftest async-work
+  (is (= 6 (await (g/work 5)))))

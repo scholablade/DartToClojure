@@ -1,0 +1,8 @@
+.dart_tool/
+.cpcache/
+.clojuredart/
+REPL.lock
+lib/
+test/cljd-out/
+src/verify/gen/
+src/verify/main.cljd

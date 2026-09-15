@@ -10,4 +10,5 @@
          :exec-fn cognitect.test-runner.api/test}
   :kondo {:deps {clj-kondo/clj-kondo {:mvn/version "2025.06.05"}}
           :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"]}
-  :run {:main-opts ["-m" "dart2cljd.api"]}}}
+  :run {:main-opts ["-m" "dart2cljd.api"]}
+  :verify {:main-opts ["-m" "dart2cljd.verify"]}}}

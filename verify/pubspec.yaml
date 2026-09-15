@@ -1,0 +1,19 @@
+name: cljd_verify
+description: "dart2cljd verification gate: compiles corpus translations with the real ClojureDart compiler and runs them."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  test: ^1.25.6
+
+flutter:
+  uses-material-design: true

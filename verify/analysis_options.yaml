@@ -1,0 +1,5 @@
+# The generated Dart under lib/cljd-out and test/cljd-out already carries
+# `// ignore_for_file:` headers written by the ClojureDart compiler; this
+# project therefore uses default lints. `make verify` analyses each generated
+# file directly and fails on any reported issue.
+{analyzer: {exclude: [build/**]}}
