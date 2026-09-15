@@ -11,17 +11,22 @@
             [dart2cljd.printer :as printer]))
 
 (def ^:private pairs
-  "fixture name -> paths (edn in, cljd golden out)."
-  {"m3" ["test/fixtures/m3.edn" "corpus/m3.cljd"]})
+  "fixture name -> {:in edn :out cljd :opts emission options}."
+  {"m3" {:in "test/fixtures/m3.edn"
+         :out "corpus/m3.cljd"
+         :opts {:path "m3.dart"}}
+   "idiomatic" {:in "test/fixtures/idiomatic.edn"
+                :out "corpus/idiomatic.cljd"
+                :opts {:path "idiomatic.dart" :mode :idiomatic}}})
 
 (defn- emit-fixture [name]
-  (let [[in _] (pairs name)
+  (let [{:keys [in opts]} (pairs name)
         doc (ast/normalize-doc (edn/read-string (slurp (io/file in))))]
-    (printer/print-forms (decls/emit-unit (:unit doc) {:path (str name ".dart")}))))
+    (printer/print-forms (decls/emit-unit (:unit doc) opts))))
 
 (defn -main [& [cmd]]
   (if (= "regen" cmd)
-    (doseq [[name [_ out]] pairs]
+    (doseq [[name {:keys [out]}] pairs]
       (io/make-parents out)
       (spit (io/file out) (str (emit-fixture name) "\n"))
       (println "wrote" out))

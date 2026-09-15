@@ -184,6 +184,16 @@
          (str/join "\n" (map #(pp % (+ indent 2)) body))
          ")")))
 
+(defn- pp-letfn [x indent]
+  (let [[head bindings & body] x
+        b-indent (+ indent (count (str "(" head " [")))
+        bind-str (str/join "\n" (map #(pp % b-indent) bindings))]
+    (str (pad indent) "(" head " ["
+         (str/triml bind-str)
+         "]\n"
+         (str/join "\n" (map #(pp % (+ indent 2)) body))
+         ")")))
+
 (defn- pp-fn [x indent]
   (let [[head & more] x
         [fname more] (if (symbol? (first more))
@@ -310,8 +320,9 @@
         body (case h
                ("defn" "defn-" "defmacro" "defmethod") (pp-defn x indent)
                "def" (pp-def x indent)
-               ("let" "letfn" "loop" "when-let" "when-some" "if-let" "if-some")
+               ("let" "loop" "when-let" "when-some" "if-let" "if-some")
                (pp-let x indent)
+               "letfn" (pp-letfn x indent)
                ("fn" "fn*") (pp-fn x indent)
                ("if" "if-not") (pp-if x indent)
                ("when" "when-not") (pp-when x indent)

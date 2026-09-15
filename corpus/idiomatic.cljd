@@ -1,0 +1,64 @@
+(ns idiomatic
+  (:require
+   ["package:flutter/material.dart" :as m]
+   [cljd.flutter :as f]))
+
+(defn Greeting [^String .name]
+  (f/widget
+    :context context
+    (m/Padding .padding (m/EdgeInsets.all 8))
+    m/Center
+    (m/DecoratedBox .decoration (m/BoxDecoration))
+    (m/Text (str "Hello " name))))
+
+(defn Counter [^String .title]
+  (let [count (atom 0)
+        step (atom 1)]
+    (letfn [(increment [] (swap! count + (deref step)))
+            (doubled [] (* (deref count) 2))
+            ^:async (ping [] (await (Future.delayed (Duration .seconds 1))) (swap! count inc))]
+      (f/widget
+        :watch [_ count _ step]
+        :context context
+        (m/Scaffold
+          .appBar (m/AppBar .title (m/Text title))
+          .floatingActionButton
+            (m/FloatingActionButton
+              .onPressed (fn [] (swap! count + 2))
+              .child (m/Icon m/Icons.add)))
+        .body m/Center
+        (m/Text (str "Count: " (deref count) " (" (doubled) ")"))))))
+
+(defn Banner []
+  (f/widget :context context (m/Center .child (m/Text "banner"))))
+
+(defn Page []
+  (f/widget
+    :context context
+    (m/MaterialApp
+      .title "Demo"
+      .theme (m/ThemeData .primarySwatch m/Colors.blue)
+      .home (Counter .title "Counter"))))
+
+(deftype Legacy
+  []
+  :type-only true
+  :extends m/StatelessWidget
+  Legacy
+  (^:getter ^int answer [this] 42)
+  (^m/Widget build [this context] (m/Text "legacy")))
+
+(defn ^Legacy Legacy-new []
+  (let [this (Legacy)] this))
+
+(deftype Plain
+  [^:mutable ^int value]
+  :type-only true
+  Plain
+  (^int double [this] (* value 2)))
+
+(defn ^Plain Plain-new [^int value]
+  (let [this (Plain value)] this))
+
+(defn modulo [^int a ^int b]
+  (mod a b))

@@ -11,6 +11,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
+            [clojure.tools.cli :refer [parse-opts]]
             [dart2cljd.alias :as alias]
             [dart2cljd.ast :as ast]
             [dart2cljd.emit.core :as core]
@@ -146,13 +147,24 @@
     (convert-doc doc (assoc opts :path path))))
 
 (defn -main
-  "Minimal CLI: read a Dart file or stdin and print cljd."
+  "Minimal CLI: read a Dart file or stdin and print cljd.
+
+  Flags: --idiomatic/-i (Flutter sugar), --faithful (default), --width N."
   [& args]
-  (let [path (first args)
-        code (if (and path (not= path "-"))
-               (slurp path)
-               (slurp *in*))
-        out (if (and path (not= path "-"))
-              (convert-file path)
-              (convert code))]
-    (println out)))
+  (let [{:keys [options arguments errors]}
+        (parse-opts args
+                    [["-i" "--idiomatic" "Idiomatic mode (Flutter sugar)"]
+                     [nil "--faithful" "Faithful mode (default)"]
+                     ["-w" "--width N" "Printer line width"
+                      :parse-fn #(Integer/parseInt %)]])]
+    (when (seq errors)
+      (binding [*out* *err*] (run! println errors))
+      (System/exit 1))
+    (let [path (first arguments)
+          opts (cond-> {}
+                 (:idiomatic options) (assoc :mode :idiomatic)
+                 (:width options) (assoc :width (:width options)))
+          out (if (and path (not= path "-"))
+                (apply convert-file path (mapcat identity opts))
+                (apply convert (slurp *in*) (mapcat identity opts)))]
+      (println out))))

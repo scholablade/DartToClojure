@@ -28,7 +28,8 @@
             [clojure.string :as str]
             [dart2cljd.alias :as alias]
             [dart2cljd.emit.core :as core]
-            [dart2cljd.emit.statements :as st]))
+            [dart2cljd.emit.statements :as st]
+            [dart2cljd.idiomatic :as idiomatic]))
 
 (defn ctx-for
   "Build an emission context for a unit (options may carry :aliases)."
@@ -36,6 +37,7 @@
   (core/ctx aliases
             (assoc (select-keys opts [:unit-info :class-name :type-vars])
                    :mode mode
+                   :flutter-alias (alias/flutter-alias aliases)
                    :emit-body st/emit-body
                    :emit-stmt st/emit-stmt
                    :emit-switch-expr st/emit-switch-expr)))
@@ -683,16 +685,39 @@
                        (:name d)))})
 
 (defn emit-unit
-  "Normalized :unit IR -> vector of top-level forms, ns first."
-  [unit {:keys [ns path aliases] :as opts}]
+  "Normalized :unit IR -> vector of top-level forms, ns first.
+
+  In :idiomatic mode, recognized Flutter widget classes are emitted as
+  builder fns and `cljd.flutter` is added to the requires."
+  [unit {:keys [ns path aliases mode] :as opts}]
   (let [info (unit-info unit)
+        idiomatic? (= :idiomatic mode)
+        plan (if idiomatic?
+               (idiomatic/plan unit)
+               {:widgets {} :consumed #{}})
+        info (assoc info :widget-fns (:widgets plan))
         local-names (set (keys (:classes info)))
         aliases (or aliases (unit-aliases unit (assoc opts :local-names local-names)))
         base-ctx (ctx-for aliases (assoc opts :unit-info info))
         ns-name (or ns (some-> (library-name unit) symbol) (path->ns path) 'main)
         requires (alias/require-clauses
                   (filter #(= :import (:ir %)) (:directives unit)))
+        ;; cljd.flutter is a cljd namespace, not a Dart library: it must be
+        ;; required as a symbol (string requires are resolved by the Dart
+        ;; analyzer and would fail with "Can't find Dart lib").
+        requires (if (and idiomatic?
+                          (not-any? #(= "cljd.flutter" (str (first %))) requires))
+                   (conj requires
+                         [(symbol "cljd.flutter")
+                          :as (symbol (alias/flutter-alias aliases))])
+                   requires)
         ns-form (list* 'ns ns-name
                        (when (seq requires)
                          [(list* :require requires)]))]
-    (into [ns-form] (mapcat #(emit-decl % base-ctx) (:decls unit)))))
+    (into [ns-form]
+          (mapcat (fn [d]
+                    (if-let [w (get-in plan [:widgets (:name d)])]
+                      (idiomatic/emit-widget w base-ctx)
+                      (when-not (contains? (:consumed plan) (:name d))
+                        (emit-decl d base-ctx))))
+                  (:decls unit)))))

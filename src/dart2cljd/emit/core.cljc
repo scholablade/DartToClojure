@@ -54,7 +54,8 @@
                             :mutable :captured :fields :locals :static-names
                             :class-name :unit-info :type-vars :this-sym
                             :local-types :instance-methods :instance-getters
-                            :instance-setters])))
+                            :instance-setters :atom-fields :state-ctx
+                            :flutter-alias :thread-props])))
 
 ;; ---------------------------------------------------------------------------
 ;; unit info helpers (local classes, statics, typedefs)
@@ -141,8 +142,20 @@
       (fail! node (str "unsupported type annotation " (:ir node))))))
 
 (defn- ctor-symbol [ctor ctx]
-  (let [base (type-symbol (:type ctor) ctx)]
-    (if-let [n (:name ctor)]
+  (let [t (:type ctor)
+        ;; `const Foo.named(...)` parses in parse-only mode as a NamedType
+        ;; whose :prefix is the class and whose :name is the constructor,
+        ;; e.g. {:prefix "EdgeInsets" :name "all"}. Library prefixes are
+        ;; known to the alias table, so they are not mistaken for classes.
+        qualified-parse? (and (nil? (:name ctor))
+                              (:prefix t)
+                              (not (alias/import-prefix? (:prefix t) (:aliases ctx)))
+                              (alias/class-name? (:prefix t)))
+        base (if qualified-parse?
+               (alias/qualify (:prefix t) (:aliases ctx))
+               (type-symbol t ctx))
+        n (or (:name ctor) (when qualified-parse? (:name t)))]
+    (if n
       (symbol (str base "." n))
       base)))
 
@@ -420,9 +433,24 @@
       (contains? (get-in ctx [:unit-info :top-fns]) n)
       (contains? (get-in ctx [:unit-info :top-getters]) n)
       (contains? (get-in ctx [:unit-info :top-setters]) n)
+      (contains? (get-in ctx [:unit-info :widget-fns]) n)
       (contains? alias/core-symbols n)
       (contains? (:referred (:aliases ctx)) n)
       (alias/import-prefix? n (:aliases ctx))))
+
+(defn- widget-fn-info
+  "Emission info for a class emitted as an idiomatic widget builder fn."
+  [ctx class]
+  (get-in ctx [:unit-info :widget-fns (str class)]))
+
+(defn- drop-widget-args
+  "Remove named constructor arguments this widget builder does not accept
+  (currently `key`)."
+  [ctx class args]
+  (let [drops (:drop-args (widget-fn-info ctx class))]
+    (if (seq drops)
+      (vec (remove #(and (:name %) (contains? drops (:name %))) args))
+      args)))
 
 (defn- emit-fn-call
   "Unqualified call: `foo(...)` (top-level function, constructor, static
@@ -430,6 +458,9 @@
   [node ctx]
   (let [n (:name node)]
     (cond
+      (contains? (get-in ctx [:unit-info :widget-fns]) (str n))
+      (list* (symbol (str n)) (emit-args (drop-widget-args ctx n (:args node)) ctx))
+
       (and (local-class? n ctx) (known-ctor? n nil ctx))
       (list* (ctor-symbol-for n nil) (emit-args (:args node) ctx))
 
@@ -525,7 +556,9 @@
       (emit-user-operator node ctx)
 
       (= op "%")
-      (list '. (emit-expr (:lhs node) ctx) (symbol "%") (emit-expr (:rhs node) ctx))
+      (if (= :idiomatic (:mode ctx))
+        (list 'mod (emit-expr (:lhs node) ctx) (emit-expr (:rhs node) ctx))
+        (list '. (emit-expr (:lhs node) ctx) (symbol "%") (emit-expr (:rhs node) ctx)))
 
       (contains? binary-ops op)
       (list* (binary-ops op) (flatten-same op node ctx))
@@ -586,6 +619,14 @@
               (list 'let [(symbol "d2c$old") (list 'deref (symbol n))]
                     write (symbol "d2c$old"))))
 
+          (contains? (:atom-fields ctx) n)
+          (let [a (get (:atom-fields ctx) n)
+                write (list 'swap! a op)]
+            (if prefix?
+              write
+              (list 'let [(symbol "d2c$old") (list 'deref a)]
+                    write (symbol "d2c$old"))))
+
           :else
           (let [write (list 'set! (symbol n) (list op (symbol n)))]
             (if prefix?
@@ -629,6 +670,16 @@
                         (list '. 'd2c$a (operator-method-symbol m) 'd2c$b))
                   rhs)
             (list setter (symbol n) (compound-fn op) rhs))))
+
+      (contains? (:atom-fields ctx) n)
+      (let [a (get (:atom-fields ctx) n)
+            d (list 'deref a)]
+        (case op
+          nil (list 'reset! a rhs)
+          "??" (list 'if (list 'nil? d) (list 'reset! a rhs) d)
+          "&&" (list 'if d (list 'reset! a rhs) d)
+          "||" (list 'if d d (list 'reset! a rhs))
+          (list 'swap! a (compound-fn op) rhs)))
 
       (and (contains? (:local-types ctx) n)
            (contains? operator-call-names (bare-operator op)))
@@ -832,8 +883,10 @@
       (contains? (:mutable ctx) n) (list 'deref (symbol n))
       (contains? (:static-names ctx) n) (get (:static-names ctx) n)
       (contains? (get-in ctx [:unit-info :top-getters]) n) (list (symbol n))
+      (contains? (get-in ctx [:unit-info :widget-fns]) n) (symbol n)
       (contains? (:locals ctx) n) (symbol n)
       (contains? (:fields ctx) n) (symbol n)
+      (contains? (:atom-fields ctx) n) (list 'deref (get (:atom-fields ctx) n))
       (and (:this-sym ctx)
            (not (known-bare? n ctx)))
       (list (symbol (str ".-" n)) (:this-sym ctx))
@@ -857,19 +910,162 @@
     :this 'this
     :super 'super))
 
+;; ---------------------------------------------------------------------------
+;; idiomatic widget threading (M4)
+;; ---------------------------------------------------------------------------
+
+(def ^:private default-thread-props
+  "Named Dart arguments that f/widget can thread a builder chain through."
+  #{"child" "body" "home"})
+
+(declare thread-arg)
+
+(defn- ctor-node?
+  "A constructor call node: an InstanceCreationExpression, or — in
+  parse-only mode, where imported types are unresolved — a target-less call
+  whose name is class-like."
+  [node ctx]
+  (case (:ir node)
+    :new true
+    :call (and (nil? (:target node))
+               (class-like? (:name node) ctx)
+               (not (alias/import-prefix? (:name node) (:aliases ctx)))
+               (not (contains? (get-in ctx [:unit-info :top-fns])
+                               (str (:name node))))
+               (not (contains? (get-in ctx [:unit-info :top-getters])
+                               (str (:name node)))))
+    false))
+
+(defn- chain-forms
+  "Number of forms in the widget chain rooted at a constructor node."
+  [node ctx]
+  (if-let [{:keys [value]} (thread-arg node ctx)]
+    (inc (chain-forms value ctx))
+    1))
+
+(defn- thread-arg
+  "The named argument to continue a widget chain through: the threadable
+  argument (whose value is a constructor node) with the longest chain; ties
+  go to the last such argument. nil when there is none."
+  [node ctx]
+  (let [props (or (:thread-props ctx) default-thread-props)
+        cands (keep-indexed
+               (fn [i a]
+                 (when (and (:name a) (contains? props (:name a)))
+                   (let [v (strip-paren (:expr a))]
+                     (when (ctor-node? v ctx)
+                       {:index i :arg a :value v}))))
+               (:args node))]
+    (when (seq cands)
+      (apply max-key (fn [{:keys [index value]}]
+                       [(chain-forms value ctx) index])
+             cands))))
+
+(defn- ctor-node-name
+  "Class name a constructor node constructs."
+  [node]
+  (case (:ir node)
+    :new (get-in node [:ctor :type :name])
+    :call (:name node)))
+
+(defn- emit-ctor-head [node ctx]
+  (let [raw (ctor-node-name node)]
+    (cond
+      (contains? (get-in ctx [:unit-info :widget-fns]) (str raw)) (symbol (str raw))
+
+      (local-class? raw ctx)
+      (if (known-ctor? raw (:name (:ctor node)) ctx)
+        (ctor-symbol-for raw (:name (:ctor node)))
+        (fail! node (str raw " has no constructor "
+                         (or (:name (:ctor node)) "new"))))
+
+      :else (case (:ir node)
+              :new (ctor-symbol (:ctor node) ctx)
+              :call (alias/qualify raw (:aliases ctx))))))
+
+(defn- emit-ctor-args [node ctx drop-index]
+  (let [raw (ctor-node-name node)
+        args (:args node)
+        args (if (some? drop-index)
+               (vec (concat (take drop-index args) (drop (inc drop-index) args)))
+               args)]
+    (emit-args (drop-widget-args ctx raw args) ctx)))
+
+(defn- emit-ctor-form
+  "Emit a constructor call, optionally removing the argument at `drop-index`
+  and/or rendering a zero-argument intermediate chain form bare."
+  ([node ctx] (emit-ctor-form node ctx {}))
+  ([node ctx {:keys [drop-index bare?]}]
+   (let [head (emit-ctor-head node ctx)
+         args (emit-ctor-args node ctx drop-index)]
+     (if (and bare? (empty? args))
+       head
+       (list* head args)))))
+
+(defn- emit-chain-tail [node ctx]
+  (let [{:keys [index value arg]} (thread-arg node ctx)]
+    (if value
+      (into [(emit-ctor-form node ctx {:drop-index index :bare? true})
+             (symbol (str "." (:name arg)))]
+            (emit-chain-tail value ctx))
+      [(emit-ctor-form node ctx)])))
+
+(defn- emit-widget-thread
+  "`(f/widget A .body B .child C)` for a chain rooted at `node`."
+  [node ctx]
+  (let [child-prop (symbol ".child")
+        forms (remove #(= child-prop %) (emit-chain-tail node ctx))]
+    (list* (symbol (str (or (:flutter-alias ctx) "f") "/widget")) forms)))
+
+(defn- thread-widget?
+  "True when `node` should be emitted as an f/widget threading form."
+  [node ctx]
+  (and (= :idiomatic (:mode ctx))
+       (ctor-node? node ctx)
+       (>= (chain-forms node ctx) 3)))
+
+(defn- emit-set-state
+  "Evaluate a `setState` callback inline; state writes swap the state atoms."
+  [node ctx]
+  (let [args (:args node)
+        f (some-> args first :expr)
+        body (when (and (= :fn (:ir f)) (empty? (:params f))) (:body f))]
+    (when-not body
+      (fail! node "setState requires a no-argument function literal"))
+    (case (:ir body)
+      :expr-body
+      (let [e (:expr body)]
+        (if (and (contains? #{:postfix :prefix} (:ir e))
+                 (contains? #{"++" "--"} (:op e)))
+          (emit-increment e ctx true)
+          (emit-expr e ctx)))
+
+      :block-body
+      (let [forms ((:emit-body ctx) (:stmts (:block body))
+                   (assoc ctx :fn-body? false))]
+        (cond
+          (empty? forms) nil
+          (= 1 (count forms)) (first forms)
+          :else (list* 'do forms)))
+
+      (fail! node "unsupported setState body"))))
+
 (defn- emit-expr-call [node ctx]
   (case (:ir node)
-    :new (let [ctor (:ctor node)
-               raw (get-in ctor [:type :name])
-               cname (:name ctor)]
-           (if (local-class? raw ctx)
-             (if (known-ctor? raw cname ctx)
-               (list* (ctor-symbol-for raw cname) (emit-args (:args node) ctx))
-               (fail! node (str raw " has no constructor " (or cname "new"))))
-             (list* (ctor-symbol ctor ctx) (emit-args (:args node) ctx))))
-    :call (if (:target node)
-            (emit-chain node ctx)
-            (emit-fn-call node ctx))
+    :new (if (thread-widget? node ctx)
+           (emit-widget-thread node ctx)
+           (emit-ctor-form node ctx))
+    :call (cond
+            (and (:state-ctx ctx)
+                 (nil? (:target node))
+                 (= "setState" (:name node)))
+            (emit-set-state node ctx)
+
+            (:target node) (emit-chain node ctx)
+
+            (thread-widget? node ctx) (emit-widget-thread node ctx)
+
+            :else (emit-fn-call node ctx))
     :prop (emit-chain node ctx)
     :call-fn (list* (emit-expr (:fn node) ctx) (emit-args (:args node) ctx))
     :index (let [target (emit-expr (:target node) ctx)

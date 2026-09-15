@@ -103,6 +103,16 @@
   [p ctx]
   (contains? (:prefix->uri ctx) (str p)))
 
+(defn flutter-alias
+  "Deterministic alias for cljd.flutter in this context: the existing binding
+  when the library is already aliased, otherwise the first free candidate
+  from [\"f\" \"fl\" \"cljd-flutter\"]. Idiomatic mode adds the require."
+  [ctx]
+  (let [prefix->uri (:prefix->uri ctx)]
+    (or (some (fn [[a uri]] (when (= "cljd.flutter" uri) a)) prefix->uri)
+        (first (remove #(contains? prefix->uri %) ["f" "fl"]))
+        "cljd-flutter")))
+
 (defn qualify
   "Resolve a bare Dart identifier to a cljd symbol.
   Referred names and dart:core names stay bare; known import prefixes are
