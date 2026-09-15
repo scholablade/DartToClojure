@@ -11,6 +11,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [clojure.tools.cli :refer [parse-opts]]
             [dart2cljd.alias :as alias]
             [dart2cljd.ast :as ast]
@@ -146,25 +147,167 @@
         doc (ast/normalize-doc (astdump-file path opts) opts)]
     (convert-doc doc (assoc opts :path path))))
 
-(defn -main
-  "Minimal CLI: read a Dart file or stdin and print cljd.
+;; ---------------------------------------------------------------------------
+;; CLI (flag-compatible with DartClojure's `dumch.dartclojure`)
+;; ---------------------------------------------------------------------------
 
-  Flags: --idiomatic/-i (Flutter sugar), --faithful (default), --width N."
+(def ^:private color-cycle
+  ["\u001b[36m" "\u001b[33m" "\u001b[35m" "\u001b[32m" "\u001b[34m"])
+
+(def ^:private ansi-reset "\u001b[0m")
+
+(defn colorize
+  "Deterministic ANSI coloring: strings green, delimiters by nesting depth."
+  [^String s]
+  (let [sb (StringBuilder.)
+        depth (volatile! 0)
+        in-string? (volatile! false)
+        escaped? (volatile! false)]
+    (dotimes [i (.length s)]
+      (let [c (.charAt s i)]
+        (cond
+          @in-string?
+          (do (.append sb c)
+              (cond
+                @escaped? (vreset! escaped? false)
+                (= c \\) (vreset! escaped? true)
+                (= c \") (vreset! in-string? false)))
+
+          (= c \")
+          (do (vreset! in-string? true)
+              (.append sb "\u001b[32m")
+              (.append sb c))
+
+          (#{\( \[ \{} c)
+          (let [color (nth color-cycle (mod @depth (count color-cycle)))]
+            (vswap! depth inc)
+            (.append sb color)
+            (.append sb c))
+
+          (#{\) \] \}} c)
+          (do (vswap! depth dec)
+              (.append sb ansi-reset)
+              (.append sb c))
+
+          :else (.append sb c))))
+    (str sb)))
+
+(defn- boolean-arg [s]
+  (contains? #{"true" "1" "yes"} (str/lower-case (str s))))
+
+(def cli-options
+  [["-r" "--repl BOOLEAN" "REPL mode: read snippets until the end marker"
+    :default false
+    :parse-fn boolean-arg
+    :validate [boolean? "Must be either true or false"]]
+   ["-e" "--end TEXT" "Mode: text marking the end of a REPL snippet"
+    :default ""
+    :parse-fn str]
+   ["-m" "--material MATERIAL" "material require alias"
+    :default "m"
+    :parse-fn str
+    :validate [#(re-matches #"^[A-Za-z][A-Za-z0-9]*$" %)
+               "invalid require alias for material"]]
+   ["-f" "--flutter FLUTTER" "cljd.flutter require alias"
+    :default "f"
+    :parse-fn str
+    :validate [#(re-matches #"^[A-Za-z][A-Za-z0-9]*$" %)
+               "invalid require alias for cljd.flutter"]]
+   ["-c" "--colors BOOLEAN" "colorize output"
+    :default false
+    :parse-fn boolean-arg
+    :validate [boolean? "Must be either true or false"]]
+   ["-i" "--idiomatic" "Idiomatic mode (Flutter sugar)"]
+   [nil "--faithful" "Faithful mode (default)"]
+   ["-w" "--width N" "Printer line width"
+    :default 100
+    :parse-fn #(Integer/parseInt %)
+    :validate [pos? "Must be a positive number"]]
+   [nil "--default-alias ALIAS" "Alias for unresolved Dart types (default \"m\")"
+    :parse-fn str]
+   [nil "--dart PATH" "Dart binary to run the astdump frontend"
+    :parse-fn str]
+   ["-p" "--path PATH" "Path to the Dart file to translate"
+    :parse-fn str]
+   ["-h" "--help"]])
+
+(defn cli-opts
+  "CLI options -> conversion kwargs."
+  [{:keys [material flutter width faithful default-alias dart]} idiomatic?]
+  (cond-> {:material material
+           :flutter flutter
+           :width width
+           :dart dart}
+    (not (nil? default-alias)) (assoc :default-alias default-alias)
+    (and idiomatic? (not faithful)) (assoc :mode :idiomatic)))
+
+(defn- show [s colors] (println (if colors (colorize (str s)) (str s))))
+
+(defn- repl-instructions [end]
+  (println (str "Paste dart code below, press enter"
+                (when (seq end) (str ", write '" end "',"))
+                " and see the result:\n")))
+
+(defn- repl
+  "Read snippets from stdin until `end` and print each translation.
+  Conversion errors are reported and the session continues."
+  [end convert-opts colors]
+  (repl-instructions end)
+  (loop [input (read-line) acc []]
+    (if (nil? input)
+      nil
+      (if (= input end)
+        (do
+          (try
+            (show (apply convert (str/join "\n" acc) (mapcat identity convert-opts)) colors)
+            (catch Exception e
+              (binding [*out* *err*]
+                (println "Can't convert the code; e" (.getMessage e)))))
+          (println)
+          (recur (read-line) []))
+        (recur (read-line) (conj acc input))))))
+
+(defn run-cli
+  "Run the CLI; returns an exit code (0 ok, 1 conversion error, 2 usage)."
+  [args]
+  (let [{:keys [options arguments errors summary]} (parse-opts args cli-options)]
+    (cond
+      errors
+      (do (binding [*out* *err*] (run! println errors)) 1)
+
+      (:help options)
+      (do (println "dart2cljd: deterministic Dart -> ClojureDart translator\n")
+          (println summary)
+          0)
+
+      (:repl options)
+      (do (repl (:end options) (cli-opts options (:idiomatic options)) (:colors options))
+          0)
+
+      :else
+      (let [opts (cli-opts options (:idiomatic options))
+            path (or (:path options) (first arguments))]
+        (if (nil? path)
+          (do (binding [*out* *err*]
+                (println "no arguments passed; use --help for usage"))
+              2)
+          (try
+            (let [out (cond
+                        (= "-" path) (apply convert (slurp *in*) (mapcat identity opts))
+                        (:path options) (apply convert-file path (mapcat identity opts))
+                        :else (apply convert path (mapcat identity opts)))]
+              (show out (:colors options))
+              0)
+            (catch clojure.lang.ExceptionInfo e
+              (binding [*out* *err*] (println (.getMessage e)))
+              1)))))))
+
+(defn -main
+  "dart2cljd CLI: translate Dart code (argument, file or REPL) to ClojureDart.
+
+  Flags mirror DartClojure's CLI (`-r -e -m -f -c -p`) plus `-i/--idiomatic`,
+  `--faithful`, `-w/--width`, `--default-alias`, `--dart`."
   [& args]
-  (let [{:keys [options arguments errors]}
-        (parse-opts args
-                    [["-i" "--idiomatic" "Idiomatic mode (Flutter sugar)"]
-                     [nil "--faithful" "Faithful mode (default)"]
-                     ["-w" "--width N" "Printer line width"
-                      :parse-fn #(Integer/parseInt %)]])]
-    (when (seq errors)
-      (binding [*out* *err*] (run! println errors))
-      (System/exit 1))
-    (let [path (first arguments)
-          opts (cond-> {}
-                 (:idiomatic options) (assoc :mode :idiomatic)
-                 (:width options) (assoc :width (:width options)))
-          out (if (and path (not= path "-"))
-                (apply convert-file path (mapcat identity opts))
-                (apply convert (slurp *in*) (mapcat identity opts)))]
-      (println out))))
+  (let [code (run-cli args)]
+    (when-not (zero? code)
+      (System/exit code))))
