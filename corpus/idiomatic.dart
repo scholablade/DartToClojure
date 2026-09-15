@@ -61,6 +61,28 @@ class BannerState extends State<Banner> {
   Widget build(BuildContext context) => const Center(child: Text('banner'));
 }
 
+class Ticker extends StatefulWidget {
+  const Ticker({super.key});
+  @override
+  State<Ticker> createState() => TickerState();
+}
+
+class TickerState extends State<Ticker> {
+  final StringBuffer buf = StringBuffer();
+  void bump() {
+    setState(() {
+      buf.write('x');
+    });
+  }
+  @override
+  Widget build(BuildContext context) {
+    return TextButton(
+      onPressed: bump,
+      child: Text('ticks: ${buf.length}'),
+    );
+  }
+}
+
 class Page extends StatelessWidget {
   const Page();
   @override

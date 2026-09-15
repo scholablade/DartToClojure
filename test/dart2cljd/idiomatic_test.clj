@@ -38,38 +38,50 @@
 
 (deftest widget-classes-become-fns
   (let [o (out)]
-    (testing "a StatelessWidget becomes a builder fn"
-      (is (re-find #"\(defn Greeting \[\^String \.name\]" o))
+    (testing "a StatelessWidget becomes a builder fn; key stays a parameter"
+      (is (re-find #"\(defn Greeting \[\.key nil \^String \.name\]" o))
       (is (not (re-find #"deftype Greeting" o))))
     (testing "a StatefulWidget + State pair becomes one fn"
-      (is (re-find #"\(defn Counter \[\^String \.title\]" o))
+      (is (re-find #"\(defn Counter \[\.key nil \^String \.title\]" o))
       (is (not (re-find #"deftype Counter|deftype CounterState" o)))
       (is (re-find #"\(defn Banner \[\]" o)))
     (testing "widget classes outside the recognized shapes stay faithful"
       (is (re-find #"\(deftype Legacy" o))
       (is (re-find #"\(deftype Plain" o)))))
 
+(deftest key-params-are-threaded
+  (let [o (out)]
+    (testing "a keyed widget wraps its body in KeyedSubtree"
+      (is (re-find #"\(m/KeyedSubtree\s+\.key key" o)))
+    (testing "a widget without a key constructor param is not wrapped"
+      (is (re-find #"(?s)\(defn Banner \[\]\s+\(f/widget :context context \(m/Center" o)))
+    (testing "named key args survive at call sites"
+      (is (re-find #"\.home \(Counter \.key nil \.title \"Counter\"\)" o)))))
+
 (deftest state-mapping
   (let [o (out)]
     (testing "state fields are atoms bound in a let"
-      (is (re-find #"\(let \[count \(atom 0\)\s+step \(atom 1\)\]" o)))
+      (is (re-find #"\(let \[count \(atom 0\)\s+step \(atom 1\)" o)))
     (testing "every watched atom subscribes the widget"
-      (is (re-find #":watch \[_ count _ step\]" o)))
+      (is (re-find #":watch \[_ count _ step _ d2c\$tick\]" o)))
     (testing "State methods become local fns"
-      (is (re-find #"\(increment \[\] \(swap! count \+ \(deref step\)\)\)" o))
+      (is (re-find #"\(increment \[\] \(do \(swap! count \+ \(deref step\)\) \(swap! d2c\$tick inc\)\)\)" o))
       (is (re-find #"\(doubled \[\] \(\* \(deref count\) 2\)\)" o))
       (is (re-find #"\(doubled\)" o)))
     (testing "async State methods keep ^:async"
-      (is (re-find #"\^:async \(ping \[\] \(await" o)))
+      (is (re-find #"(?s)\^:async \(ping\s+\[\]\s+\(await" o)))
     (testing "setState callbacks are evaluated inline"
-      (is (re-find #"\(fn \[\] \(swap! count \+ 2\)\)" o)))
+      (is (re-find #"\(fn \[\] \(do \(swap! count \+ 2\) \(swap! d2c\$tick inc\)\)\)" o)))
     (testing "widget.<field> resolves to the builder fn parameter"
       (is (re-find #"\(m/Text title\)" o))
       (is (not (re-find #"\.-title widget" o))))))
 
-(deftest call-site-rewrite
-  (testing "in-unit constructor calls become builder fn calls; key is dropped"
-    (is (re-find #"\.home \(Counter \.title \"Counter\"\)" (out)))))
+(deftest set-state-tick
+  (let [o (out)]
+    (testing "a setState writing no state atom still bumps the tick"
+      (is (re-find #"\(bump \[\] \(do \(\.write \(deref buf\) \"x\"\) \(swap! d2c\$tick inc\)\)\)" o)))
+    (testing "the tick atom is watched"
+      (is (re-find #":watch \[_ buf _ d2c\$tick\]" o)))))
 
 ;; ---------------------------------------------------------------------------
 ;; f/widget threading
@@ -109,8 +121,8 @@
 
 (deftest plan-consumes-only-paired-state-classes
   (let [p (idiomatic/plan (:unit @doc))]
-    (is (= #{"Greeting" "Counter" "Banner" "Page"} (set (keys (:widgets p)))))
-    (is (= #{"CounterState" "BannerState"} (:consumed p)))))
+    (is (= #{"Greeting" "Counter" "Banner" "Ticker" "Page"} (set (keys (:widgets p)))))
+    (is (= #{"CounterState" "BannerState" "TickerState"} (:consumed p)))))
 
 (deftest no-sugar-without-flutter
   (testing "a StatefulWidget without a paired State class falls back"

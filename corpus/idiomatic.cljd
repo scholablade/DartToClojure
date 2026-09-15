@@ -3,34 +3,56 @@
    ["package:flutter/material.dart" :as m]
    [cljd.flutter :as f]))
 
-(defn Greeting [^String .name]
-  (f/widget
-    :context context
-    (m/Padding .padding (m/EdgeInsets.all 8))
-    m/Center
-    (m/DecoratedBox .decoration (m/BoxDecoration))
-    (m/Text (str "Hello " name))))
-
-(defn Counter [^String .title]
-  (let [count (atom 0)
-        step (atom 1)]
-    (letfn [(increment [] (swap! count + (deref step)))
-            (doubled [] (* (deref count) 2))
-            ^:async (ping [] (await (Future.delayed (Duration .seconds 1))) (swap! count inc))]
+(defn Greeting [.key nil ^String .name]
+  (m/KeyedSubtree
+    .key key
+    .child
       (f/widget
-        :watch [_ count _ step]
         :context context
-        (m/Scaffold
-          .appBar (m/AppBar .title (m/Text title))
-          .floatingActionButton
-            (m/FloatingActionButton
-              .onPressed (fn [] (swap! count + 2))
-              .child (m/Icon m/Icons.add)))
-        .body m/Center
-        (m/Text (str "Count: " (deref count) " (" (doubled) ")"))))))
+        (m/Padding .padding (m/EdgeInsets.all 8))
+        m/Center
+        (m/DecoratedBox .decoration (m/BoxDecoration))
+        (m/Text (str "Hello " name)))))
+
+(defn Counter [.key nil ^String .title]
+  (m/KeyedSubtree
+    .key key
+    .child
+      (let [count (atom 0)
+            step (atom 1)
+            d2c$tick (atom 0)]
+        (letfn [(increment [] (do (swap! count + (deref step)) (swap! d2c$tick inc)))
+                (doubled [] (* (deref count) 2))
+                ^:async (ping
+                  []
+                  (await (Future.delayed (Duration .seconds 1)))
+                  (do (swap! count inc) (swap! d2c$tick inc)))]
+          (f/widget
+            :watch [_ count _ step _ d2c$tick]
+            :context context
+            (m/Scaffold
+              .appBar (m/AppBar .title (m/Text title))
+              .floatingActionButton
+                (m/FloatingActionButton
+                  .onPressed (fn [] (do (swap! count + 2) (swap! d2c$tick inc)))
+                  .child (m/Icon m/Icons.add)))
+            .body m/Center
+            (m/Text (str "Count: " (deref count) " (" (doubled) ")")))))))
 
 (defn Banner []
   (f/widget :context context (m/Center .child (m/Text "banner"))))
+
+(defn Ticker [.key nil]
+  (m/KeyedSubtree
+    .key key
+    .child
+      (let [buf (atom (StringBuffer))
+            d2c$tick (atom 0)]
+        (letfn [(bump [] (do (.write (deref buf) "x") (swap! d2c$tick inc)))]
+          (f/widget
+            :watch [_ buf _ d2c$tick]
+            :context context
+            (m/TextButton .onPressed bump .child (m/Text (str "ticks: " (.-length (deref buf))))))))))
 
 (defn Page []
   (f/widget
@@ -38,7 +60,7 @@
     (m/MaterialApp
       .title "Demo"
       .theme (m/ThemeData .primarySwatch m/Colors.blue)
-      .home (Counter .title "Counter"))))
+      .home (Counter .key nil .title "Counter"))))
 
 (deftype Legacy
   []

@@ -13,7 +13,10 @@
   (RESEARCH M5.6)."
   (:require [cljd.test :refer [deftest is]]
             [verify.main]
-            [verify.gen.m3 :as g]))
+            [verify.gen.m3 :as g]
+            [verify.gen.idiomatic :as i]
+            ["package:flutter/material.dart" :as m]
+            ["package:flutter_test/flutter_test.dart" :as ft]))
 
 (deftest fib
   (is (= 5 (g/fib 5)))
@@ -49,3 +52,23 @@
 
 (deftest async-work
   (is (= 6 (await (g/work 5)))))
+
+;; ---------------------------------------------------------------------------
+;; idiomatic widget runtime (corpus/idiomatic.dart translation)
+;; ---------------------------------------------------------------------------
+
+(deftest key-params-are-threaded
+  :runner (ft/testWidgets [tester])
+  (let [^ft/WidgetTester {:flds [pumpWidget]} tester]
+    (await (pumpWidget (m/MaterialApp .home (i/Greeting .key (m/ValueKey "g1")
+                                                      .name "Ada"))))
+    (ft/expect (ft/find.text "Hello Ada") ft/findsOneWidget)))
+
+(deftest set-state-without-state-write-rebuilds
+  :runner (ft/testWidgets [tester])
+  (let [^ft/WidgetTester {:flds [pumpWidget tap pump]} tester]
+    (await (pumpWidget (m/MaterialApp .home (i/Ticker .key (m/ValueKey "t1")))))
+    (ft/expect (ft/find.text "ticks: 0") ft/findsOneWidget)
+    (await (tap (ft/find.byType m/TextButton)))
+    (await (pump))
+    (ft/expect (ft/find.text "ticks: 1") ft/findsOneWidget)))

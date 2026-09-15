@@ -1025,30 +1025,39 @@
        (>= (chain-forms node ctx) 3)))
 
 (defn- emit-set-state
-  "Evaluate a `setState` callback inline; state writes swap the state atoms."
+  "Evaluate a `setState` callback inline; state writes swap the state atoms.
+
+  When the widget watches a tick atom (idiomatic state emission), every
+  `setState` additionally bumps it so callbacks that write no state atom still
+  rebuild (RESEARCH M4.4/M5; Flutter coalesces the extra rebuild)."
   [node ctx]
   (let [args (:args node)
         f (some-> args first :expr)
-        body (when (and (= :fn (:ir f)) (empty? (:params f))) (:body f))]
+        body (when (and (= :fn (:ir f)) (empty? (:params f))) (:body f))
+        tick (when-some [t (:tick-atom ctx)] (list 'swap! t 'inc))]
     (when-not body
       (fail! node "setState requires a no-argument function literal"))
-    (case (:ir body)
-      :expr-body
-      (let [e (:expr body)]
-        (if (and (contains? #{:postfix :prefix} (:ir e))
-                 (contains? #{"++" "--"} (:op e)))
-          (emit-increment e ctx true)
-          (emit-expr e ctx)))
+    (let [form (case (:ir body)
+                 :expr-body
+                 (let [e (:expr body)]
+                   (if (and (contains? #{:postfix :prefix} (:ir e))
+                            (contains? #{"++" "--"} (:op e)))
+                     (emit-increment e ctx true)
+                     (emit-expr e ctx)))
 
-      :block-body
-      (let [forms ((:emit-body ctx) (:stmts (:block body))
-                   (assoc ctx :fn-body? false))]
-        (cond
-          (empty? forms) nil
-          (= 1 (count forms)) (first forms)
-          :else (list* 'do forms)))
+                 :block-body
+                 (let [forms ((:emit-body ctx) (:stmts (:block body))
+                              (assoc ctx :fn-body? false))]
+                   (cond
+                     (empty? forms) nil
+                     (= 1 (count forms)) (first forms)
+                     :else (list* 'do forms)))
 
-      (fail! node "unsupported setState body"))))
+                 (fail! node "unsupported setState body"))]
+      (cond
+        (nil? tick) form
+        (nil? form) tick
+        :else (list 'do form tick)))))
 
 (defn- emit-expr-call [node ctx]
   (case (:ir node)

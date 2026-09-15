@@ -11,15 +11,22 @@
   named constructors, mixins, heritage from other unit classes, ...) are
   left to the faithful emitter.
 
-  Documented divergences (deterministic):
-    * `key` constructor parameters are dropped (they only affect identity
-      and are not part of a widget's semantic value);
-    * `setState` callbacks are evaluated inline: rebuilds are triggered by
-      the atom swaps that state writes perform, not by setState itself;
-    * state fields are one atom each; in-place mutation of the object held
-      by an atom does not notify watchers (an assignment does)."
+  Widget identity and rebuilds:
+    * a constructor `key` parameter becomes a `.key` parameter of the builder
+      fn, and the emitted widget is wrapped in `(m/KeyedSubtree .key key …)`
+      (`f/widget :key` would double-wrap through `ValueKey`);
+    * every `setState` call additionally bumps a hidden `d2c$tick` atom which
+      the widget watches, so a callback that writes no state atom (or mutates
+      the object held by one) still rebuilds. The extra atom swap is
+      redundant when the callback does write state atoms; Flutter coalesces
+      the resulting rebuild scheduling.
+
+  Documented divergence (deterministic): state fields are one atom each;
+  in-place mutation of the object held by an atom notifies watchers only
+  through the `setState` tick, not by itself."
   (:refer-clojure :exclude [methods])
-  (:require [dart2cljd.emit.core :as core]))
+  (:require [dart2cljd.alias :as alias]
+            [dart2cljd.emit.core :as core]))
 
 ;; ---------------------------------------------------------------------------
 ;; IR shape helpers
@@ -109,29 +116,41 @@
       (first cs)
       :else nil)))
 
+(defn- keep-key-param
+  "The builder-fn form of a constructor `key` parameter: a `super.key` loses
+  its `:super` flag, and an optional parameter gets an explicit nil default
+  (Dart named params are implicitly nullable; cljd named params are required
+  without a default)."
+  [p]
+  (let [p (dissoc p :super)]
+    (if (and (not (:required p)) (nil? (:default p)))
+      (assoc p :default {:ir :null-lit})
+      p)))
+
 (defn- clean-params
-  "Constructor parameters without framework params (`super.*`) or `key`.
-  Returns {:params [...] :drop-args #{...}} or nil when a dropped parameter
-  cannot be dropped safely at call sites (i.e. it is not named)."
+  "Constructor parameters without framework params (`super.*`), keeping `key`
+  as a plain parameter so widget identity survives (see the ns docstring).
+
+  Returns {:params [...] :drop-args #{...} :key? bool} or nil when a dropped
+  framework parameter cannot be dropped safely at call sites (i.e. it is not
+  named)."
   [ctor]
-  (loop [ps (seq (:params ctor)) out [] drops #{}]
+  (loop [ps (seq (:params ctor)) out [] drops #{} key? false]
     (if-not ps
-      {:params (vec out) :drop-args drops}
+      {:params (vec out) :drop-args drops :key? key?}
       (let [p (first ps)
             n (:name p)
             named? (#{:named} (:kind p))]
         (cond
+          (= "key" n)
+          (recur (next ps) (conj out (keep-key-param p)) drops true)
+
           (:super p)
           (if named?
-            (recur (next ps) out (cond-> drops n (conj n)))
+            (recur (next ps) out (cond-> drops n (conj n)) key?)
             nil)
 
-          (= "key" n)
-          (if named?
-            (recur (next ps) out (conj drops n))
-            nil)
-
-          :else (recur (next ps) (conj out p) drops))))))
+          :else (recur (next ps) (conj out p) drops key?))))))
 
 (defn- find-method [d name]
   (some #(when (= name (:name %)) %) (methods d)))
@@ -248,6 +267,20 @@
     (coll? node) (boolean (some #(references-name? % n) node))
     :else false))
 
+(defn- uses-set-state?
+  "True when the IR contains a target-less `setState(...)` call (the shape
+  `rewrite-state` leaves for `this.setState(...)`)."
+  [node]
+  (cond
+    (map? node)
+    (or (and (= :call (:ir node))
+             (nil? (:target node))
+             (= "setState" (:name node)))
+        (boolean (some uses-set-state?
+                       (vals (dissoc node :ir :src :annotations)))))
+    (coll? node) (boolean (some uses-set-state? node))
+    :else false))
+
 ;; ---------------------------------------------------------------------------
 ;; plan
 ;; ---------------------------------------------------------------------------
@@ -279,7 +312,7 @@
 (defn- stateless-info [d]
   (when (class-shape-ok? d)
     (when-let [ctor (widget-ctor d)]
-      (when-let [{:keys [params drop-args]} (clean-params ctor)]
+      (when-let [{:keys [params drop-args key?]} (clean-params ctor)]
         (when-let [ms (regular-methods d)]
           (let [build (find-method d "build")
                 others (remove #(= "build" (:name %)) ms)
@@ -300,6 +333,7 @@
                        :name (:name d)
                        :params (fill-param-types params fields)
                        :drop-args drop-args
+                       :key? key?
                        :field-inits (vec (filter :init fields))
                        :methods (mapv first rw-methods)
                        :build (first rw-build)
@@ -360,7 +394,7 @@
 (defn- stateful-info [d by-name]
   (when (class-shape-ok? d)
     (when-let [ctor (widget-ctor d)]
-      (when-let [{:keys [params drop-args]} (clean-params ctor)]
+      (when-let [{:keys [params drop-args key?]} (clean-params ctor)]
         (when-let [ms (regular-methods d)]
           (let [create (find-method d "createState")
                 others (remove #(= "createState" (:name %)) ms)
@@ -380,6 +414,7 @@
                    :state-name (:name s)
                    :params (fill-param-types params fields)
                    :drop-args drop-args
+                   :key? key?
                    :field-inits (vec (filter :init fields))
                    :methods (:methods st)
                    :build (:build st)
@@ -463,16 +498,19 @@
 
 (defn emit-widget
   "Emission info from `plan` -> vector of top-level forms (one defn)."
-  [{:keys [name params field-inits methods build context-name state-fields]}
+  [{:keys [name params field-inits methods build context-name state-fields key?]}
    ctx]
   (let [param-names (set (keep :name params))
         method-names (set (map :name methods))
         init-field-names (set (map :name field-inits))
+        tick? (or (some uses-set-state? methods)
+                  (uses-set-state? build))
         atom-fields (into {} (for [f state-fields]
                                [(:name f) (symbol (:name f))]))
         state-ctx (assoc ctx
                          :atom-fields atom-fields
-                         :state-ctx true)
+                         :state-ctx true
+                         :tick-atom (when tick? 'd2c$tick))
         locals (cond-> (into param-names (concat method-names init-field-names))
                  context-name (conj context-name))
         init-ctx (assoc state-ctx :locals param-names)
@@ -486,7 +524,9 @@
                                   [(symbol (:name f))
                                    (list 'atom
                                          (core/emit-expr (:init f) init-ctx))])
-                                state-fields)))
+                                state-fields)
+                        (when tick?
+                          ['d2c$tick (list 'atom 0)])))
         method-ctx (assoc state-ctx :locals locals)
         method-fns (mapv #(emit-method-fn % method-ctx) methods)
         build-ctx (assoc state-ctx :locals locals)
@@ -495,14 +535,19 @@
                            build-ctx))
         directives (vec
                     (concat
-                     (when (seq state-fields)
-                       [:watch (vec (mapcat (fn [f] ['_ (symbol (:name f))])
-                                            state-fields))])
+                     (when (or (seq state-fields) tick?)
+                       [:watch (vec (concat (mapcat (fn [f] ['_ (symbol (:name f))])
+                                                    state-fields)
+                                            (when tick? ['_ 'd2c$tick])))])
                      (when context-name
                        [:context (symbol context-name)])))
-        body (wrap-let init-bindings
-                       (wrap-letfn method-fns
-                                   (wrap-widget ctx directives build-body)))]
+        widget (wrap-let init-bindings
+                         (wrap-letfn method-fns
+                                     (wrap-widget ctx directives build-body)))
+        body (if key?
+               (list (alias/qualify "KeyedSubtree" (:aliases ctx))
+                     '.key 'key '.child widget)
+               widget)]
     [(list* 'defn (symbol name)
             (core/emit-params params {} state-ctx)
             [body])]))
