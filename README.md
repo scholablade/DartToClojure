@@ -190,7 +190,9 @@ These are deliberate and recorded with their probe evidence in
   ClojureDart cannot express them.
 - Dart extensions and extension types fail loudly.
 - Non-const records are wrapped in `cljd.core/identity` (upstream compiler bug).
-- User-operator dispatch at call sites uses a syntactic local-type pass; types
-  flowing through arbitrary expressions fall back to numeric operators.
+- User-operator dispatch uses a syntactic type pass plus `dart/is?` guards for
+  unknown *identifier* receivers; compound assignments and operators on other
+  expression kinds (call results, property accesses) still fall back to
+  numeric/plain operators.
 - Mutability/type analyses are name-based and over-approximate shadowing
   (worst case: an unnecessary `volatile!` box).
