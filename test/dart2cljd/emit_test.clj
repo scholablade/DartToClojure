@@ -38,14 +38,14 @@
 (def m3-doc (delay (fixture "m3.edn")))
 
 (def m3-forms
-  (delay (decls/emit-unit (:unit @m3-doc) {:path "m3.dart"})))
+  (delay (decls/emit-unit (:unit @m3-doc) {:path "corpus/m3.dart"})))
 
 ;; ---------------------------------------------------------------------------
 ;; M3 golden (whole-file faithful translation; regenerate: make golden)
 ;; ---------------------------------------------------------------------------
 
 (deftest m3-golden
-  (testing "test/m3.dart translates byte-identically to the reviewed golden file"
+  (testing "corpus/m3.dart translates byte-identically to the reviewed golden file"
     (is (= (slurp (io/file "corpus/m3.cljd"))
            (str (printer/print-forms @m3-forms) "\n")))))
 

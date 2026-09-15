@@ -16,10 +16,10 @@
           (edn/read-string (slurp (io/resource "fixtures/idiomatic.edn"))))))
 
 (def ^:private forms
-  (delay (decls/emit-unit (:unit @doc) {:path "idiomatic.dart" :mode :idiomatic})))
+  (delay (decls/emit-unit (:unit @doc) {:path "corpus/idiomatic.dart" :mode :idiomatic})))
 
 (def ^:private faithful-forms
-  (delay (decls/emit-unit (:unit @doc) {:path "idiomatic.dart"})))
+  (delay (decls/emit-unit (:unit @doc) {:path "corpus/idiomatic.dart"})))
 
 (defn- out [] (printer/print-forms @forms))
 (defn- faithful-out [] (printer/print-forms @faithful-forms))

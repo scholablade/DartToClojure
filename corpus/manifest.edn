@@ -1,0 +1,9 @@
+;; dart2cljd golden corpus manifest.
+;;
+;; Each entry pairs `corpus/<name>.dart` (Dart input) with
+;; `corpus/<name>.cljd` (reviewed expected translation) and records the
+;; emission mode. `make golden` regenerates the .cljd files from these
+;; entries; `make verify` translates the .dart files and compile-gates the
+;; results with the real ClojureDart compiler.
+[{:name "m3" :mode :faithful}
+ {:name "idiomatic" :mode :idiomatic}]
