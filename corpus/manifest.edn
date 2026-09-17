@@ -1,9 +1,24 @@
 ;; dart2cljd golden corpus manifest.
 ;;
-;; Each entry pairs `corpus/<name>.dart` (Dart input) with
-;; `corpus/<name>.cljd` (reviewed expected translation) and records the
-;; emission mode. `make golden` regenerates the .cljd files from these
-;; entries; `make verify` translates the .dart files and compile-gates the
-;; results with the real ClojureDart compiler.
+;; Each `:file` entry (the default kind) pairs `corpus/<name>.dart` (Dart
+;; input) with `corpus/<name>.cljd` (reviewed expected translation) and
+;; records the emission mode. `make golden` regenerates the .cljd files from
+;; these entries; `make verify` translates the .dart files and compile-gates
+;; the results with the real ClojureDart compiler.
+;;
+;; A `:dir` entry is a whole-tree batch conversion (M6): `:dir` is the Dart
+;; source tree, `:out` the generated cljd tree under verify/src,
+;; `:ns-prefix` the namespace prefix, `:expect-failures` the files that must
+;; fail loudly (so the gate verifies the failure policy too) and `:entry`
+;; the generated file `verify.main` requires.
 [{:name "m3" :mode :faithful}
- {:name "idiomatic" :mode :idiomatic}]
+ {:name "idiomatic" :mode :idiomatic}
+ {:kind :dir
+  :name "batchproj"
+  :dir "test/batchproj/lib"
+  :out "verify/src/verify/gen/batchproj"
+  :ns-prefix "verify.gen.batchproj"
+  :package "batchproj"
+  :mode :faithful
+  :expect-failures ["orphan_part.dart"]
+  :entry "main"}]

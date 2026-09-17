@@ -26,7 +26,8 @@
 
 (defn -main [& [cmd]]
   (if (= "regen" cmd)
-    (doseq [{:keys [name] :as entry} manifest]
+    (doseq [{:keys [name kind] :as entry} manifest
+            :when (= :file (or kind :file))]
       (let [out (io/file "corpus" (str name ".cljd"))]
         (spit out (str (emit-entry entry) "\n"))
         (println "wrote" (.getPath out))))

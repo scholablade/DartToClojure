@@ -15,6 +15,8 @@
             [verify.main]
             [verify.gen.m3 :as g]
             [verify.gen.idiomatic :as i]
+            [verify.gen.batchproj.main :as bp]
+            [verify.gen.batchproj.models.item :as item]
             ["package:flutter/material.dart" :as m]
             ["package:flutter_test/flutter_test.dart" :as ft]))
 
@@ -56,6 +58,20 @@
 
 (deftest async-work
   (is (= 6 (await (g/work 5)))))
+
+;; ---------------------------------------------------------------------------
+;; batch directory conversion runtime (test/batchproj translation, M6)
+;;
+;; `verify.gen.batchproj.main` is the generated `test/batchproj/lib/main.dart`
+;; of the manifest's `:kind :dir` entry; its imports are symbol requires into
+;; the other generated files, so these checks exercise the cross-file paths
+;; (constructor make-fns, statics, type references) at runtime.
+;; ---------------------------------------------------------------------------
+
+(deftest cross-file-project
+  (is (= "Button: widget (3.5)" (bp/describe (item/Item-new "widget" 3.5))))
+  (is (= "item: box" (bp/describeKind)))
+  (is (= 5.0 (bp/hyp 3.0 4.0))))
 
 ;; ---------------------------------------------------------------------------
 ;; idiomatic widget runtime (corpus/idiomatic.dart translation)

@@ -62,6 +62,38 @@ The CLI keeps DartClojure's flag surface, so editor integrations port over:
 | `-w N` | printer line width (default 100) |
 | `--default-alias A` | alias for unresolved Dart types |
 | `--dart PATH` | Dart binary used by the frontend |
+| `--dir DIR` | batch mode: translate a whole Dart source tree |
+| `--out DIR` | batch mode: output directory (required with `--dir`) |
+| `--ns-prefix P` | batch mode: prefix for generated namespaces |
+| `--exclude GLOB` | batch mode: skip files matching GLOB (repeatable) |
+| `--package NAME` | batch mode: Dart package name (default: nearest `pubspec.yaml`) |
+
+### Batch conversion (`--dir`)
+
+```console
+$ dart2cljd --dir lib --out src --ns-prefix my.app
+dart2cljd: orphan_part.dart: dart2cljd: `part of` files are not supported ...
+dart2cljd: converted 12, skipped 2, failed 1
+$ echo $?
+1
+```
+
+One `.cljd` per converted input, preserving the tree structure
+(`lib/foo/bar_baz.dart` → `src/foo/bar_baz.cljd`, namespace
+`my.app.foo.bar-baz`; the mapping is the inverse of ClojureDart's
+`ns-to-paths`). `*.g.dart`, `*.freezed.dart` and `*.mocks.dart` are skipped by
+default. Failures never abort the run: every file is attempted, failures are
+reported per file with `file:line:col`, and the CLI exits nonzero with a
+`converted N, skipped M, failed K` summary.
+
+Conversion is **two-pass**, so the generated tree is a connected project: a
+project index maps files to namespaces, declared type names to their namespace,
+and classes to their constructors/statics. Relative and own-`package:` imports
+become symbol requires (`[my.app.widgets.button :as button]`), cross-file type
+references resolve to the generated namespace, and cross-file constructor /
+static calls are rewritten to the generated `Class-new` / `Class-member`
+names. `dart:*` and external packages stay string requires. `part`, `part of`
+and `export` fail loudly (ClojureDart cannot express them).
 
 ### API
 
@@ -165,7 +197,11 @@ $ make gate      # all three
 
 The corpus is a pair per entry: `corpus/<name>.dart` plus the reviewed
 `corpus/<name>.cljd`. `make golden` regenerates the expected files; `make
-fixture` refreshes the cached astdump EDN used by the fast unit tests.
+fixture` refreshes the cached astdump EDN used by the fast unit tests. A
+manifest entry can also be `:kind :dir` (an M6 whole-tree fixture): its
+`:expect-failures` list is asserted by the gate, so the failure policy is
+verified too, and the generated tree is compiled and exercised at runtime
+through its `:entry` namespace.
 
 ## Repository layout
 
@@ -184,12 +220,15 @@ src/dart2cljd/
   emit/decls.cljc       ns, classes/deftype, enums, typedefs, annotations
   idiomatic.cljc        widget classes -> fns, State -> atoms, f/widget
   printer.cljc          deterministic pretty-printer
-  api.clj               convert/convert-file + DartClojure-compatible CLI
+  frontend.clj          astdump runner (cached kernel snapshot)
+  batch.clj             --dir conversion: discovery, index, import resolution
+  api.clj               convert/convert-file/convert-dir + CLI
   verify.clj            compile/run verification harness
   golden.clj            golden corpus regeneration
 corpus/                 .dart inputs + reviewed .cljd outputs + manifest
 verify/                 cljd Flutter project used by the compile gate
 test/                   unit + golden tests, fixtures, integration corpora
+test/batchproj/         M6 directory fixture (relative/package imports, part file)
 RESEARCH.md             compiler probes and the decisions they bind
 ```
 
@@ -210,3 +249,13 @@ These are deliberate and recorded with their probe evidence in
   numeric/plain operators.
 - Mutability/type analyses are name-based and over-approximate shadowing
   (worst case: an unnecessary `volatile!` box).
+- Batch mode resolves cross-file *types*, constructors and statics; cross-file
+  top-level functions/variables keep their bare names (qualify them by hand or
+  call them through a class/file that declares them), cross-file typedef
+  references are not expanded, and static field/setter assignments on another
+  file's class are out of scope. Duplicate type names across files are a
+  warning with first-wins by sorted path.
+- The astdump frontend is run through a kernel snapshot cached in
+  `.dart2cljd-cache/` (`dart run` re-JITs `package:analyzer` at ~40 s per
+  call; the snapshot is ~1.3 s and is rebuilt when `bin/astdump.dart`
+  changes).

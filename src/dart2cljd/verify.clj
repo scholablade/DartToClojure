@@ -32,6 +32,7 @@
             [clojure.tools.cli :refer [parse-opts]]
             [dart2cljd.api :as api]
             [dart2cljd.ast :as ast]
+            [dart2cljd.batch :as batch]
             [dart2cljd.emit.decls :as decls]
             [dart2cljd.printer :as printer]))
 
@@ -51,9 +52,22 @@
     (edn/read-string (slurp file))))
 
 (defn gen-ns
-  "Namespace symbol under which a corpus entry is compiled."
+  "Namespace symbol under which a (file-kind) corpus entry is compiled."
   [name]
   (symbol (str "verify.gen." name)))
+
+(defn entry-kind
+  "Manifest entry kind: `:file` (default) or `:dir`."
+  [entry]
+  (or (:kind entry) :file))
+
+(defn entry-ns
+  "Namespace `verify.main` requires for an entry: `verify.gen.<name>` for
+  file entries, `<ns-prefix>.<entry>` for directory entries."
+  [entry]
+  (case (entry-kind entry)
+    :dir (symbol (str (:ns-prefix entry) "." (:entry entry)))
+    (gen-ns (:name entry))))
 
 (defn gen-source
   "Translate a normalized unit for the verify project (ns overridden)."
@@ -64,12 +78,12 @@
                            (= :idiomatic mode) (assoc :mode :idiomatic)))))
 
 (defn main-source
-  "Generate verify.main, requiring every corpus entry."
+  "Generate verify.main, requiring every corpus entry (file and directory)."
   [entries]
   (str "(ns verify.main\n  (:require\n"
        (str/join "\n"
-                 (for [{:keys [name]} entries]
-                   (str "   [verify.gen." name " :as " name "]")))
+                 (for [entry entries]
+                   (str "   [" (entry-ns entry) " :as " (:name entry) "]")))
        "))\n\n(defn main [] nil)\n"))
 
 (def runtime-namespaces
@@ -127,13 +141,83 @@
       (spit out (str (gen-source unit entry) "\n"))
       (.getPath out))))
 
+(defn- write-dir-entry!
+  "Batch-convert a `:kind :dir` entry into `:out` and check its failure set.
+
+  The manifest declares which files must fail (`:expect-failures`); an
+  unexpected conversion or failure is a gate error. Returns the
+  `convert-dir` report."
+  [root entry]
+  (let [{:keys [name dir out ns-prefix package mode expect-failures]} entry
+        result (api/convert-dir
+                (cond-> {:dir (.getPath (io/file root dir))
+                         :out (.getPath (io/file root out))
+                         :root root}
+                  ns-prefix (assoc :ns-prefix ns-prefix)
+                  package (assoc :package package)
+                  (= :idiomatic mode) (assoc :mode :idiomatic)))
+        failed (set (map :file (:failed result)))
+        expected (set expect-failures)]
+    (when-not (= failed expected)
+      (throw (ex-info (str "dart2cljd.verify: " name ": expected failures "
+                           (pr-str expected) ", got " (pr-str failed)
+                           (when-let [f (first (:failed result))]
+                             (str " (" (ex-message (:error f)) ")")))
+                      {:dart2cljd/kind :verify :entry name
+                       :expected expected :failed failed})))
+    (println (str "verify: translated " name " (" dir "): "
+                  (batch/summary result)
+                  (when (seq expected)
+                    (str "; expected failures: " (str/join ", " (sort expected))))))
+    result))
+
+(defn- write-entries!
+  "Translate all manifest entries; returns them unchanged."
+  [root entries]
+  (doseq [entry entries]
+    (if (= :dir (entry-kind entry))
+      (write-dir-entry! root entry)
+      (println (str "verify: translated corpus/" (:name entry) ".dart -> "
+                    (write-entry! root entry)))))
+  entries)
+
+(defn- delete-tree! [^java.io.File f]
+  (when (.isDirectory f)
+    (doseq [c (.listFiles f)] (delete-tree! c)))
+  (.delete f))
+
 (defn- clean-gen! [root entries]
   (let [dir (io/file root "verify/src/verify/gen")
-        keep-names (set (map #(str (:name %) ".cljd") entries))]
+        keep-files (set (for [e entries :when (= :file (entry-kind e))]
+                          (str (:name e) ".cljd")))
+        keep-dirs (set (for [e entries :when (= :dir (entry-kind e))]
+                         (:name e)))]
     (when (.isDirectory dir)
       (doseq [^java.io.File f (.listFiles dir)
-              :when (and (.isFile f) (not (keep-names (.getName f))))]
-        (.delete f)))))
+              :when (not (or (and (.isFile f) (contains? keep-files (.getName f)))
+                             (and (.isDirectory f) (contains? keep-dirs (.getName f)))))]
+        (delete-tree! f)))))
+
+(defn generated-dart-files
+  "Dart files the compile step should produce for the entries (paths relative
+  to verify/), plus the generated verify.main."
+  [root entries]
+  (let [verify-dir (.toPath (io/file root "verify"))
+        gen-dir (io/file root "verify/lib/cljd-out/verify/gen")
+        rel (fn [^java.io.File f]
+              (str (.relativize verify-dir (.toPath f))))]
+    (mapv rel
+          (concat
+           (mapcat (fn [entry]
+                     (if (= :dir (entry-kind entry))
+                       (let [d (io/file gen-dir (:name entry))]
+                         (when (.isDirectory d)
+                           (->> (file-seq d)
+                                (filter #(and (.isFile ^java.io.File %)
+                                              (str/ends-with? (.getName ^java.io.File %) ".dart"))))))
+                       [(io/file gen-dir (str (:name entry) ".dart"))]))
+                   entries)
+           [(io/file root "verify/lib/cljd-out/verify/main.dart")]))))
 
 ;; ---------------------------------------------------------------------------
 ;; steps
@@ -191,9 +275,7 @@
     (println (str "verify: " (count entries) " corpus entries: "
                   (str/join ", " (map :name entries))))
     (clean-gen! root entries)
-    (doseq [entry entries]
-      (println (str "verify: translated corpus/" (:name entry) ".dart -> "
-                    (write-entry! root entry))))
+    (write-entries! root entries)
     (spit (io/file root "verify/src/verify/main.cljd") (main-source entries))
     (print-result
      (if compile-only
@@ -203,8 +285,7 @@
                   (into ["-M:cljd" "test"] runtime-namespaces))))
     (strip-generated-test-imports! root)
     (when-not no-analyze
-      (doseq [dart (concat (map #(str "lib/cljd-out/verify/gen/" (:name %) ".dart") entries)
-                           ["lib/cljd-out/verify/main.dart"])]
+      (doseq [dart (generated-dart-files root entries)]
         (print-result (run-step! step-opts (str "analyze " dart) dart-bin ["analyze" dart]))))
     0))
 

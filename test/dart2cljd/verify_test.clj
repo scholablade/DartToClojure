@@ -21,18 +21,34 @@
 
 (deftest manifest-is-complete
   (let [entries (verify/manifest root)]
-    (is (= #{"m3" "idiomatic"} (set (map :name entries))))
+    (is (= #{"m3" "idiomatic" "batchproj"} (set (map :name entries))))
     (is (= :faithful (:mode (first (filter #(= "m3" (:name %)) entries)))))
     (is (= :idiomatic (:mode (first (filter #(= "idiomatic" (:name %)) entries)))))
-    (testing "each entry has input and golden files"
-      (doseq [{:keys [name]} entries]
+    (testing "each file entry has input and golden files"
+      (doseq [{:keys [name] :as entry} entries
+              :when (= :file (verify/entry-kind entry))]
         (is (.exists (io/file root "corpus" (str name ".dart"))))
-        (is (.exists (io/file root "corpus" (str name ".cljd"))))))))
+        (is (.exists (io/file root "corpus" (str name ".cljd"))))))
+    (testing "the directory entry names its source tree and expected failures"
+      (let [entry (first (filter #(= :dir (verify/entry-kind %)) entries))]
+        (is (= "test/batchproj/lib" (:dir entry)))
+        (is (= "verify.gen.batchproj" (:ns-prefix entry)))
+        (is (= ["orphan_part.dart"] (:expect-failures entry)))
+        (is (= "main" (:entry entry)))
+        (is (.isDirectory (io/file root (:dir entry))))))))
 
 (deftest generated-namespaces
-  (is (= 'verify.gen.m3 (verify/gen-ns "m3"))))
+  (is (= 'verify.gen.m3 (verify/gen-ns "m3")))
+  (is (= :file (verify/entry-kind {:name "m3"})))
+  (is (= :dir (verify/entry-kind {:kind :dir :name "batchproj"})))
+  (is (= 'verify.gen.batchproj.main
+         (verify/entry-ns {:kind :dir :name "batchproj"
+                           :ns-prefix "verify.gen.batchproj" :entry "main"})))
+  (is (= 'verify.gen.idiomatic (verify/entry-ns {:name "idiomatic"}))))
+
 (deftest generated-source-matches-golden-modulo-ns
   (doseq [{:keys [name mode] :as entry} (verify/manifest root)
+          :when (= :file (verify/entry-kind entry))
           :let [golden (slurp (io/file root "corpus" (str name ".cljd")))
                 unit (if (= "m3" name) @m3-unit @idiomatic-unit)
                 source (verify/gen-source unit entry)
@@ -47,8 +63,10 @@
   (let [entries (verify/manifest root)
         src (verify/main-source entries)]
     (is (str/starts-with? src "(ns verify.main"))
-    (doseq [{:keys [name]} entries]
-      (is (str/includes? src (str "[verify.gen." name " :as " name "]"))))
+    (doseq [entry entries]
+      (is (str/includes? src (str "[" (verify/entry-ns entry)
+                                  " :as " (:name entry) "]"))))
+    (is (str/includes? src "[verify.gen.batchproj.main :as batchproj]"))
     (is (str/includes? src "(defn main [] nil)"))))
 
 (deftest runtime-namespaces-is-a-single-entry-point
