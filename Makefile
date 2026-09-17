@@ -27,6 +27,6 @@ lint:
 	clojure -M:kondo
 
 clean:
-	rm -rf .cpcache target
+	rm -rf .cpcache target .dart2cljd-cache
 	rm -rf verify/.cpcache verify/.clojuredart verify/.dart_tool verify/lib \
 	       verify/test/cljd-out verify/src/verify/gen verify/src/verify/main.cljd

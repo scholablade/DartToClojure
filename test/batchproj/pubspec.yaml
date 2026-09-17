@@ -1,0 +1,7 @@
+name: batchproj
+description: "dart2cljd batch fixture: relative + own-package imports, cross-file types and a part file."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.2

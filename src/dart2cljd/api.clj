@@ -8,17 +8,15 @@
   the snippet and of bin/astdump.dart, so repeated conversions in tests do
   not pay the Dart startup cost and stale entries are invalidated whenever
   the frontend changes."
-  (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
-            [clojure.java.shell :as shell]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [clojure.tools.cli :refer [parse-opts]]
             [dart2cljd.alias :as alias]
             [dart2cljd.ast :as ast]
+            [dart2cljd.batch :as batch]
             [dart2cljd.emit.core :as core]
             [dart2cljd.emit.decls :as decls]
-            [dart2cljd.printer :as printer])
-  (:import (java.security MessageDigest)))
+            [dart2cljd.frontend :as frontend]
+            [dart2cljd.printer :as printer]))
 
 ;; ---------------------------------------------------------------------------
 ;; options
@@ -81,59 +79,17 @@
                       {:dart2cljd/kind :options :format (:format opts)})))))
 
 ;; ---------------------------------------------------------------------------
-;; astdump frontend
+;; astdump frontend (see dart2cljd.frontend)
 ;; ---------------------------------------------------------------------------
 
-(defn- sha256 [^String s]
-  (let [d (MessageDigest/getInstance "SHA-256")]
-    (apply str (map #(format "%02x" %) (.digest d (.getBytes s "UTF-8"))))))
-
-(defn- cache-file [root key]
-  (io/file root ".dart2cljd-cache" (str key ".edn")))
-
-(defn- run-astdump
-  "Run bin/astdump.dart with `args`, feeding `stdin` when given."
-  [root cmd args stdin]
-  (let [result (apply shell/sh cmd "run" "bin/astdump.dart"
-                      (concat args (when stdin [:in stdin]) [:dir root]))]
-    (when-not (zero? (:exit result))
-      (throw (ex-info (str "dart2cljd: astdump failed: " (:err result))
-                      {:dart2cljd/kind :astdump
-                       :exit (:exit result)
-                       :stderr (:err result)})))
-    (edn/read-string (:out result))))
-
-(defn astdump
+(def astdump
   "Dump a Dart snippet (string) to an astdump EDN document.
-
   Options: :dart (binary), :root (dart2cljd checkout), :no-cache"
-  [code {:keys [dart root no-cache] :as opts}]
-  (let [root (or root (System/getenv "DART2CLJD_ROOT") (:dart2cljd-root opts)
-                  (System/getProperty "user.dir"))
-        cmd (or dart (System/getenv "DART2CLJD_DART") "dart")
-        dumper (io/file root "bin/astdump.dart")
-        tool-hash (if (.exists dumper) (sha256 (slurp dumper)) "missing")
-        key (sha256 (str tool-hash "\n" cmd "\n" code))
-        cached (cache-file root key)]
-    (if (and (not no-cache) (.exists cached))
-      (edn/read-string (slurp cached))
-      (let [doc (run-astdump root cmd ["-"] code)]
-        (when-not no-cache
-          (io/make-parents cached)
-          (spit cached (pr-str doc)))
-        doc))))
+  frontend/astdump)
 
-(defn astdump-file
-  "Dump a Dart file (path) to an astdump EDN document.
-
-  `path` is resolved against the caller's directory: the frontend runs with
-  its working directory set to the dart2cljd checkout."
-  [path {:keys [dart root] :as opts}]
-  (let [root (or root (System/getenv "DART2CLJD_ROOT") (:dart2cljd-root opts)
-                  (System/getProperty "user.dir"))
-        cmd (or dart (System/getenv "DART2CLJD_DART") "dart")
-        path (str (.getAbsoluteFile (io/file path)))]
-    (run-astdump root cmd [path] nil)))
+(def astdump-file
+  "Dump a Dart file (path) to an astdump EDN document."
+  frontend/astdump-file)
 
 ;; ---------------------------------------------------------------------------
 ;; public API
@@ -152,6 +108,15 @@
   (let [opts (kwargs->map args)
         doc (ast/normalize-doc (astdump-file path opts) opts)]
     (convert-doc doc (assoc opts :path path))))
+
+(defn convert-dir
+  "Batch mode (M6): translate a whole Dart directory tree.
+
+  Options: `:dir :out :ns-prefix :exclude :package :mode` — see
+  `dart2cljd.batch/convert-dir`. Returns the report map
+  (`:converted :skipped :failed :exit`), never throws for per-file failures."
+  [opts]
+  (batch/convert-dir opts))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI (flag-compatible with DartClojure's `dumch.dartclojure`)
@@ -235,6 +200,17 @@
     :parse-fn str]
    ["-p" "--path PATH" "Path to the Dart file to translate"
     :parse-fn str]
+   [nil "--dir DIR" "Batch mode: Dart directory to translate"]
+   [nil "--out DIR" "Batch mode: output directory for generated .cljd files"]
+   [nil "--ns-prefix PREFIX" "Batch mode: namespace prefix for generated files"
+    :parse-fn str]
+   [nil "--exclude GLOB" "Batch mode: skip files matching GLOB (repeatable)"
+    :default []
+    :multi true
+    :update-fn (fn [acc v] (conj acc v))
+    :parse-fn str]
+   [nil "--package NAME" "Batch mode: Dart package name (default: nearest pubspec.yaml)"
+    :parse-fn str]
    ["-h" "--help"]])
 
 (defn cli-opts
@@ -246,6 +222,13 @@
            :dart dart}
     (not (nil? default-alias)) (assoc :default-alias default-alias)
     (and idiomatic? (not faithful)) (assoc :mode :idiomatic)))
+
+(defn batch-opts
+  "CLI options -> `convert-dir` kwargs."
+  [{:keys [dir out ns-prefix exclude package]} conversion-opts]
+  (cond-> (assoc conversion-opts :dir dir :out out :exclude (vec exclude))
+    (some? ns-prefix) (assoc :ns-prefix ns-prefix)
+    (some? package) (assoc :package package)))
 
 (defn- show [s colors] (println (if colors (colorize (str s)) (str s))))
 
@@ -273,6 +256,20 @@
           (recur (read-line) []))
         (recur (read-line) (conj acc input))))))
 
+(defn- report-batch
+  "Print a batch report: warnings and per-file failures to stderr (file:
+  message, the message carries the source position), the summary to stdout.
+  Returns the report's exit code."
+  [{:keys [failed warnings exit] :as result}]
+  (doseq [w warnings]
+    (binding [*out* *err*]
+      (println (str "dart2cljd: warning: " w))))
+  (doseq [{:keys [file error]} failed]
+    (binding [*out* *err*]
+      (println (str "dart2cljd: " file ": " (ex-message error)))))
+  (println (str "dart2cljd: " (batch/summary result)))
+  exit)
+
 (defn run-cli
   "Run the CLI; returns an exit code (0 ok, 1 conversion error, 2 usage)."
   [args]
@@ -289,6 +286,18 @@
       (:repl options)
       (do (repl (:end options) (cli-opts options (:idiomatic options)) (:colors options))
           0)
+
+      (:dir options)
+      (if (nil? (:out options))
+        (do (binding [*out* *err*]
+              (println "dart2cljd: --dir requires --out"))
+            1)
+        (try
+          (report-batch (convert-dir (batch-opts options
+                                                 (cli-opts options (:idiomatic options)))))
+          (catch clojure.lang.ExceptionInfo e
+            (binding [*out* *err*] (println (.getMessage e)))
+            1)))
 
       :else
       (let [opts (cli-opts options (:idiomatic options))
@@ -309,10 +318,11 @@
               1)))))))
 
 (defn -main
-  "dart2cljd CLI: translate Dart code (argument, file or REPL) to ClojureDart.
+  "dart2cljd CLI: translate Dart code (argument, file, `--dir` tree or REPL).
 
   Flags mirror DartClojure's CLI (`-r -e -m -f -c -p`) plus `-i/--idiomatic`,
-  `--faithful`, `-w/--width`, `--default-alias`, `--dart`."
+  `--faithful`, `-w/--width`, `--default-alias`, `--dart`, and the batch flags
+  `--dir --out --ns-prefix --exclude --package`."
   [& args]
   (let [code (run-cli args)]
     (when-not (zero? code)

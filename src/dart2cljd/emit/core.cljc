@@ -104,6 +104,30 @@
       :else nil)))
 
 ;; ---------------------------------------------------------------------------
+;; batch-mode project index (types declared in other files, M6)
+;; ---------------------------------------------------------------------------
+
+(defn- project-type-info
+  "Batch-mode index info for a type declared in another file of the same
+  project, or nil. Index built by dart2cljd.batch."
+  [name ctx]
+  (get (get-in ctx [:aliases :project-types]) (str name)))
+
+(defn- project-ctor-symbol
+  "Ns-level make-fn symbol for a constructor of a project type, or nil when
+  the index does not know that constructor."
+  [info class ctor-name]
+  (when (contains? (:ctors info) ctor-name)
+    (symbol (str (:ns info) "/" (member-symbol class (or ctor-name "new"))))))
+
+(defn- drop-args
+  "Remove named arguments whose names are in `drops`."
+  [drops args]
+  (if (seq drops)
+    (vec (remove #(and (:name %) (contains? drops (:name %))) args))
+    args))
+
+;; ---------------------------------------------------------------------------
 ;; types, constructors, arguments
 ;; ---------------------------------------------------------------------------
 
@@ -153,13 +177,28 @@
                               (:prefix t)
                               (not (alias/import-prefix? (:prefix t) (:aliases ctx)))
                               (alias/class-name? (:prefix t)))
-        base (if qualified-parse?
-               (alias/qualify (:prefix t) (:aliases ctx))
-               (type-symbol t ctx))
+        base-name (if qualified-parse? (:prefix t) (:name t))
+        info (when base-name (project-type-info base-name ctx))
         n (or (:name ctor) (when qualified-parse? (:name t)))]
-    (if n
-      (symbol (str base "." n))
-      base)))
+    (cond
+      (and info (:widget? info) (nil? n))
+      (symbol (str (:ns info) "/" base-name))
+
+      (and info (:widget? info))
+      (fail! ctor (str base-name " is translated as a widget builder fn; "
+                       "constructor " n " is not available in idiomatic mode"))
+
+      info
+      (or (project-ctor-symbol info base-name n)
+          (fail! ctor (str base-name " has no constructor " (or n "new"))))
+
+      :else
+      (let [base (if qualified-parse?
+                   (alias/qualify (:prefix t) (:aliases ctx))
+                   (type-symbol t ctx))]
+        (if n
+          (symbol (str base "." n))
+          base)))))
 
 (defn emit-args
   "Flatten IR arguments into a cljd argument sequence: positional values
@@ -309,6 +348,16 @@
 (defn- super-base [src]
   {:ir :qualified :symbol (form/hint 'super 'this) :src src})
 
+(defn- import-prefix-sym?
+  "True when `name` is an import alias *and* not shadowed by a local or field
+  of the same name (Dart scoping: a local declaration shadows a library
+  prefix, so `item.display` with a field `item` is property access, not a
+  library-qualified reference)."
+  [name ctx]
+  (and (alias/import-prefix? name (:aliases ctx))
+       (not (contains? (:locals ctx) (str name)))
+       (not (contains? (:fields ctx) (str name)))))
+
 (defn- unchain
   "Decompose a property/call/prefixed-identifier chain into [base links],
   links ordered from the base outwards. Handles Dart's syntactic
@@ -321,7 +370,7 @@
     (case (:ir n)
       :prefixed-id
       (let [{:keys [prefix name src]} n]
-        (if (alias/import-prefix? prefix (:aliases ctx))
+        (if (import-prefix-sym? prefix ctx)
           [(qualified-node (symbol (str prefix "/" name)) src) links]
           [(id-node prefix src) (cons {:kind :get :name name :null-aware false} links)]))
 
@@ -337,7 +386,7 @@
           ;; library-qualified call: math/max(1, 2), m/Text("x")
           (and (= :call (:ir n))
                (= :id (:ir t))
-               (alias/import-prefix? (:name t) (:aliases ctx)))
+               (import-prefix-sym? (:name t) ctx))
           [(assoc (qualified-node (symbol (str (:name t) "/" (:name n))) (:src n))
                   :args (:args n))
            links]
@@ -404,6 +453,41 @@
     (thread base-form (map #(link-step % ctx) more)
             (boolean (some :null-aware links)))))
 
+(defn- emit-project-static
+  "Static member access on a project class declared in another file of the
+  same batch conversion. Its statics are emitted as ns-level names
+  (`ns/Class-member`), mirroring `emit-local-static`."
+  [base links ctx node]
+  (let [class (:name base)
+        info (project-type-info class ctx)
+        f (first links)
+        member (:name f)
+        more (rest links)
+        kind (get (:statics info) member)
+        sym (symbol (str (:ns info) "/" class "-" member))
+        base-form (case (:kind f)
+                    :get (case kind
+                           :field sym
+                           :getter (list sym)
+                           :method sym ; tear-off
+                           :ctor sym   ; constructor tear-off
+                           nil (fail! node (str "unknown static member "
+                                                class "." member)))
+                    :call (case kind
+                            :method (list* sym (emit-args (:args f) ctx))
+                            :ctor (list* sym (emit-args (:args f) ctx))
+                            :getter (fail! node (str class "." member
+                                                     " is a getter, not a method"))
+                            :field (fail! node (str class "." member
+                                                    " is a field, not a method"))
+                            nil (fail! node (str "unknown static member "
+                                                 class "." member))))]
+    (when (:widget? info)
+      (fail! node (str class " is translated as a widget builder fn; static "
+                       "member access is not available in idiomatic mode")))
+    (thread base-form (map #(link-step % ctx) more)
+            (boolean (some :null-aware links)))))
+
 (defn- emit-chain [node ctx]
   (let [[base links] (unchain node ctx)
         null-aware? (boolean (some :null-aware links))]
@@ -411,22 +495,24 @@
       (fail! node "member access without a target"))
     (if (and (static-base? base ctx) (local-class? (:name base) ctx))
       (emit-local-static base links ctx node)
-      (if (static-base? base ctx)
-        (if (every? #(= :get (:kind %)) links)
-          ;; static field/property path -> dotted symbol (m/Colors.grey.shade300)
-          (symbol (str (alias/qualify (:name base) (:aliases ctx))
-                       (apply str (map #(str "." (:name %)) links))))
-          ;; static method call, then optional further steps
-          (let [[f & more] links]
-            (when-not (= :call (:kind f))
-              (fail! node "unsupported static member chain"))
-            (thread (list* (alias/qualify-member (:name base) (:name f) (:aliases ctx))
-                           (emit-args (:args f) ctx))
-                    (map #(link-step % ctx) more)
-                    (boolean (some :null-aware links)))))
-        (thread (emit-base base ctx)
-                (map #(link-step % ctx) links)
-                null-aware?)))))
+      (if (and (static-base? base ctx) (project-type-info (:name base) ctx))
+        (emit-project-static base links ctx node)
+        (if (static-base? base ctx)
+          (if (every? #(= :get (:kind %)) links)
+            ;; static field/property path -> dotted symbol (m/Colors.grey.shade300)
+            (symbol (str (alias/qualify (:name base) (:aliases ctx))
+                         (apply str (map #(str "." (:name %)) links))))
+            ;; static method call, then optional further steps
+            (let [[f & more] links]
+              (when-not (= :call (:kind f))
+                (fail! node "unsupported static member chain"))
+              (thread (list* (alias/qualify-member (:name base) (:name f) (:aliases ctx))
+                             (emit-args (:args f) ctx))
+                      (map #(link-step % ctx) more)
+                      (boolean (some :null-aware links)))))
+          (thread (emit-base base ctx)
+                  (map #(link-step % ctx) links)
+                  null-aware?))))))
 
 (defn- known-bare?
   "True when a bare name is definitely not an implicit-this member access:
@@ -450,10 +536,7 @@
   "Remove named constructor arguments this widget builder does not accept
   (currently `key`)."
   [ctx class args]
-  (let [drops (:drop-args (widget-fn-info ctx class))]
-    (if (seq drops)
-      (vec (remove #(and (:name %) (contains? drops (:name %))) args))
-      args)))
+  (drop-args (:drop-args (widget-fn-info ctx class)) args))
 
 (defn- emit-fn-call
   "Unqualified call: `foo(...)` (top-level function, constructor, static
@@ -469,6 +552,15 @@
 
       (local-class? n ctx)
       (fail! node (str n " has no unnamed constructor"))
+
+      (project-type-info n ctx)
+      (let [info (project-type-info n ctx)]
+        (if (:widget? info)
+          (list* (symbol (str (:ns info) "/" n))
+                 (emit-args (drop-args (:drop-args info) (:args node)) ctx))
+          (if-let [sym (project-ctor-symbol info n nil)]
+            (list* sym (emit-args (:args node) ctx))
+            (fail! node (str n " has no unnamed constructor")))))
 
       (class-like? n ctx)
       (list* (alias/qualify n (:aliases ctx)) (emit-args (:args node) ctx))
@@ -1084,6 +1176,14 @@
         (ctor-symbol-for raw (:name (:ctor node)))
         (fail! node (str raw " has no constructor "
                          (or (:name (:ctor node)) "new"))))
+
+      (project-type-info raw ctx)
+      (let [info (project-type-info raw ctx)]
+        (cond
+          (:widget? info) (symbol (str (:ns info) "/" raw))
+          :else (or (project-ctor-symbol info raw (:name (:ctor node)))
+                    (fail! node (str raw " has no constructor "
+                                     (or (:name (:ctor node)) "new"))))))
 
       :else (case (:ir node)
               :new (ctor-symbol (:ctor node) ctx)

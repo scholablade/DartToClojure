@@ -44,15 +44,17 @@
                    :emit-switch-expr st/emit-switch-expr)))
 
 (defn unit-aliases
-  "Alias context for a unit's imports, honoring :default-alias and local
-  type names."
-  [unit {:keys [default-alias local-names] :as opts}]
+  "Alias context for a unit's imports, honoring :default-alias, local type
+  names and (batch mode) :project-types / :resolver."
+  [unit {:keys [default-alias local-names project-types resolver] :as opts}]
   (let [imports (filter #(= :import (:ir %)) (:directives unit))]
     (alias/context imports
                    {:default-alias (if (contains? opts :default-alias)
                                      default-alias
                                      "m")
-                    :local-names (set local-names)})))
+                    :local-names (set local-names)
+                    :project-types project-types
+                    :resolver resolver})))
 
 ;; ---------------------------------------------------------------------------
 ;; annotations
@@ -697,7 +699,9 @@
             {}
             classes)))
 
-(defn- unit-info [unit]
+(defn unit-info
+  "Whole-unit resolution table (classes/statics/typedefs/top-level names).
+  Public for batch mode, which builds the cross-file project index from it." [unit]
   {:classes (into {}
                   (for [d (:decls unit)
                         :when (contains? #{:class :enum} (:ir d))]
@@ -734,7 +738,8 @@
         base-ctx (ctx-for aliases (assoc opts :unit-info info))
         ns-name (or ns (some-> (library-name unit) symbol) (path->ns path) 'main)
         requires (alias/require-clauses
-                  (filter #(= :import (:ir %)) (:directives unit)))
+                  (filter #(= :import (:ir %)) (:directives unit))
+                  (:resolver opts))
         ;; cljd.flutter is a cljd namespace, not a Dart library: it must be
         ;; required as a symbol (string requires are resolved by the Dart
         ;; analyzer and would fail with "Can't find Dart lib").
