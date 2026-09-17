@@ -88,11 +88,15 @@ reported per file with `file:line:col`, and the CLI exits nonzero with a
 
 Conversion is **two-pass**, so the generated tree is a connected project: a
 project index maps files to namespaces, declared type names to their namespace,
-and classes to their constructors/statics. Relative and own-`package:` imports
-become symbol requires (`[my.app.widgets.button :as button]`), cross-file type
-references resolve to the generated namespace, and cross-file constructor /
-static calls are rewritten to the generated `Class-new` / `Class-member`
-names. `dart:*` and external packages stay string requires. `part`, `part of`
+classes to their constructors/statics, and top-level values to their kinds.
+Relative and own-`package:` imports become symbol requires
+(`[my.app.widgets.button :as button]`), cross-file type references resolve to
+the generated namespace, cross-file constructor / static calls are rewritten
+to the generated `Class-new` / `Class-member` names, top-level
+functions/getters/vars are called through their generated namespace, and
+cross-file typedefs expand to their target type. Writes work too: mutable
+top-level vars (`set!`), static fields, setters and increments across files.
+`dart:*` and external packages stay string requires. `part`, `part of`
 and `export` fail loudly (ClojureDart cannot express them).
 
 ### API
@@ -249,12 +253,13 @@ These are deliberate and recorded with their probe evidence in
   numeric/plain operators.
 - Mutability/type analyses are name-based and over-approximate shadowing
   (worst case: an unnecessary `volatile!` box).
-- Batch mode resolves cross-file *types*, constructors and statics; cross-file
-  top-level functions/variables keep their bare names (qualify them by hand or
-  call them through a class/file that declares them), cross-file typedef
-  references are not expanded, and static field/setter assignments on another
-  file's class are out of scope. Duplicate type names across files are a
-  warning with first-wins by sorted path.
+- Batch mode resolves cross-file types, typedefs, top-level
+  functions/getters/setters/vars and static members (reads, calls, writes and
+  increments). Duplicate type/value names across files are a warning with
+  first-wins by sorted path. Remaining batch approximations: a typedef whose
+  target is a bare type parameter fails loudly at use sites; instance members
+  inherited from outside the converted tree are invisible to the syntactic
+  pass, so a cross-file value with the same name wins over them.
 - The astdump frontend is run through a kernel snapshot cached in
   `.dart2cljd-cache/` (`dart run` re-JITs `package:analyzer` at ~40 s per
   call; the snapshot is ~1.3 s and is rebuilt when `bin/astdump.dart`
