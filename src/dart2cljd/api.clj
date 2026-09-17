@@ -108,7 +108,8 @@
 
   Options: :dart (binary), :root (dart2cljd checkout), :no-cache"
   [code {:keys [dart root no-cache] :as opts}]
-  (let [root (or root (:dart2cljd-root opts) (System/getProperty "user.dir"))
+  (let [root (or root (System/getenv "DART2CLJD_ROOT") (:dart2cljd-root opts)
+                  (System/getProperty "user.dir"))
         cmd (or dart (System/getenv "DART2CLJD_DART") "dart")
         dumper (io/file root "bin/astdump.dart")
         tool-hash (if (.exists dumper) (sha256 (slurp dumper)) "missing")
@@ -123,10 +124,15 @@
         doc))))
 
 (defn astdump-file
-  "Dump a Dart file (path) to an astdump EDN document."
+  "Dump a Dart file (path) to an astdump EDN document.
+
+  `path` is resolved against the caller's directory: the frontend runs with
+  its working directory set to the dart2cljd checkout."
   [path {:keys [dart root] :as opts}]
-  (let [root (or root (:dart2cljd-root opts) (System/getProperty "user.dir"))
-        cmd (or dart (System/getenv "DART2CLJD_DART") "dart")]
+  (let [root (or root (System/getenv "DART2CLJD_ROOT") (:dart2cljd-root opts)
+                  (System/getProperty "user.dir"))
+        cmd (or dart (System/getenv "DART2CLJD_DART") "dart")
+        path (str (.getAbsoluteFile (io/file path)))]
     (run-astdump root cmd [path] nil)))
 
 ;; ---------------------------------------------------------------------------

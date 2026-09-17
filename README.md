@@ -26,6 +26,18 @@ Dart source ─► bin/astdump.dart ─► EDN AST ─► normalize ─► emit 
 
 ## Usage
 
+`bin/dart2cljd` works from any directory and can be symlinked onto `PATH`
+(it resolves symlinks and puts the checkout on the classpath itself):
+
+```console
+$ ln -sf "$PWD/bin/dart2cljd" ~/.local/bin/dart2cljd   # once, from the checkout
+$ cd ~/my_app
+$ dart2cljd -p lib/main.dart                 # relative paths use your cwd
+```
+
+`DART2CLJD_ROOT` overrides the checkout location if you move things around;
+`DART2CLJD_DART` overrides the Dart binary.
+
 ```console
 $ bin/dart2cljd "Text('hi')"                 # snippet (argument)
 (m/Text "hi")

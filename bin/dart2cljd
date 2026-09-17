@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# dart2cljd CLI entry. Delegates to clojure -M.
-# Usage: bin/dart2cljd [options] [file.dart | -]
+# dart2cljd CLI entry. Works from any directory and through symlinks
+# (e.g. `ln -sf /path/to/dart2cljd/bin/dart2cljd ~/.local/bin/dart2cljd`):
+# it puts the checkout on the classpath via -Sdeps and tells the converter
+# where the astdump frontend lives via DART2CLJD_ROOT. Relative file
+# arguments still resolve against the caller's directory.
+# Usage: dart2cljd [options] [file.dart | -]
 set -euo pipefail
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec clojure -M:run "$@"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+export DART2CLJD_ROOT="${DART2CLJD_ROOT:-$DIR}"
+exec clojure -Sdeps "{:deps {dart2cljd/dart2cljd {:local/root \"$DIR\"}}}" \
+  -M -m dart2cljd.api "$@"
