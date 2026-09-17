@@ -83,6 +83,55 @@ class TickerState extends State<Ticker> {
   }
 }
 
+class Editor extends StatefulWidget {
+  const Editor({super.key});
+  @override
+  State<Editor> createState() => EditorState();
+}
+
+class EditorState extends State<Editor> {
+  late final TextEditingController controller;
+  @override
+  void initState() {
+    super.initState();
+    controller = TextEditingController(text: 'hi');
+  }
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+  @override
+  Widget build(BuildContext context) {
+    return TextField(controller: controller);
+  }
+}
+
+class Fader extends StatefulWidget {
+  const Fader({super.key});
+  @override
+  State<Fader> createState() => FaderState();
+}
+
+class FaderState extends State<Fader> {
+  late final AnimationController controller;
+  @override
+  void initState() {
+    super.initState();
+    controller = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 100));
+  }
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(opacity: controller, child: const Text('fade'));
+  }
+}
+
 class Page extends StatelessWidget {
   const Page();
   @override

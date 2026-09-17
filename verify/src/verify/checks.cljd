@@ -76,3 +76,19 @@
     (await (tap (ft/find.byType m/TextButton)))
     (await (pump))
     (ft/expect (ft/find.text "ticks: 1") ft/findsOneWidget)))
+
+(deftest managed-controller-lifecycle
+  :runner (ft/testWidgets [tester])
+  (let [^ft/WidgetTester {:flds [pumpWidget enterText]} tester]
+    (await (pumpWidget (m/MaterialApp .home (m/Scaffold .body (i/Editor)))))
+    (ft/expect (ft/find.text "hi") ft/findsOneWidget)
+    (await (enterText (ft/find.byType m/TextField) "bye"))
+    (ft/expect (ft/find.text "bye") ft/findsOneWidget)
+    (await (pumpWidget (m/MaterialApp .home (m/SizedBox))))))
+
+(deftest managed-vsync-lifecycle
+  :runner (ft/testWidgets [tester])
+  (let [^ft/WidgetTester {:flds [pumpWidget]} tester]
+    (await (pumpWidget (m/MaterialApp .home (i/Fader))))
+    (ft/expect (ft/find.text "fade") ft/findsOneWidget)
+    (await (pumpWidget (m/MaterialApp .home (m/SizedBox))))))

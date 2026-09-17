@@ -125,6 +125,31 @@
            (str/starts-with? (name x) ".")
            (not (str/starts-with? (name x) ".-")))))
 
+(defn- pp-binding-vector
+  "`keyword [binding expr … :option value …]` layout for f/widget
+  `:managed`/`:watch` bindings: elements hang as usual, but `:option value`
+  pairs stay on one line."
+  [kw x indent]
+  (let [kw-str (flat kw)]
+    (if (fits? x (+ indent (count kw-str) 1))
+      (pair-line kw x indent)
+      (let [elem-indent (+ indent (count kw-str) 2)
+            ls (loop [es (seq x) out []]
+                 (if-not es
+                   out
+                   (let [e (first es)]
+                     (if (and (keyword? e) (next es))
+                       (recur (nnext es)
+                              (conj out (pair-line e (second es) elem-indent)))
+                       (recur (next es) (conj out (pp e elem-indent)))))))]
+        (if (empty? ls)
+          (str (pad indent) kw-str " []")
+          (str (pad indent) kw-str " [" (str/triml (first ls))
+               (str/join "" (map #(str "\n" %) (rest ls)))
+               "]"))))))
+
+(def ^:private binding-vector-directives #{:managed :watch})
+
 (defn- pp-elems
   "Render call arguments at `indent`, pairing `.named`/`:directive` markers
   with their following value."
@@ -134,7 +159,11 @@
       out
       (let [e (first elems)]
         (if (and (directive? e) (next elems))
-          (recur (nnext elems) (conj out (pair-line e (second elems) indent)))
+          (recur (nnext elems)
+                 (conj out (if (and (contains? binding-vector-directives e)
+                                    (vector? (second elems)))
+                             (pp-binding-vector e (second elems) indent)
+                             (pair-line e (second elems) indent))))
           (recur (next elems) (conj out (pp e indent))))))))
 
 (defn- pp-map [pairs indent]

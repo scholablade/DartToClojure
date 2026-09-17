@@ -7,9 +7,9 @@
   fns (`letfn`) and whose `build` method becomes the widget body.
 
   Everything here is a pure function of the unit IR. Classes whose shape is
-  not recognized (lifecycle overrides, getters/setters, statics, generics,
-  named constructors, mixins, heritage from other unit classes, ...) are
-  left to the faithful emitter.
+  not recognized (unrecognized lifecycle overrides, getters/setters, statics,
+  generics, named constructors, mixins, heritage from other unit classes, ...)
+  are left to the faithful emitter.
 
   Widget identity and rebuilds:
     * a constructor `key` parameter becomes a `.key` parameter of the builder
@@ -20,6 +20,20 @@
       the object held by one) still rebuilds. The extra atom swap is
       redundant when the callback does write state atoms; Flutter coalesces
       the resulting rebuild scheduling.
+
+  Lifecycle resources:
+    * `initState` is recognized when it only calls `super.initState()` and
+      assigns declared fields that have no initializer; those fields become
+      `f/widget :managed` resources with `:refresh-on :never` (created once,
+      like initState);
+    * `dispose` is recognized when it only calls `super.dispose()` and
+      disposes exactly those fields (`field.dispose()`/`.cancel()`/`.close()`
+      map to the `:dispose` option);
+    * `vsync: this` in a managed expression maps to the `:vsync` directive
+      binding (`d2c$vsync`);
+    * managed fields may be read from `build` (including closures) but not
+      from other State methods, which are emitted outside the widget body and
+      cannot see the managed bindings; anything else falls back.
 
   Documented divergence (deterministic): state fields are one atom each;
   in-place mutation of the object held by an atom notifies watchers only
@@ -281,6 +295,114 @@
     (coll? node) (boolean (some uses-set-state? node))
     :else false))
 
+(defn- mutates-name?
+  "True when the IR assigns or increments the identifier `n`."
+  [node n]
+  (cond
+    (map? node)
+    (or (and (contains? #{:assign :postfix :prefix} (:ir node))
+             (let [t (or (:lhs node) (:operand node))]
+               (and (map? t) (= :id (:ir t)) (= n (:name t)))))
+        (boolean (some #(mutates-name? % n)
+                       (vals (dissoc node :ir :src :annotations)))))
+    (coll? node) (boolean (some #(mutates-name? % n) node))
+    :else false))
+
+(defn- strip-paren [node]
+  (if (= :paren (:ir node)) (recur (:expr node)) node))
+
+(defn- this-member-name
+  "Name when `t` accesses a member of `names` through an implicit or
+  explicit `this` (`f`, `this.f`)."
+  [t names]
+  (let [t (strip-paren t)]
+    (cond
+      (and (map? t) (= :id (:ir t)) (contains? names (:name t))) (:name t)
+      (and (map? t) (= :prefixed-id (:ir t)) (= "this" (:prefix t))
+           (contains? names (:name t))) (:name t)
+      (and (map? t) (= :prop (:ir t)) (this-node? (:target t))
+           (contains? names (:name t))) (:name t)
+      :else nil)))
+
+(defn- super-call? [e name]
+  (and (= :call (:ir e))
+       (= :super (:ir (:target e)))
+       (= name (:name e))))
+
+(defn- stmt-expr [st]
+  (when (= :expr-stmt (:ir st)) (:expr st)))
+
+(def ^:private dispose-forms
+  {"dispose" '.dispose "cancel" '.cancel "close" '.close})
+
+(defn- parse-init-state
+  "Recognized `initState` body: `super.initState()` plus `field = expr`
+  assignments to declared fields without initializers. Returns
+  {:assignments [{:name f :expr e}]} or nil when the body has anything else."
+  [m field-map]
+  (when (= :block-body (:ir (:body m)))
+    (let [names (set (keys field-map))]
+      (reduce
+       (fn [acc st]
+         (let [e (stmt-expr st)
+               f (when (and e (= :assign (:ir e)) (= "=" (:op e)))
+                   (this-member-name (:lhs e) names))]
+           (cond
+             (and e (super-call? e "initState")) acc
+             (and f (nil? (:init (get field-map f))))
+             (if (some #(= f (:name %)) (:assignments acc))
+               (reduced nil)
+               (update acc :assignments conj {:name f :expr (:rhs e)}))
+             :else (reduced nil))))
+       {:assignments []}
+       (get-in m [:body :block :stmts])))))
+
+(defn- parse-dispose
+  "Recognized `dispose` body: `super.dispose()` plus `field.dispose()` /
+  `field.cancel()` / `field.close()` for the given managed fields. Returns
+  {:disposes {field form}} or nil when the body has anything else."
+  [m managed-names]
+  (when (= :block-body (:ir (:body m)))
+    (reduce
+     (fn [acc st]
+       (let [e (stmt-expr st)
+             f (when (and e (= :call (:ir e)))
+                 (this-member-name (:target e) managed-names))
+             form (when f (get dispose-forms (:name e)))]
+         (cond
+           (and e (super-call? e "dispose")) acc
+           (and f form) (update acc :disposes assoc f form)
+           :else (reduced nil))))
+     {:disposes {}}
+     (get-in m [:body :block :stmts]))))
+
+(defn- substitute-vsync
+  "Replace `this` used as the value of a `vsync:` named argument with the
+  `:vsync` directive binding `d2c$vsync`. Returns [expr vsync?] or nil when
+  `this` appears anywhere else in the expression."
+  [node]
+  (let [stray? (volatile! false)
+        vsync? (volatile! false)]
+    (letfn [(walk [n]
+              (cond
+                (map? n)
+                (cond
+                  (= :this (:ir n)) (do (vreset! stray? true) n)
+
+                  (and (= :arg (:ir n)) (= "vsync" (:name n)))
+                  (if (= :this (:ir (:expr n)))
+                    (do (vreset! vsync? true)
+                        (assoc n :expr {:ir :id :name "d2c$vsync" :src (:src n)}))
+                    (walk-fields n walk))
+
+                  :else (walk-fields n walk))
+
+                (vector? n) (mapv walk n)
+                :else n))]
+      (let [out (walk node)]
+        (when-not @stray?
+          [out @vsync?])))))
+
 ;; ---------------------------------------------------------------------------
 ;; plan
 ;; ---------------------------------------------------------------------------
@@ -342,17 +464,39 @@
 
 (defn- state-info
   "Analyse a `State<W>` class; `widget-field-names` are the fields of the
-  paired `StatefulWidget`, readable through `widget.<field>`."
+  paired `StatefulWidget`, readable through `widget.<field>`.
+
+  `initState`/`dispose` are recognized when the class initializes fields that
+  have no initializer (they become `:managed` resources, created once and
+  disposed) and disposes exactly those fields. Managed fields may be read
+  from `build` (including closures) but not from other methods, which are
+  emitted outside the widget body and cannot see the managed bindings.
+  Anything else keeps the faithful fallback."
   [s widget-field-names]
   (when (class-shape-ok? s)
     (when-let [ms (regular-methods s)]
       (let [build (find-method s "build")
-            others (remove #(= "build" (:name %)) ms)]
+            init (find-method s "initState")
+            dispose (find-method s "dispose")
+            others (remove #(contains? #{"build" "initState" "dispose"} (:name %)) ms)]
         (when (and build
                    (build-param build)
-                   (not-any? #(contains? lifecycle-methods (:name %)) others)
-                   (not-any? #(contains? lifecycle-methods (:name %)) ms))
+                   (not-any? #(contains? lifecycle-methods (:name %)) others))
           (let [fields (field-specs s)
+                field-map (into {} (map (juxt :name identity)) fields)
+                parsed-init (if init (parse-init-state init field-map)
+                                {:assignments []})
+                managed-names (set (map :name (:assignments parsed-init)))
+                parsed-dispose (if dispose (parse-dispose dispose managed-names)
+                                   {:disposes {}})
+                managed (when (and parsed-init parsed-dispose)
+                          (mapv (fn [a]
+                                  (assoc a :dispose
+                                         (get (:disposes parsed-dispose) (:name a))))
+                                (:assignments parsed-init)))
+                uninitialized (remove #(or (:init %)
+                                           (contains? managed-names (:name %)))
+                                      fields)
                 method-names (set (map :name others))
                 env {:fields (set (map :name fields))
                      :methods method-names
@@ -365,13 +509,31 @@
                                     (first (last rewritten))]
                                    [nil nil])
                 field-rewrites (map #(rewrite-state (:init %) env) fields)
-                fields-ok? (every? second field-rewrites)]
-            (when (and ok? fields-ok?)
+                fields-ok? (every? second field-rewrites)
+                managed-ok? (and parsed-init
+                                 parsed-dispose
+                                 (empty? uninitialized)
+                                 (every? :dispose managed)
+                                 (every? (fn [m]
+                                           (not-any? #(references-name? % (:name m))
+                                                     others'))
+                                         managed))
+                rw (mapv (fn [m]
+                           (when-let [[e vsync?] (substitute-vsync (:expr m))]
+                             (let [[e ok] (rewrite-state e env)]
+                               (when ok (assoc m :init e :vsync? vsync?)))))
+                         managed)
+                managed-rw (when (every? some? rw) rw)
+                field-init (into {} (map (fn [f [init _]] [(:name f) init])
+                                         fields field-rewrites))]
+            (when (and ok? fields-ok? managed-ok? managed-rw
+                       (not-any? #(mutates-name? build' (:name %)) managed))
               {:kind :stateful
                :name (:name s)
-               :fields (mapv (fn [f [init _]]
-                               {:name (:name f) :init init})
-                             fields field-rewrites)
+               :fields (mapv (fn [f] {:name (:name f) :init (field-init (:name f))})
+                             (remove #(contains? managed-names (:name %)) fields))
+               :managed managed-rw
+               :vsync? (boolean (some :vsync? managed-rw))
                :methods others'
                :build build'
                :context-name (:name (build-param build))})))))))
@@ -419,7 +581,9 @@
                    :methods (:methods st)
                    :build (:build st)
                    :context-name (:context-name st)
-                   :state-fields (:fields st)})))))))))
+                   :state-fields (:fields st)
+                   :managed (:managed st)
+                   :vsync? (:vsync? st)})))))))))
 
 (defn plan
   "Analyze a unit for idiomatic widget classes.
@@ -498,11 +662,13 @@
 
 (defn emit-widget
   "Emission info from `plan` -> vector of top-level forms (one defn)."
-  [{:keys [name params field-inits methods build context-name state-fields key?]}
+  [{:keys [name params field-inits methods build context-name state-fields
+           key? managed vsync?]}
    ctx]
   (let [param-names (set (keep :name params))
         method-names (set (map :name methods))
         init-field-names (set (map :name field-inits))
+        managed-names (set (map :name managed))
         tick? (or (some uses-set-state? methods)
                   (uses-set-state? build))
         atom-fields (into {} (for [f state-fields]
@@ -511,7 +677,8 @@
                          :atom-fields atom-fields
                          :state-ctx true
                          :tick-atom (when tick? 'd2c$tick))
-        locals (cond-> (into param-names (concat method-names init-field-names))
+        locals (cond-> (into param-names (concat method-names init-field-names
+                                                 managed-names))
                  context-name (conj context-name))
         init-ctx (assoc state-ctx :locals param-names)
         init-bindings (vec
@@ -527,6 +694,7 @@
                                 state-fields)
                         (when tick?
                           ['d2c$tick (list 'atom 0)])))
+        managed-ctx (assoc state-ctx :locals locals)
         method-ctx (assoc state-ctx :locals locals)
         method-fns (mapv #(emit-method-fn % method-ctx) methods)
         build-ctx (assoc state-ctx :locals locals)
@@ -535,6 +703,15 @@
                            build-ctx))
         directives (vec
                     (concat
+                     (when vsync? [:vsync 'd2c$vsync])
+                     (when (seq managed)
+                       [:managed (vec (mapcat
+                                       (fn [m]
+                                         [(symbol (:name m))
+                                          (core/emit-expr (:init m) managed-ctx)
+                                          :refresh-on :never
+                                          :dispose (:dispose m)])
+                                       managed))])
                      (when (or (seq state-fields) tick?)
                        [:watch (vec (concat (mapcat (fn [f] ['_ (symbol (:name f))])
                                                     state-fields)

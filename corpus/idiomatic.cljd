@@ -54,6 +54,31 @@
             :context context
             (m/TextButton .onPressed bump .child (m/Text (str "ticks: " (.-length (deref buf))))))))))
 
+(defn Editor [.key nil]
+  (m/KeyedSubtree
+    .key key
+    .child
+      (f/widget
+        :managed [controller
+                  (m/TextEditingController .text "hi")
+                  :refresh-on :never
+                  :dispose .dispose]
+        :context context
+        (m/TextField .controller controller))))
+
+(defn Fader [.key nil]
+  (m/KeyedSubtree
+    .key key
+    .child
+      (f/widget
+        :vsync d2c$vsync
+        :managed [controller
+                  (m/AnimationController .vsync d2c$vsync .duration (Duration .milliseconds 100))
+                  :refresh-on :never
+                  :dispose .dispose]
+        :context context
+        (m/FadeTransition .opacity controller .child (m/Text "fade")))))
+
 (defn Page []
   (f/widget
     :context context

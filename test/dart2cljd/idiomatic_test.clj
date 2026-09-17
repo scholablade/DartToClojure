@@ -121,8 +121,23 @@
 
 (deftest plan-consumes-only-paired-state-classes
   (let [p (idiomatic/plan (:unit @doc))]
-    (is (= #{"Greeting" "Counter" "Banner" "Ticker" "Page"} (set (keys (:widgets p)))))
-    (is (= #{"CounterState" "BannerState" "TickerState"} (:consumed p)))))
+    (is (= #{"Greeting" "Counter" "Banner" "Ticker" "Editor" "Fader" "Page"}
+           (set (keys (:widgets p)))))
+    (is (= #{"CounterState" "BannerState" "TickerState" "EditorState" "FaderState"}
+           (:consumed p)))))
+
+(deftest managed-lifecycle-resources
+  (let [o (out)]
+    (testing "initState-created fields become :managed resources created once"
+      (is (re-find #":managed \[controller\s+\(m/TextEditingController \.text \"hi\"\)\s+:refresh-on :never\s+:dispose \.dispose\]" o)))
+    (testing "vsync: this maps to the :vsync directive binding"
+      (is (re-find #":vsync d2c\$vsync" o))
+      (is (re-find #"(?s)\(m/AnimationController\s+\.vsync d2c\$vsync" o)))
+    (testing "managed fields are read in build as plain locals"
+      (is (re-find #"\(m/TextField \.controller controller\)" o))
+      (is (re-find #"\(m/FadeTransition \.opacity controller" o)))
+    (testing "recognized lifecycle members are not emitted as methods"
+      (is (not (re-find #"initState|super" o))))))
 
 (deftest no-sugar-without-flutter
   (testing "a StatefulWidget without a paired State class falls back"
