@@ -185,6 +185,8 @@ String vec(Iterable<String> parts) => '[${parts.join(' ')}]';
 
 String kw(AstNode n) {
   var t = n.runtimeType.toString();
+  // Analyzer 14 versioned projections: `FooV1Impl` -> `Foo`.
+  t = t.replaceAll(RegExp(r'V\d+Impl\d*$'), '');
   t = t.replaceAll(RegExp(r'Impl\d*$'), '');
   return ':$t';
 }
@@ -303,6 +305,17 @@ String dump(AstNode node, LineInfo li) {
           ':type-params ${fe.typeParameters == null ? 'nil' : vec(fe.typeParameters!.typeParameters.map((t) => dump(t, li)))} '
           ':params ${fe.parameters == null ? 'nil' : dump(fe.parameters!, li)} '
           ':body ${dump(fe.body, li)} ');
+    case TopLevelGetterDeclaration g:
+      // Analyzer 14 models top-level getters as their own declaration kind
+      // (`TopLevelGetterDeclarationV1Impl`); emit the FunctionDeclaration
+      // shape so the IR stays `:fn-decl :kind :getter`.
+      f.write(':name ${s(g.name.lexeme)} '
+          ':kind :getter '
+          ':external ${b(g.externalKeyword != null)} '
+          ':return-type ${g.returnType == null ? 'nil' : dump(g.returnType!, li)} '
+          ':type-params nil '
+          ':params nil '
+          ':body ${dump(g.body, li)} ');
     case TopLevelVariableDeclaration t:
       f.write(':external ${b(t.externalKeyword != null)} '
           ':vars ${dump(t.variables, li)} ');

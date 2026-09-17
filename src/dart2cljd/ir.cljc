@@ -183,6 +183,18 @@
              [:params :params]
              [:body :child]]}
 
+   ;; Analyzer 14 models top-level getters separately; astdump emits the
+   ;; FunctionDeclaration shape for them.
+   :TopLevelGetterDeclaration
+   {:ir :fn-decl
+    :fields [[:name :scalar]
+             [:kind :scalar]
+             [:external :scalar]
+             [:return-type :child]
+             [:type-params :children]
+             [:params :params]
+             [:body :child]]}
+
    :TopLevelVariableDeclaration
    {:ir :top-var-decl
     :fields [[:external :scalar]

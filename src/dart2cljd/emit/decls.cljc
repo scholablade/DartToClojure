@@ -45,8 +45,8 @@
 
 (defn unit-aliases
   "Alias context for a unit's imports, honoring :default-alias, local type
-  names and (batch mode) :project-types / :resolver."
-  [unit {:keys [default-alias local-names project-types resolver] :as opts}]
+  names and (batch mode) :project-types / :project-values / :resolver."
+  [unit {:keys [default-alias local-names project-types project-values resolver] :as opts}]
   (let [imports (filter #(= :import (:ir %)) (:directives unit))]
     (alias/context imports
                    {:default-alias (if (contains? opts :default-alias)
@@ -54,6 +54,7 @@
                                      "m")
                     :local-names (set local-names)
                     :project-types project-types
+                    :project-values project-values
                     :resolver resolver})))
 
 ;; ---------------------------------------------------------------------------
@@ -159,16 +160,31 @@
             (:type f) (assoc :tag (core/type-symbol (:type f) ctx)))]
     (with-meta (symbol (:name f)) m)))
 
-(defn- class-static-names [d]
-  (into {}
-        (concat
-         (for [m (:members d)
-               :when (and (= :field-decl (:ir m)) (:static m))
-               v (get-in m [:fields :vars])]
-           [(:name v) (core/member-symbol (:name d) (:name v))])
-         (for [m (:members d)
-               :when (and (= :method (:ir m)) (:static m))]
-           [(:name m) (core/member-symbol (:name d) (:name m))]))))
+(defn- class-static-members
+  "Static members of a class as `name -> {kind sym}`, where kind is one of
+  :field :getter :method :setter. Fields/getters/methods use the generated
+  `Class-member` name; setters the generated `set-member!` fn. Bare
+  references inside the class must distinguish kinds (a getter read is a
+  call, a setter write is a call, a field write is `set!`)."
+  [d]
+  (let [class (:name d)]
+    (reduce (fn [m [name kind]]
+              (update m name assoc kind
+                      (if (= :setter kind)
+                        (symbol (str "set-" name "!"))
+                        (core/member-symbol class name))))
+            {}
+            (concat
+             (for [m (:members d)
+                   :when (and (= :field-decl (:ir m)) (:static m))
+                   v (get-in m [:fields :vars])]
+               [(:name v) :field])
+             (for [m (:members d)
+                   :when (and (= :method (:ir m)) (:static m))]
+               [(:name m) (case (:kind m)
+                            :getter :getter
+                            :setter :setter
+                            :method)])))))
 
 (defn- instance-member-sets [d]
   (let [ms (filter #(and (= :method (:ir %)) (not (:static %))) (:members d))]
@@ -181,7 +197,7 @@
 
 (defn- member-ctx
   "Emission context for a class body: fields excluded from mutation analysis,
-  bare static names rewritten, implicit-this members resolved."
+  bare static members rewritten, implicit-this members resolved."
   [ctx class-name members fields statics type-vars]
   (merge (assoc ctx
                 :class-name class-name
@@ -189,7 +205,7 @@
                 :scalar-fields (set (for [f fields
                                           :when (typeinfo/scalar-type? (:type f))]
                                       (:name f)))
-                :static-names statics
+                :static-members statics
                 :type-vars (set type-vars)
                 :this-sym 'this)
          (instance-member-sets {:members members})))
@@ -480,7 +496,7 @@
         all-fields (into fields super-fields)
         concrete-stubs? (and (:abstract d) (seq fields))
         class-ctx (member-ctx ctx (:name d) (:members d) all-fields
-                              (class-static-names d)
+                              (class-static-members d)
                               (keep :name (:type-params d)))
         type-sym (type-name-symbol d)
         type-sym (if concrete-stubs?
@@ -719,7 +735,13 @@
                        (:name d)))
    :top-setters (set (for [d (:decls unit)
                            :when (and (= :fn-decl (:ir d)) (= :setter (:kind d)))]
-                       (:name d)))})
+                       (:name d)))
+   :top-vars (into {}
+                   (for [d (:decls unit)
+                         :when (= :top-var-decl (:ir d))
+                         v (get-in d [:vars :vars])]
+                     [(:name v) {:const (boolean (get-in d [:vars :const]))
+                                 :final (boolean (get-in d [:vars :final]))}]))})
 
 (defn emit-unit
   "Normalized :unit IR -> vector of top-level forms, ns first.

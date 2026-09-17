@@ -84,6 +84,31 @@
 
 (def Suit-values [Suit-hearts Suit-spades])
 
+(deftype Usage
+  []
+  :type-only true
+  Usage)
+
+(defn ^Usage Usage-new []
+  (let [this (Usage)] this))
+
+(def Usage-hits 0)
+
+(defn Usage-total []
+  Usage-hits)
+
+(defn set-total! [^int v]
+  (set! Usage-hits v))
+
+(defn Usage-record [^int n]
+  (set! Usage-hits (+ Usage-hits n)))
+
+(defn Usage-summary []
+  (str Usage-hits "/" (Usage-total)))
+
+(defn setTotal [^int v]
+  (set-total! v))
+
 (comment "typedef Cb (expanded at use sites)")
 
 (comment "typedef Pair (expanded at use sites)")
@@ -183,4 +208,8 @@
     (print (.-value Suit-hearts))
     (print (fib 5))
     (loops)
-    (print oldName)))
+    (print oldName)
+    (Usage-record 2)
+    (print (Usage-summary))
+    (setTotal 5)
+    (print (Usage-summary))))

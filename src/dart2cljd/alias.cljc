@@ -75,10 +75,13 @@
     :project-types  map of type name -> project info for types declared in
                     *other* files of the batch conversion; consulted by
                     `qualify` before the default-alias fallback
+    :project-values map of top-level value name -> project info (ns/kinds)
+                    for values declared in *other* files of the batch
+                    conversion; consulted by the emitter's fallbacks
     :resolver       fn [uri] -> {:ns sym :alias sym} for imports that resolve
                     into the converted project tree (nil for external libs)"
   ([imports] (context imports nil))
-  ([imports {:keys [default-alias local-names project-types resolver]
+  ([imports {:keys [default-alias local-names project-types project-values resolver]
              :or {default-alias "m" local-names #{}}}]
    (let [entries (for [imp imports
                        :let [uri (get-in imp [:uri :value])
@@ -103,6 +106,7 @@
       :referred (into #{} (mapcat :refer) entries)
       :local-names (set local-names)
       :project-types (or project-types {})
+      :project-values (or project-values {})
       :default-alias (some-> default-alias str)})))
 
 (def snippet-context
@@ -162,8 +166,8 @@
   static members on a deftype, so batch mode emits them as ns-level fns."
   [type-id member ctx]
   (if-let [info (get (:project-types ctx) (str type-id))]
-    (let [kind (get-in info [:statics (str member)])]
-      (if kind
+    (let [kinds (get-in info [:statics (str member)])]
+      (if (seq kinds)
         (symbol (str (:ns info) "/" type-id "-" member))
         (symbol (str (qualify type-id ctx) "." member))))
     (symbol (str (qualify type-id ctx) "." member))))

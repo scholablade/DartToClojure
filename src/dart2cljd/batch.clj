@@ -27,6 +27,7 @@
             [clojure.string :as str]
             [dart2cljd.alias :as alias]
             [dart2cljd.ast :as ast]
+            [dart2cljd.emit.core :as core]
             [dart2cljd.emit.decls :as decls]
             [dart2cljd.frontend :as frontend]
             [dart2cljd.idiomatic :as idiomatic]
@@ -188,30 +189,116 @@
     [(:name d) (:ir d)]))
 
 (defn- statics-map
-  "Generated ns-level static members of a class: member name -> kind."
+  "Generated ns-level static members of a class: member name -> set of kinds
+  (:field :getter :method :setter; a getter/setter pair shares a name)."
   [ci]
-  (merge (into {} (map #(vector % :field)) (:static-fields ci))
-         (into {} (map #(vector % :getter)) (:static-getters ci))
-         (into {} (map #(vector % :setter)) (:static-setters ci))
-         (into {} (map #(vector % :method)) (:static-methods ci))
-         (into {} (keep (fn [c] (when c [c :ctor]))) (:ctors ci))))
+  (reduce (fn [m [name kind]]
+            (update m name (fnil conj #{}) kind))
+          {}
+          (concat
+           (for [n (:static-fields ci)] [n :field])
+           (for [n (:static-getters ci)] [n :getter])
+           (for [n (:static-setters ci)] [n :setter])
+           (for [n (:static-methods ci)] [n :method])
+           (for [c (:ctors ci) :when c] [c :ctor]))))
 
 (defn- type-info
   [name ns kind widget-plan ui]
-  (let [ci (get (:classes ui) name)]
+  (let [ci (get (:classes ui) name)
+        kind (if (= :type-alias kind) :typedef kind)]
     (cond-> {:ns ns :kind kind}
       ci (assoc :ctors (or (:ctors ci) #{})
                 :statics (statics-map ci))
       widget-plan (assoc :widget? true :drop-args (:drop-args widget-plan))
       (nil? ci) (assoc :ctors #{} :statics {}))))
 
+(defn- values-map
+  "Top-level values of a unit as `name -> {:ns ns :kinds #{...} :final? bool}`.
+
+  Kinds are :fn :getter :setter :var; a getter and a setter with the same
+  name merge into one entry (Dart allows the pair). `:final?` marks const and
+  final vars, which must not be assigned."
+  [ns ui]
+  (reduce (fn [m [name kind extra]]
+            (update m name
+                    (fn [e]
+                      (cond-> (-> e
+                                  (assoc :ns ns)
+                                  (update :kinds (fnil conj #{}) kind))
+                        extra (assoc :final? true)))))
+          {}
+          (concat
+           (for [n (:top-fns ui)] [n :fn nil])
+           (for [n (:top-getters ui)] [n :getter nil])
+           (for [n (:top-setters ui)] [n :setter nil])
+           (for [[n m] (:top-vars ui)]
+             [n :var (or (:const m) (:final m))]))))
+
+(defn- add-index-entries
+  "Add `entries` (in sorted file order) under `key`, first-wins with a
+  duplicate warning that names both files."
+  [acc key label entries]
+  (reduce (fn [acc {:keys [file name info]}]
+            (if-let [prev (get-in acc [key name])]
+              (update acc :warnings conj
+                      (str "duplicate " label " " name " in " (:file prev)
+                           " and " file "; " (:file prev) " wins"))
+              (assoc-in acc [key name] (assoc info :file file))))
+          acc
+          entries))
+
+(defn- typedef-target-symbol
+  "Resolve a typedef's target type to the symbol the use site should emit,
+  using the *declaring* file's emission context (its imports, local names and
+  the current project type map). Throws when the target is a bare type
+  parameter (unrepresentable at use sites)."
+  [d unit types]
+  (let [ui (decls/unit-info unit)
+        local-names (set (map first (declared-types unit)))
+        aliases (decls/unit-aliases unit {:project-types types
+                                          :local-names local-names})
+        ctx (core/ctx aliases {:unit-info ui
+                               :type-vars (set (keep :name (:type-params d)))})
+        sym (core/type-symbol (:type d) ctx)]
+    (when (contains? (set (keep :name (:type-params d))) (str sym))
+      (throw (ex-info (str "typedef " (:name d) " resolves to type parameter "
+                           sym)
+                      {:dart2cljd/kind :batch :typedef (:name d)})))
+    sym))
+
+(defn- resolve-typedefs
+  "Iteratively expand project typedef targets until a fixpoint, so typedef
+  chains (also across files) resolve. Typedefs that stay unresolved (cycles,
+  type-parameter targets) keep no target and fail loudly at their use sites."
+  [types parsed]
+  (loop [types types passes 0]
+    (if (>= passes 10)
+      types
+      (let [progress (volatile! false)
+            types' (reduce (fn [types {:keys [unit]}]
+                             (reduce (fn [types d]
+                                       (if (nil? (:typedef-target (get types (:name d))))
+                                         (if-let [sym (try
+                                                        (typedef-target-symbol d unit types)
+                                                        (catch Exception _ nil))]
+                                           (do (vswap! progress (constantly true))
+                                               (assoc-in types [(:name d) :typedef-target] sym))
+                                           types)
+                                         types))
+                                     types
+                                     (filter #(= :type-alias (:ir %)) (:decls unit))))
+                           types
+                           parsed)]
+        (if @progress (recur types' (inc passes)) types')))))
+
 (defn build-index
   "Pass 1 of batch conversion: build the cross-file index from parsed files
   (`[{:file rel :unit unit} ...]`, sorted by path).
 
-  Returns `{:file->ns ... :package ... :project-types ... :warnings [...]}`.
-  Type names are global to the generated project; duplicate declarations are
-  a warning and first-wins by sorted path (deterministic)."
+  Returns `{:file->ns ... :package ... :project-types ... :project-values ...
+  :warnings [...]}`. Type and value names are global to the generated
+  project; duplicate declarations are a warning and first-wins by sorted
+  path (deterministic)."
   [parsed opts]
   (let [file->ns (into {} (map (fn [{:keys [file]}] [file (path->ns file opts)]))
                        parsed)
@@ -223,22 +310,16 @@
                       [name kind] (declared-types unit)]
                   {:file file :name name
                    :info (type-info name ns kind (get widgets name) ui)})
-        {:keys [types warnings]}
-        (reduce (fn [{:keys [types warnings]} {:keys [file name info]}]
-                  (if-let [prev (get types name)]
-                    {:types types
-                     :warnings (conj warnings
-                                     (str "duplicate type " name " in "
-                                          (:file prev) " and " file
-                                          "; " (:file prev) " wins"))}
-                    {:types (assoc types name (assoc info :file file))
-                     :warnings warnings}))
-                {:types {} :warnings []}
-                entries)]
-    {:file->ns file->ns
-     :package (:package opts)
-     :project-types types
-     :warnings warnings}))
+        value-entries (for [{:keys [file unit]} parsed
+                            :let [ns (get file->ns file)
+                                  ui (decls/unit-info unit)]
+                            [name info] (values-map ns ui)]
+                        {:file file :name name :info info})
+        base (-> {:project-types {} :project-values {} :warnings []}
+                 (add-index-entries :project-types "type" entries)
+                 (add-index-entries :project-values "value" value-entries))
+        base (update base :project-types #(resolve-typedefs % parsed))]
+    (assoc base :file->ns file->ns :package (:package opts))))
 
 ;; ---------------------------------------------------------------------------
 ;; import resolution (per file)
@@ -323,13 +404,22 @@
 (defn- emit-source
   "Emit one unit for batch output (ns from the path, project index attached,
   mode honored)."
-  [unit rel ns {:keys [mode resolver project-types]}]
+  [unit rel ns {:keys [mode resolver project-types project-values]}]
   (printer/print-forms
    (decls/emit-unit unit
                     (cond-> {:ns ns :path rel
                              :resolver resolver
-                             :project-types project-types}
+                             :project-types project-types
+                             :project-values project-values}
                       (= :idiomatic mode) (assoc :mode :idiomatic)))))
+
+(defn- file-project-values
+  "Project values declared in *other* files: same-file values stay bare
+  (namespace-level references need no qualification)."
+  [index rel]
+  (let [ns (get (:file->ns index) rel)]
+    (into {} (remove (fn [[_ info]] (= ns (:ns info))))
+          (:project-values index))))
 
 (defn convert-one
   "Translate one parsed unit and write `<out>/<rel>.cljd`.
@@ -341,7 +431,8 @@
         resolver (file-resolver index rel unit)
         source (str (emit-source unit rel ns (assoc opts
                                                     :resolver resolver
-                                                    :project-types (:project-types index)))
+                                                    :project-types (:project-types index)
+                                                    :project-values (file-project-values index rel)))
                     "\n")
         out-file (java.io.File. (str out) (str/replace rel #"\.dart$" ".cljd"))]
     (io/make-parents out-file)

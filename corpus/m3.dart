@@ -56,6 +56,28 @@ enum Suit {
   const Suit(this.value);
 }
 
+// In-file static member shapes: bare field/getter/setter references and a
+// qualified static setter write.
+class Usage {
+  static int hits = 0;
+
+  static int get total => hits;
+
+  static set total(int v) {
+    hits = v;
+  }
+
+  static void record(int n) {
+    hits += n;
+  }
+
+  static String summary() => '$hits/$total';
+}
+
+void setTotal(int v) {
+  Usage.total = v;
+}
+
 typedef Cb = void Function(int);
 typedef Pair<A, B> = (A, B);
 
@@ -130,4 +152,8 @@ void main() {
   print(fib(5));
   loops();
   print(oldName);
+  Usage.record(2);
+  print(Usage.summary());
+  setTotal(5);
+  print(Usage.summary());
 }

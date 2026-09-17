@@ -144,29 +144,40 @@
               "models/item.dart" 'app.models.item
               "widgets/button.dart" 'app.widgets.button}
              (:file->ns index)))
-      (is (= #{"Item" "Button"} (set (keys (:project-types index)))))
+      (is (= #{"Item" "Button" "Label"} (set (keys (:project-types index)))))
       (testing "class info: namespace, constructors and statics"
         (is (= 'app.models.item (get-in index [:project-types "Item" :ns])))
         (is (= :class (get-in index [:project-types "Item" :kind])))
         (is (= #{nil} (get-in index [:project-types "Item" :ctors])))
-        (is (= {"kind" :field "make" :method}
+        (is (= {"kind" #{:field} "count" #{:field}
+                "total" #{:getter :setter} "make" #{:method}}
                (get-in index [:project-types "Item" :statics]))))
+      (testing "typedef targets are expanded in the declaring file's context"
+        (is (= 'String (get-in index [:project-types "Label" :typedef-target]))))
+      (testing "top-level values are indexed with their kinds"
+        (is (= #{:fn} (get-in index [:project-values "tag" :kinds])))
+        (is (= 'app.models.item (get-in index [:project-values "tag" :ns])))
+        (is (= #{:var} (get-in index [:project-values "itemCount" :kinds])))
+        (is (= #{:fn} (get-in index [:project-values "bumpCount" :kinds]))))
       (testing "no warnings for distinct type names"
         (is (empty? (:warnings index)))))))
 
 (deftest duplicate-type-names-warn-and-first-wins
   (if-not (dart?)
     (is true "dart binary not present; skipped")
-    (let [unit (batch/parse-unit "models/item.dart" {:dir fixture-dir
-                                                     :dart dart-bin})
-          index (batch/build-index [{:file "a/item.dart" :unit unit}
-                                    {:file "b/item.dart" :unit unit}]
-                                   {:package "batchproj"})]
-      (is (= 1 (count (:warnings index))))
-      (is (str/includes? (first (:warnings index)) "duplicate type Item"))
-      (is (str/includes? (first (:warnings index)) "a/item.dart"))
-      (testing "first file in sorted order wins"
-        (is (= 'a.item (get-in index [:project-types "Item" :ns])))))))
+    (let [dir (temp-dir)]
+      (write-file! dir "a/item.dart" "class Item {\n  int a = 1;\n}\n")
+      (write-file! dir "b/item.dart" "class Item {\n  int b = 2;\n}\n")
+      (let [parsed (mapv (fn [rel]
+                           {:file rel
+                            :unit (batch/parse-unit rel {:dir dir :dart dart-bin})})
+                         ["a/item.dart" "b/item.dart"])
+            index (batch/build-index parsed {:package "dup"})]
+        (is (= 1 (count (:warnings index))))
+        (is (str/includes? (first (:warnings index)) "duplicate type Item"))
+        (is (str/includes? (first (:warnings index)) "a/item.dart"))
+        (testing "first file in sorted order wins"
+          (is (= 'a.item (get-in index [:project-types "Item" :ns]))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; batch conversion (requires the Dart frontend)
@@ -208,6 +219,21 @@
           (is (str/includes? main "batch.models.item/Item-kind"))
           (is (str/includes? main "(batch.models.item/Item-make \"box\")"))
           (is (str/includes? main "(.-label (batch.models.item/Item-make"))))
+      (testing "cross-file top-level values keep their generated namespaces"
+        (let [main (slurp (io/file out "main.cljd"))
+              item (slurp (io/file out "models/item.cljd"))]
+          (is (str/includes? main "(batch.models.item/tag item)"))
+          (is (str/includes? main "(set! batch.models.item/itemCount 0)"))
+          (is (str/includes? main "(set! batch.models.item/Item-count (+ batch.models.item/Item-count 2))"))
+          (is (str/includes? main "(batch.models.item/set-total! 0)"))
+          (is (str/includes? main "(batch.models.item/Item-total)"))
+          (testing "same-file values stay bare"
+            (is (str/includes? item "(set! itemCount (inc itemCount))"))
+            (is (not (str/includes? item "(set! batch.models.item/itemCount"))))))
+      (testing "cross-file typedefs expand to their target type"
+        (let [button (slurp (io/file out "widgets/button.cljd"))]
+          (is (str/includes? button "^String caption"))
+          (is (not (str/includes? button "Label")))))
       (testing "local fields shadow project import aliases"
         (let [button (slurp (io/file out "widgets/button.cljd"))]
           (is (str/includes? button "(.-display item)"))))
@@ -215,6 +241,42 @@
         (is (not (.exists (io/file out "orphan_part.cljd")))))
       (testing "the skipped generated file is not written"
         (is (not (.exists (io/file out "generated.g.cljd"))))))))
+
+(defn- convert-temp
+  "Convert `files` (`{rel content}`) in a temp project; returns the report."
+  [files]
+  (let [dir (temp-dir)
+        out (temp-dir)]
+    (doseq [[rel content] files]
+      (write-file! dir rel content))
+    (batch/convert-dir {:dir dir :out out :dart dart-bin :package "tmp"})))
+
+(deftest cross-file-loud-failures
+  (if-not (dart?)
+    (is true "dart binary not present; skipped")
+    (do
+      (testing "an unknown static member on another file's class"
+      (let [r (convert-temp {"a.dart" "class A {\n  static int x = 1;\n}\n"
+                             "b.dart" "import 'a.dart';\nvoid f() {\n  A.nope = 2;\n}\n"})]
+        (is (= 1 (:exit r)))
+        (is (= ["b.dart"] (map :file (:failed r))))
+        (is (str/includes? (ex-message (:error (first (:failed r))))
+                           "unknown static member"))))
+    (testing "a cross-file getter called as a function"
+      (let [r (convert-temp {"a.dart" "int get total => 1;\n"
+                             "b.dart" "import 'a.dart';\nint f() {\n  return total();\n}\n"})]
+        (is (= ["b.dart"] (map :file (:failed r))))
+        (is (str/includes? (ex-message (:error (first (:failed r))))
+                           "is a getter"))))
+    (testing "a typedef that resolves to a type parameter"
+      (let [r (convert-temp {"a.dart" "typedef Id<T> = T;\n"
+                             "b.dart" (str "import 'a.dart';\n"
+                                           "class B {\n"
+                                           "  final Id value = 1;\n"
+                                           "}\n")})]
+        (is (= ["b.dart"] (map :file (:failed r))))
+        (is (str/includes? (ex-message (:error (first (:failed r))))
+                           "cannot expand typedef")))))))
 
 (deftest convert-dir-is-deterministic
   (if-not (dart?)

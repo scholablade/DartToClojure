@@ -13,8 +13,9 @@
                  with `atom` instead of `volatile!`)
     :fields      instance field names in scope (never treated as mutable
                  locals, never dereferenced)
-    :static-names map of bare class-static names -> emitted symbols, for
-                 method bodies that reference statics without qualification
+    :static-members map of bare class-static member name -> {kind symbol},
+                 for method bodies that reference statics without qualification
+                 (kinds: :field :getter :method :setter)
     :class-name  current class (for bare static references in methods)
     :unit-info   whole-unit class/typedef/getter table built by emit.decls
     :type-vars   type parameters in scope (kept bare in type positions)
@@ -31,7 +32,7 @@
             [dart2cljd.mutable :as mutable]
             [dart2cljd.typeinfo :as typeinfo]))
 
-(declare emit-expr emit-increment type-symbol)
+(declare emit-expr emit-increment type-symbol assign-slot)
 
 (defn fail!
   "Raise a loud, positioned emission error."
@@ -53,7 +54,7 @@
           :local-types {}
           :type-vars #{}}
          (select-keys opts [:mode :emit-body :emit-stmt :emit-switch-expr
-                            :mutable :captured :fields :locals :static-names
+                            :mutable :captured :fields :locals :static-members
                             :class-name :unit-info :type-vars :this-sym
                             :local-types :instance-methods :instance-getters
                             :instance-setters :atom-fields :state-ctx
@@ -113,6 +114,33 @@
   [name ctx]
   (get (get-in ctx [:aliases :project-types]) (str name)))
 
+(defn- project-value-info
+  "Batch-mode index info for a top-level value declared in another file of
+  the same project, or nil."
+  [name ctx]
+  (get (get-in ctx [:aliases :project-values]) (str name)))
+
+(defn- project-value-symbol [info name]
+  (symbol (str (:ns info) "/" name)))
+
+(defn- own-instance-member?
+  "True when the current class declares an instance member with this name.
+  Dart scoping gives instance members priority over cross-file top-level
+  values; members inherited from outside the unit are not visible to this
+  syntactic pass (documented approximation)."
+  [name ctx]
+  (let [n (str name)]
+    (or (contains? (:fields ctx) n)
+        (contains? (:instance-methods ctx) n)
+        (contains? (:instance-getters ctx) n)
+        (contains? (:instance-setters ctx) n))))
+
+(defn- static-member-info
+  "Kind map `{kind symbol}` for a bare static member of the current class, or
+  nil."
+  [name ctx]
+  (get (:static-members ctx) (str name)))
+
 (defn- project-ctor-symbol
   "Ns-level make-fn symbol for a constructor of a project type, or nil when
   the index does not know that constructor."
@@ -155,11 +183,16 @@
     (case (:ir node)
       :named-type
       (let [{:keys [prefix name]} node
-            name (str name)]
+            name (str name)
+            ptype (project-type-info name ctx)]
         (cond
           prefix (symbol (str prefix "/" name))
           (contains? (:type-vars ctx) name) (symbol name)
           (typedef-type name ctx) (type-symbol (typedef-type name ctx) ctx)
+          (:typedef-target ptype) (:typedef-target ptype)
+          (= :typedef (:kind ptype))
+          (fail! node (str "cannot expand typedef " name " (defined in "
+                           (:file ptype) "); use a concrete type instead"))
           (contains? bare-types name) (symbol name)
           :else (alias/qualify name (:aliases ctx))))
 
@@ -463,25 +496,25 @@
         f (first links)
         member (:name f)
         more (rest links)
-        kind (get (:statics info) member)
+        kinds (get (:statics info) member)
         sym (symbol (str (:ns info) "/" class "-" member))
         base-form (case (:kind f)
-                    :get (case kind
-                           :field sym
-                           :getter (list sym)
-                           :method sym ; tear-off
-                           :ctor sym   ; constructor tear-off
-                           nil (fail! node (str "unknown static member "
-                                                class "." member)))
-                    :call (case kind
-                            :method (list* sym (emit-args (:args f) ctx))
-                            :ctor (list* sym (emit-args (:args f) ctx))
-                            :getter (fail! node (str class "." member
-                                                     " is a getter, not a method"))
-                            :field (fail! node (str class "." member
-                                                    " is a field, not a method"))
-                            nil (fail! node (str "unknown static member "
-                                                 class "." member))))]
+                    :get (cond
+                           (contains? kinds :field) sym
+                           (contains? kinds :getter) (list sym)
+                           (contains? kinds :method) sym ; tear-off
+                           (contains? kinds :ctor) sym   ; constructor tear-off
+                           :else (fail! node (str "unknown static member "
+                                                  class "." member)))
+                    :call (cond
+                            (contains? kinds :method) (list* sym (emit-args (:args f) ctx))
+                            (contains? kinds :ctor) (list* sym (emit-args (:args f) ctx))
+                            (contains? kinds :getter) (fail! node (str class "." member
+                                                                       " is a getter, not a method"))
+                            (contains? kinds :field) (fail! node (str class "." member
+                                                                      " is a field, not a method"))
+                            :else (fail! node (str "unknown static member "
+                                                   class "." member))))]
     (when (:widget? info)
       (fail! node (str class " is translated as a widget builder fn; static "
                        "member access is not available in idiomatic mode")))
@@ -540,7 +573,7 @@
 
 (defn- emit-fn-call
   "Unqualified call: `foo(...)` (top-level function, constructor, static
-  member, or implicit-this method)."
+  member, cross-file project value, or implicit-this method)."
   [node ctx]
   (let [n (:name node)]
     (cond
@@ -553,6 +586,25 @@
       (local-class? n ctx)
       (fail! node (str n " has no unnamed constructor"))
 
+      (static-member-info n ctx)
+      (let [sm (static-member-info n ctx)]
+        (cond
+          (:method sm) (list* (:method sm) (emit-args (:args node) ctx))
+          (:field sm) (fail! node (str n " is a static field, not a method"))
+          (:getter sm) (fail! node (str n " is a static getter; read it as a property"))
+          :else (fail! node (str n " is a static setter; assign to it"))))
+
+      (and (project-value-info n ctx) (not (own-instance-member? n ctx)))
+      (let [{:keys [kinds] :as info} (project-value-info n ctx)]
+        (cond
+          (or (contains? kinds :fn) (contains? kinds :var))
+          (list* (project-value-symbol info n) (emit-args (:args node) ctx))
+
+          (contains? kinds :getter)
+          (fail! node (str n " is a getter; read it as a property"))
+
+          :else (fail! node (str n " is a setter; assign to it"))))
+
       (project-type-info n ctx)
       (let [info (project-type-info n ctx)]
         (if (:widget? info)
@@ -564,9 +616,6 @@
 
       (class-like? n ctx)
       (list* (alias/qualify n (:aliases ctx)) (emit-args (:args node) ctx))
-
-      (contains? (:static-names ctx) n)
-      (list* (get (:static-names ctx) n) (emit-args (:args node) ctx))
 
       (and (:this-sym ctx)
            (not (known-bare? n ctx)))
@@ -788,6 +837,99 @@
 (defn- simple-target? [node]
   (contains? #{:id :this :super} (:ir node)))
 
+(defn- increment-form
+  "Build the cljd form for `place++`/`++place` (and --) given the read and
+  write forms of the place. Dart evaluates the place once, so the old value
+  is bound before the write."
+  [read-form write-form op prefix?]
+  (if prefix?
+    (write-form (list op read-form))
+    (list 'let [(symbol "d2c$old") read-form]
+          (write-form (list op (symbol "d2c$old")))
+          (symbol "d2c$old"))))
+
+(defn- static-write-target
+  "When `lhs` names a static member of a class (declared in this unit or in
+  another file of the batch), return a place descriptor
+  `{:read <form-or-nil> :write <fn>}`; nil when `lhs` is not a static
+  access. Reads are nil for write-only setters; members that cannot be
+  assigned fail loudly."
+  [lhs ctx]
+  (let [obj (:target lhs)
+        member (:name lhs)]
+    (when (and (= :id (:ir obj))
+               (not (alias/import-prefix? (:name obj) (:aliases ctx))))
+      (let [class (:name obj)
+            linfo (class-info class ctx)
+            pinfo (project-type-info class ctx)]
+        (cond
+          linfo
+          (let [field? (contains? (:static-fields linfo) member)
+                setter? (contains? (:static-setters linfo) member)
+                getter? (contains? (:static-getters linfo) member)
+                method? (contains? (:static-methods linfo) member)
+                ctor? (contains? (:ctors linfo) member)
+                field-sym (member-symbol class member)
+                setter-sym (symbol (str "set-" member "!"))]
+            (cond
+              field? {:read field-sym :write (fn [v] (list 'set! field-sym v))}
+              setter? {:read (when getter? (list field-sym))
+                       :write (fn [v] (list setter-sym v))}
+              getter? (fail! lhs (str class "." member " is a getter, not assignable"))
+              method? (fail! lhs (str class "." member " is a method, not assignable"))
+              ctor? (fail! lhs (str class "." member " is a constructor, not assignable"))
+              :else (fail! lhs (str "unknown static member " class "." member))))
+
+          pinfo
+          (let [kinds (get (:statics pinfo) member)
+                field-sym (symbol (str (:ns pinfo) "/" class "-" member))
+                setter-sym (symbol (str (:ns pinfo) "/set-" member "!"))]
+            (cond
+              (contains? kinds :field)
+              {:read field-sym :write (fn [v] (list 'set! field-sym v))}
+
+              (contains? kinds :setter)
+              {:read (when (contains? kinds :getter) (list field-sym))
+               :write (fn [v] (list setter-sym v))}
+
+              (contains? kinds :getter)
+              (fail! lhs (str class "." member " is a getter, not assignable"))
+
+              (contains? kinds :method)
+              (fail! lhs (str class "." member " is a method, not assignable"))
+
+              (contains? kinds :ctor)
+              (fail! lhs (str class "." member " is a constructor, not assignable"))
+
+              :else (fail! lhs (str "unknown static member " class "." member)))))))))
+
+(defn- assign-static
+  "Assign to a place descriptor from `static-write-target`."
+  [st op rhs lhs]
+  (when (and (nil? (:read st)) (not (contains? #{nil "="} op)))
+    (fail! lhs "compound assignment needs a matching getter"))
+  (assign-slot (:read st) (:write st) (if (nil? op) "=" op) rhs))
+
+(defn- emit-increment-place
+  "`x++` on a property/index target, incl. static members of classes."
+  [target node ctx op prefix?]
+  (if-let [st (and (= :prop (:ir target)) (static-write-target target ctx))]
+    (do
+      (when (nil? (:read st))
+        (fail! node (str (:name target) " has no getter; cannot modify it")))
+      (increment-form (:read st) (:write st) op prefix?))
+    (let [read (emit-expr target ctx)
+          setter (if (= :index (:ir target))
+                   (fn [v] (list '. (emit-expr (:target target) ctx)
+                                 "[]=" (emit-expr (:index target) ctx) v))
+                   (fn [v] (list (symbol (str ".-" (:name target) "!"))
+                                 (emit-expr (:target target) ctx) v)))]
+      (if (or prefix? (simple-target? (:target target)))
+        (setter (list op read))
+        (list 'let [(symbol "d2c$old") read]
+              (setter (list op (symbol "d2c$old")))
+              (symbol "d2c$old"))))))
+
 (defn- emit-increment
   "`x++` / `++x` (and --) preserving Dart value semantics."
   [node ctx prefix?]
@@ -795,7 +937,8 @@
         target (:operand node)]
     (case (:ir target)
       :id
-      (let [n (:name target)]
+      (let [n (:name target)
+            sm (static-member-info n ctx)]
         (cond
           (contains? (get-in (:local-types ctx) [:classes]) n)
           (do
@@ -825,31 +968,54 @@
               (list 'let [(symbol "d2c$old") (list 'deref a)]
                     write (symbol "d2c$old"))))
 
+          sm
+          (let [{:keys [field getter setter]} sm]
+            (cond
+              field (increment-form field (fn [v] (list 'set! field v)) op prefix?)
+              setter (if getter
+                       (increment-form (list getter)
+                                       (fn [v] (list setter v))
+                                       op prefix?)
+                       (fail! node (str n " has no static getter; cannot modify it")))
+              :else (fail! node (str n " is not modifiable"))))
+
+          (and (project-value-info n ctx) (not (own-instance-member? n ctx)))
+          (let [{:keys [kinds] :as info} (project-value-info n ctx)
+                sym (project-value-symbol info n)]
+            (cond
+              (contains? kinds :var)
+              (if (:final? info)
+                (fail! node (str n " is final; incrementing is invalid Dart"))
+                (increment-form sym (fn [v] (list 'set! sym v)) op prefix?))
+
+              (contains? kinds :setter)
+              (if (contains? kinds :getter)
+                (increment-form (list sym)
+                                (fn [v] (list (symbol (str (:ns info) "/set-" n "!")) v))
+                                op prefix?)
+                (fail! node (str n " has no getter; cannot modify it")))
+
+              :else (fail! node (str n " is not modifiable"))))
+
           :else
           (let [write (list 'set! (symbol n) (list op (symbol n)))]
             (if prefix?
               write
               (list 'let [(symbol "d2c$old") (symbol n)] write (symbol "d2c$old"))))))
 
-      (:prop :index)
-      (let [read (emit-expr target ctx)
-            setter (if (= :index (:ir target))
-                     (fn [v] (list '. (emit-expr (:target target) ctx)
-                                   "[]=" (emit-expr (:index target) ctx) v))
-                     (fn [v] (list (symbol (str ".-" (:name target) "!"))
-                                   (emit-expr (:target target) ctx) v)))
-            write (setter (list op read))]
-        (if (or prefix? (simple-target? (:target target)))
-          write
-          (list 'let [(symbol "d2c$old") read]
-                (setter (list op (symbol "d2c$old")))
-                (symbol "d2c$old"))))
+      :prop (emit-increment-place target node ctx op prefix?)
+      :prefixed-id (emit-increment-place (assoc target :ir :prop
+                                                :target (id-node (:prefix target)
+                                                                 (:src target)))
+                                         node ctx op prefix?)
+      :index (emit-increment-place target node ctx op prefix?)
 
       (fail! node "unsupported increment/decrement target"))))
 
 (defn- assign-id [lhs op rhs ctx]
   (let [n (:name lhs)
-        op (if (= "=" op) nil op)]
+        op (if (= "=" op) nil op)
+        sm (static-member-info n ctx)]
     (cond
       (contains? (:mutable ctx) n)
       (let [setter (if (contains? (:captured ctx) n) 'swap! 'vswap!)
@@ -889,6 +1055,37 @@
       (and (:this-sym ctx)
            (contains? (:instance-setters ctx) n))
       (list (symbol (str ".-" n "!")) (:this-sym ctx) rhs)
+
+      (and sm (not (contains? (:locals ctx) n)))
+      (let [{:keys [field getter setter]} sm]
+        (cond
+          field (assign-static {:read field
+                                :write (fn [v] (list 'set! field v))}
+                               op rhs lhs)
+          setter (assign-static {:read (when getter (list getter))
+                                 :write (fn [v] (list setter v))}
+                                op rhs lhs)
+          :else (fail! lhs (str n " is not assignable"))))
+
+      (and (project-value-info n ctx)
+           (not (own-instance-member? n ctx))
+           (not (contains? (:locals ctx) n)))
+      (let [{:keys [kinds final?] :as info} (project-value-info n ctx)
+            sym (project-value-symbol info n)
+            setter-sym (symbol (str (:ns info) "/set-" n "!"))]
+        (cond
+          (contains? kinds :setter)
+          (assign-static {:read (when (contains? kinds :getter) (list sym))
+                          :write (fn [v] (list setter-sym v))}
+                         op rhs lhs)
+
+          (contains? kinds :var)
+          (if final?
+            (fail! lhs (str n " is final; assignment is invalid Dart"))
+            (assign-static {:read sym :write (fn [v] (list 'set! sym v))}
+                           op rhs lhs))
+
+          :else (fail! lhs (str n " is not assignable"))))
 
       :else
       (case op
@@ -931,10 +1128,14 @@
   [lhs op rhs ctx]
   (case (:ir lhs)
     :id (assign-id lhs op rhs ctx)
-    :prop (assign-prop lhs op rhs ctx)
-    :prefixed-id (assign-prop (assoc lhs :ir :prop
-                                     :target (id-node (:prefix lhs) (:src lhs)))
-                              op rhs ctx)
+    :prop (if-let [st (static-write-target lhs ctx)]
+            (assign-static st op rhs lhs)
+            (assign-prop lhs op rhs ctx))
+    :prefixed-id (let [p (assoc lhs :ir :prop
+                                :target (id-node (:prefix lhs) (:src lhs)))]
+                   (if-let [st (static-write-target p ctx)]
+                     (assign-static st op rhs p)
+                     (assign-prop p op rhs ctx)))
     :index (assign-index lhs op rhs ctx)
     (fail! lhs "unsupported assignment target")))
 
@@ -1073,18 +1274,33 @@
 ;; ---------------------------------------------------------------------------
 
 (defn emit-id
-  "Emit a bare identifier: mutable box -> deref, static/class members, top
-  getters, implicit-this members, otherwise alias resolution."
+  "Emit a bare identifier: mutable box -> deref, locals/fields, static and
+  class members, top getters, cross-file project values, implicit-this
+  members, otherwise alias resolution. Dart scoping is innermost-first:
+  locals shadow class members, class members shadow top-level names."
   [name ctx]
-  (let [n (str name)]
+  (let [n (str name)
+        sm (static-member-info n ctx)]
     (cond
       (contains? (:mutable ctx) n) (list 'deref (symbol n))
-      (contains? (:static-names ctx) n) (get (:static-names ctx) n)
-      (contains? (get-in ctx [:unit-info :top-getters]) n) (list (symbol n))
-      (contains? (get-in ctx [:unit-info :widget-fns]) n) (symbol n)
       (contains? (:locals ctx) n) (symbol n)
       (contains? (:fields ctx) n) (symbol n)
       (contains? (:atom-fields ctx) n) (list 'deref (get (:atom-fields ctx) n))
+      sm (cond
+           (:field sm) (:field sm)
+           (:getter sm) (list (:getter sm))
+           (:method sm) (:method sm) ; tear-off
+           (:setter sm) (fail! {:src nil}
+                               (str n " is a write-only static setter")))
+      (contains? (get-in ctx [:unit-info :top-getters]) n) (list (symbol n))
+      (contains? (get-in ctx [:unit-info :widget-fns]) n) (symbol n)
+      (and (project-value-info n ctx) (not (own-instance-member? n ctx)))
+      (let [{:keys [kinds] :as info} (project-value-info n ctx)]
+        (cond
+          (contains? kinds :var) (project-value-symbol info n)
+          (contains? kinds :getter) (list (project-value-symbol info n))
+          (contains? kinds :fn) (project-value-symbol info n)
+          :else (fail! {:src nil} (str n " is a write-only setter"))))
       (and (:this-sym ctx)
            (not (known-bare? n ctx)))
       (list (symbol (str ".-" n)) (:this-sym ctx))

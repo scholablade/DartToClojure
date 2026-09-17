@@ -2,8 +2,9 @@ import '../models/item.dart';
 
 class Button {
   final Item item;
+  final Label caption;
 
-  Button(this.item);
+  Button(this.item, this.caption);
 
-  String render() => 'Button: ${item.display}';
+  String render() => 'Button[$caption]: ${item.display}';
 }

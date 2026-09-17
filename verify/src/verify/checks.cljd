@@ -56,6 +56,16 @@
   (is (= "Point(3.0, 3.0)"
          (str (g/addAny (g/Point-make 1) (g/Point-make 2))))))
 
+(deftest in-file-statics
+  (is (= "0/0" (g/Usage-summary)))
+  (g/Usage-record 2)
+  (is (= "2/2" (g/Usage-summary)))
+  (is (= 2 g/Usage-hits))
+  (g/setTotal 7)
+  (is (= "7/7" (g/Usage-summary)))
+  (g/set-total! 9)
+  (is (= 9 (g/Usage-total))))
+
 (deftest async-work
   (is (= 6 (await (g/work 5)))))
 
@@ -69,9 +79,19 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest cross-file-project
-  (is (= "Button: widget (3.5)" (bp/describe (item/Item-new "widget" 3.5))))
+  (is (= "Button[b]: widget (3.5)" (bp/describe (item/Item-new "widget" 3.5))))
   (is (= "item: box" (bp/describeKind)))
   (is (= 5.0 (bp/hyp 3.0 4.0))))
+
+(deftest cross-file-values-and-statics
+  (bp/resetCounts)
+  (is (= "x:0" (bp/tagOf (item/Item-new "x" 1.0))))
+  (is (= "1/2/2" (bp/touch)))
+  (is (= "x:1" (bp/tagOf (item/Item-new "x" 1.0))))
+  (is (= 2 (item/Item-total)))
+  (item/set-total! 9)
+  (is (= 9 (item/Item-total)))
+  (is (= 9 item/Item-count)))
 
 ;; ---------------------------------------------------------------------------
 ;; idiomatic widget runtime (corpus/idiomatic.dart translation)
