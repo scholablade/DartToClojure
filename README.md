@@ -103,8 +103,10 @@ atoms subscribed through `f/widget :watch`, `.child`/`.body`/`.home` chains of
 three or more widgets are threaded by `f/widget`, and `%` uses `mod`.
 Constructor `key` params are kept (the builder fn takes `.key` and wraps in
 `KeyedSubtree`), and every `setState` bumps a hidden tick atom, so callbacks
-that write no state atom still rebuild. Unrecognized widget shapes fall back
-to the faithful `deftype` output.
+that write no state atom still rebuild. `initState`-created fields (and their
+`dispose`) become `f/widget :managed` resources created once, with
+`vsync: this` mapped to the `:vsync` directive. Unrecognized widget shapes
+fall back to the faithful `deftype` output.
 
 ```dart
 class Greeting extends StatelessWidget {
