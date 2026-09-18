@@ -67,6 +67,8 @@ The CLI keeps DartClojure's flag surface, so editor integrations port over:
 | `--ns-prefix P` | batch mode: prefix for generated namespaces |
 | `--exclude GLOB` | batch mode: skip files matching GLOB (repeatable) |
 | `--package NAME` | batch mode: Dart package name (default: nearest `pubspec.yaml`) |
+| `--exports-file PATH` | batch mode: write the external-exports Dart shim here |
+| `--exports-uri URI` | batch mode: URI under which generated code requires that shim |
 
 ### Batch conversion (`--dir`)
 
@@ -96,8 +98,17 @@ to the generated `Class-new` / `Class-member` names, top-level
 functions/getters/vars are called through their generated namespace, and
 cross-file typedefs expand to their target type. Writes work too: mutable
 top-level vars (`set!`), static fields, setters and increments across files.
-`dart:*` and external packages stay string requires. `part`, `part of`
-and `export` fail loudly (ClojureDart cannot express them).
+`dart:*` and external packages stay string requires.
+
+**Barrel files (`export`)**: importing a re-exporting file pulls in the
+generated namespaces of its project exports, and — when it re-exports
+packages — one require of a generated **exports shim** under the alias
+`exports`, through which otherwise-unresolved names are qualified
+(`exports/BlocProvider`). Pass `--exports-file PATH --exports-uri URI` to
+write that shim (it must live in the target project's Dart package, e.g.
+`lib/d2c_exports.dart` / `package:my_app/d2c_exports.dart`); without the flags
+files that need it fail with an actionable message. `part`, `part of` and
+mixins with fields fail loudly (ClojureDart cannot express them yet).
 
 ### API
 
@@ -243,9 +254,10 @@ These are deliberate and recorded with their probe evidence in
 
 - `e as T` → `^T` hint; the Dart runtime `CastError` is not reproduced.
 - Faithful `%` emits `(. a % b)` (Dart euclidean `%`); idiomatic mode uses `mod`.
-- Generators (`yield`, `async*`, `sync*`) and `operator []=` fail loudly:
-  ClojureDart cannot express them.
-- Dart extensions and extension types fail loudly.
+- Generators (`yield`, `async*`, `sync*`), `operator []=`, `part`/`part of`,
+  Dart extensions/extension types and mixins with fields fail loudly:
+  ClojureDart cannot express them (mixin inlining is planned, PLAN.md §13).
+  `export` is supported through the generated exports shim (batch mode).
 - Non-const records are wrapped in `cljd.core/identity` (upstream compiler bug).
 - User-operator dispatch uses a syntactic type pass plus `dart/is?` guards for
   unknown *identifier* receivers; compound assignments and operators on other
@@ -264,3 +276,7 @@ These are deliberate and recorded with their probe evidence in
   `.dart2cljd-cache/` (`dart run` re-JITs `package:analyzer` at ~40 s per
   call; the snapshot is ~1.3 s and is rebuilt when `bin/astdump.dart`
   changes).
+- M8 batch features (barrel `export` support + exports shim, C-style
+  collection-for, statement-for fixes) are implemented and manually verified
+  but not yet covered by `make gate` fixtures; see `PLAN.md` §13 for the
+  remaining work.
