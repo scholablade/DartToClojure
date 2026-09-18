@@ -211,6 +211,10 @@
     :parse-fn str]
    [nil "--package NAME" "Batch mode: Dart package name (default: nearest pubspec.yaml)"
     :parse-fn str]
+   [nil "--exports-file PATH" "Batch mode: write the external-exports Dart shim here"
+    :parse-fn str]
+   [nil "--exports-uri URI" "Batch mode: URI under which generated code requires the shim"
+    :parse-fn str]
    ["-h" "--help"]])
 
 (defn cli-opts
@@ -225,10 +229,12 @@
 
 (defn batch-opts
   "CLI options -> `convert-dir` kwargs."
-  [{:keys [dir out ns-prefix exclude package]} conversion-opts]
+  [{:keys [dir out ns-prefix exclude package exports-file exports-uri]} conversion-opts]
   (cond-> (assoc conversion-opts :dir dir :out out :exclude (vec exclude))
     (some? ns-prefix) (assoc :ns-prefix ns-prefix)
-    (some? package) (assoc :package package)))
+    (some? package) (assoc :package package)
+    (some? exports-file) (assoc :exports-file exports-file)
+    (some? exports-uri) (assoc :exports-uri exports-uri)))
 
 (defn- show [s colors] (println (if colors (colorize (str s)) (str s))))
 

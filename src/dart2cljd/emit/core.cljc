@@ -622,7 +622,10 @@
       (list* (symbol (str "." n)) (:this-sym ctx) (emit-args (:args node) ctx))
 
       :else
-      (list* (symbol n) (emit-args (:args node) ctx)))))
+      (list* (if (and (:wildcard-alias (:aliases ctx)) (not (known-bare? n ctx)))
+               (alias/qualify n (:aliases ctx))
+               (symbol n))
+             (emit-args (:args node) ctx)))))
 
 ;; ---------------------------------------------------------------------------
 ;; operators
@@ -1219,6 +1222,78 @@
                                    (emit-elem (:value e) ctx)])
                           entries)))))
 
+(defn- for-element-new-value
+  "New-value form for one C-style collection-for updater on a loop variable
+  (`i++`, `--i`, `i += e`, `i = e`), or nil when the updater is unsupported."
+  [u names ctx]
+  (case (:ir u)
+    (:postfix :prefix)
+    (let [n (:name (:operand u))
+          op (:op u)]
+      (when (and (contains? names n) (contains? #{"++" "--"} op))
+        (list (if (= "++" op) 'inc 'dec) (symbol n))))
+
+    :assign
+    (let [lhs (:lhs u)]
+      (when (and (= :id (:ir lhs)) (contains? names (:name lhs)))
+        (if (= "=" (:op u))
+          (emit-expr (:rhs u) ctx)
+          (list (compound-fn (:op u)) (symbol (:name lhs)) (emit-expr (:rhs u) ctx)))))
+
+    nil))
+
+(defn- emit-for-parts-element
+  "C-style collection-for element: `[for (init; cond; updates) body]`.
+
+  Lowered to an eager accumulator loop (Dart collection literals are eager):
+  the element form is bound before the recur so Dart's body-before-updates
+  evaluation order is preserved."
+  [node ctx]
+  (let [loop (:loop node)
+        init (:init loop)
+        decl-vars (when (and init (= :var-decl (:ir init))) (:vars init))]
+    (when (and init (not= :var-decl (:ir init)))
+      (fail! init "collection-for initializer must be a declaration"))
+    (when (empty? decl-vars)
+      (fail! node "collection-for requires declared loop variables"))
+    (let [names (set (map :name decl-vars))]
+      (doseq [v decl-vars]
+        (when (mutable/assigns? (:body node) (:name v))
+          (fail! (:body node)
+                 (str "assignment to collection-for variable " (:name v)
+                      " is not supported"))))
+      (let [ctx (-> ctx
+                    (update :mutable #(apply disj % names))
+                    (update :captured #(apply disj % names)))
+            bindings (vec (mapcat (fn [v]
+                                    [(symbol (:name v))
+                                     (when (:init v) (emit-expr (:init v) ctx))])
+                                  decl-vars))
+            new-by-var (reduce (fn [m u]
+                                 (let [lhs (case (:ir u)
+                                             (:postfix :prefix) (:name (:operand u))
+                                             :assign (:name (:lhs u))
+                                             nil)
+                                       form (for-element-new-value u names ctx)]
+                                   (when (nil? form)
+                                     (fail! u "unsupported collection-for update"))
+                                   (assoc m lhs form)))
+                               {}
+                               (:updaters loop))
+            new-vals (mapv (fn [v]
+                             (get new-by-var (:name v) (symbol (:name v))))
+                           decl-vars)
+            cond (when (:cond loop) (emit-expr (:cond loop) ctx))
+            elem (emit-elem (:body node) ctx)
+            acc (symbol "d2c$acc")
+            elem-sym (symbol "d2c$elem")]
+        (list 'loop (conj bindings acc [])
+              (list 'if (if (some? cond) cond true)
+                    (list 'let [elem-sym elem]
+                          (list* 'recur
+                                 (conj new-vals (list 'conj acc elem-sym))))
+                    acc))))))
+
 (defn- emit-elem [node ctx]
   (case (:ir node)
     :if-element
@@ -1228,11 +1303,12 @@
 
     :for-element
     (let [loop (:loop node)]
-      (if (= :for-in (:ir loop))
-        (list 'for [(symbol (:name (:var loop)))
-                    (emit-expr (:iterable loop) ctx)]
-              (emit-elem (:body node) ctx))
-        (fail! node "only for-in elements are supported yet")))
+      (case (:ir loop)
+        :for-in (list 'for [(symbol (:name (:var loop)))
+                            (emit-expr (:iterable loop) ctx)]
+                      (emit-elem (:body node) ctx))
+        :for-parts (emit-for-parts-element node ctx)
+        (fail! node (str "unsupported collection-for " (:ir loop)))))
 
     :null-aware-elem (emit-expr (:expr node) ctx)
     :spread (fail! node "spread outside a collection literal")

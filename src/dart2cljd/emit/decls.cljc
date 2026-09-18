@@ -45,8 +45,10 @@
 
 (defn unit-aliases
   "Alias context for a unit's imports, honoring :default-alias, local type
-  names and (batch mode) :project-types / :project-values / :resolver."
-  [unit {:keys [default-alias local-names project-types project-values resolver] :as opts}]
+  names and (batch mode) :project-types / :project-values / :wildcard-alias /
+  :resolver."
+  [unit {:keys [default-alias local-names project-types project-values
+                wildcard-alias resolver] :as opts}]
   (let [imports (filter #(= :import (:ir %)) (:directives unit))]
     (alias/context imports
                    {:default-alias (if (contains? opts :default-alias)
@@ -55,6 +57,7 @@
                     :local-names (set local-names)
                     :project-types project-types
                     :project-values project-values
+                    :wildcard-alias wildcard-alias
                     :resolver resolver})))
 
 ;; ---------------------------------------------------------------------------
@@ -761,7 +764,8 @@
         ns-name (or ns (some-> (library-name unit) symbol) (path->ns path) 'main)
         requires (alias/require-clauses
                   (filter #(= :import (:ir %)) (:directives unit))
-                  (:resolver opts))
+                  (:resolver opts)
+                  (select-keys opts [:exports-uri :wildcard-alias]))
         ;; cljd.flutter is a cljd namespace, not a Dart library: it must be
         ;; required as a symbol (string requires are resolved by the Dart
         ;; analyzer and would fail with "Can't find Dart lib").

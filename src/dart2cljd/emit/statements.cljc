@@ -480,11 +480,18 @@
                                   [(symbol (:name v))
                                    (when (:init v) (emit-expr (:init v) ctx))])
                                 decl-vars))
+          ;; Each loop variable's new value comes from *its own* updater;
+          ;; updaters that are plain expressions (only possible without
+          ;; declared variables) are evaluated for effect before the recur.
+          per-var (reduce (fn [m u]
+                            (let [r (updater-new-value u loop-names ctx)]
+                              (if (vector? r)
+                                (assoc m (first r) (second r))
+                                m)))
+                          {}
+                          (:updaters loop))
           new-vals (map (fn [v]
-                          (let [u (some #(let [r (updater-new-value % loop-names ctx)]
-                                           (when (vector? r) r))
-                                        (:updaters loop))]
-                            (or (second u) (symbol (:name v)))))
+                          (get per-var (:name v) (symbol (:name v))))
                         decl-vars)
           updaters (keep (fn [u]
                            (let [r (updater-new-value u loop-names ctx)]
@@ -495,12 +502,14 @@
           recur-body (if (seq decl-vars)
                        (list* 'recur new-vals)
                        (do-form (concat updaters [(list 'recur)])))
+          recur-form (if-let [g (guards-form (remove #{cont} (:guards ctx)))]
+                       (list 'when g recur-body)
+                       recur-body)
           form (list* 'loop bindings
                       (concat (when cont [(list 'vreset! cont false)])
                               [(list 'when (and-form (guards-form (:guards ctx)) cond)
                                      body
-                                     (list 'when (guards-form (remove #{cont} (:guards ctx)))
-                                           recur-body))]))]
+                                     recur-form)]))]
       (loop-wrapper (keep identity [brk cont]) form))))
 
 (defn- emit-for-in [s ctx labels]

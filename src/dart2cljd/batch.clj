@@ -107,8 +107,7 @@
 
 (def ^:private unsupported-directives
   {:part "`part` directives are not supported by ClojureDart; merge the part files by hand"
-   :part-of "`part of` files are not supported by ClojureDart; merge the part files by hand"
-   :export "`export` directives are not supported by ClojureDart"})
+   :part-of "`part of` files are not supported by ClojureDart; merge the part files by hand"})
 
 (defn check-directives!
   "Fail loudly when a unit carries a directive the translator cannot
@@ -187,6 +186,77 @@
   (for [d (:decls unit)
         :when (contains? #{:class :enum :mixin :type-alias} (:ir d))]
     [(:name d) (:ir d)]))
+
+;; ---------------------------------------------------------------------------
+;; exports (barrel files)
+;; ---------------------------------------------------------------------------
+
+(defn export-target
+  "Resolve an `export` URI: `{:ns ns}` for a converted project file,
+  `{:external uri}` for `dart:*` / other packages / unconverted relative
+  URIs, `::missing` for a relative or own-`package:` URI that does not match a
+  converted file."
+  [index file uri]
+  (cond
+    (nil? uri) nil
+    (str/starts-with? uri "dart:") {:external uri}
+    (str/starts-with? uri "package:")
+    (let [[pkg rest] (str/split (subs uri (count "package:")) #"/" 2)]
+      (if (and rest (= pkg (:package index)))
+        (let [ns (get (:file->ns index) rest ::missing)]
+          (if (= ::missing ns) ::missing {:ns ns}))
+        {:external uri}))
+    (str/starts-with? uri "/") {:external uri}
+    :else
+    (let [rel (resolve-relative file uri)]
+      (if (= ::missing rel)
+        ::missing
+        (let [ns (get (:file->ns index) rel ::missing)]
+          (if (= ::missing ns) ::missing {:ns ns}))))))
+
+(defn- direct-exports
+  "Direct exports of a file: `{:project #{ns} :external #{uri} :missing
+  [uri]}`."
+  [index file unit]
+  (reduce (fn [acc d]
+            (let [uri (get-in d [:uri :value])
+                  t (export-target index file uri)]
+              (cond
+                (= ::missing t) (update acc :missing conj uri)
+                (contains? t :ns) (update acc :project conj (:ns t))
+                (contains? t :external) (update acc :external conj (:external t))
+                :else acc)))
+          {:project #{} :external #{} :missing []}
+          (filter #(= :export (:ir %)) (:directives unit))))
+
+(defn- export-closures
+  "Transitive export closures per file: `{file {:project #{ns} :external
+  #{uri} :missing [uri]}}`, expanding project exports through their own
+  closures until a fixpoint."
+  [direct file->ns]
+  (let [ns->file (into {} (map (fn [[f ns]] [ns f])) file->ns)]
+    (loop [closures direct passes 0]
+      (if (>= passes 10)
+        closures
+        (let [progress (volatile! false)
+              next (into {}
+                         (for [[file {:keys [project external missing]}] closures]
+                           (let [project (into project
+                                               (mapcat (fn [ns]
+                                                         (get-in closures
+                                                                 [(ns->file ns) :project]
+                                                                 #{})))
+                                               project)
+                                 external (into external
+                                                (mapcat (fn [ns]
+                                                          (get-in closures
+                                                                  [(ns->file ns) :external]
+                                                                  #{})))
+                                                project)]
+                             [file {:project project :external external
+                                    :missing missing}])))]
+          (when (not= next closures) (vreset! progress true))
+          (if @progress (recur next (inc passes)) next))))))
 
 (defn- statics-map
   "Generated ns-level static members of a class: member name -> set of kinds
@@ -318,8 +388,16 @@
         base (-> {:project-types {} :project-values {} :warnings []}
                  (add-index-entries :project-types "type" entries)
                  (add-index-entries :project-values "value" value-entries))
-        base (update base :project-types #(resolve-typedefs % parsed))]
-    (assoc base :file->ns file->ns :package (:package opts))))
+        base (update base :project-types #(resolve-typedefs % parsed))
+        direct (into {} (for [{:keys [file unit]} parsed]
+                          [file (direct-exports (assoc base
+                                                       :file->ns file->ns
+                                                       :package (:package opts))
+                                                file unit)]))]
+    (-> base
+        (assoc :file->ns file->ns
+               :package (:package opts)
+               :exports (export-closures direct file->ns)))))
 
 ;; ---------------------------------------------------------------------------
 ;; import resolution (per file)
@@ -348,8 +426,18 @@
       cand)))
 
 (defn file-resolver
-  "Per-file import resolver: Dart import URI -> `{:ns ... :alias ...}` for
-  imports that resolve into the converted tree (symbol requires).
+  "Per-file import resolution.
+
+  Returns `{:resolver fn :wildcard? bool :external-uris #{}}`:
+
+    * `resolver` maps a Dart import URI to `{:ns ... :alias ...}`, plus the
+      transitive project exports of the target (`:project-exports`) and
+      whether it re-exports external packages (`:external?`);
+    * `wildcard?` is true when an imported file re-exports external packages:
+      the emitter must then require the exports shim and route otherwise
+      unresolved names through it;
+    * `external-uris` is the union of external export URIs reachable through
+      the file's imports (used for diagnostics).
 
   `dart:*` and external packages return nil (string requires, unchanged).
   A relative or own-`package:` URI that does not resolve to a converted file
@@ -358,10 +446,18 @@
   (deterministically: last segment, then `-2`, `-3`, ...)."
   [index file unit]
   (let [imports (filter #(= :import (:ir %)) (:directives unit))
+          exports (:exports index)
+          ns->file (into {} (map (fn [[f ns]] [ns f])) (:file->ns index))
         classified (mapv (fn [imp]
-                           (let [uri (get-in imp [:uri :value])]
-                             {:imp imp :uri uri
-                              :target (project-target index file uri)}))
+                           (let [uri (get-in imp [:uri :value])
+                                 target (project-target index file uri)
+                                 target-file (when (symbol? target)
+                                               (get ns->file target))
+                                 closure (when target-file
+                                           (get exports target-file
+                                                {:project #{} :external #{}}))]
+                             {:imp imp :uri uri :target target
+                              :exports closure}))
                          imports)
         fixed (into #{}
                     (concat (keep :as imports)
@@ -371,7 +467,7 @@
                                   classified)))
         taken (volatile! fixed)
         entries (reduce
-                 (fn [m {:keys [imp uri target]}]
+                 (fn [m {:keys [imp uri target exports]}]
                    (case target
                      nil m
                      ::missing
@@ -384,12 +480,23 @@
                                        {:dart2cljd/kind :batch
                                         :file file :uri uri :node imp})))
                      (let [a (or (:as imp)
-                                 (fresh-alias (alias-candidate target) @taken))]
+                                 (fresh-alias (alias-candidate target) @taken))
+                           project-exports (-> (:project exports)
+                                               (disj target)
+                                               sort
+                                               vec)]
                        (vswap! taken conj a)
-                       (assoc m uri {:ns target :alias a}))))
+                       (assoc m uri {:ns target :alias a
+                                     :project-exports project-exports
+                                     :external? (boolean (seq (:external exports)))}))))
                  {}
-                 classified)]
-    (fn [uri] (get entries uri))))
+                 classified)
+        external-uris (into #{} (mapcat #(get-in % [:exports :external]))
+                            classified)]
+    {:resolver (fn [uri] (get entries uri))
+     :wildcard? (boolean (seq external-uris))
+     :aliases (into #{} (map :alias (vals entries)))
+     :external-uris external-uris}))
 
 ;; ---------------------------------------------------------------------------
 ;; per-file conversion
@@ -403,14 +510,17 @@
 
 (defn- emit-source
   "Emit one unit for batch output (ns from the path, project index attached,
-  mode honored)."
-  [unit rel ns {:keys [mode resolver project-types project-values]}]
+  mode and exports shim honored)."
+  [unit rel ns {:keys [mode resolver project-types project-values
+                       exports-uri wildcard-alias]}]
   (printer/print-forms
    (decls/emit-unit unit
                     (cond-> {:ns ns :path rel
                              :resolver resolver
                              :project-types project-types
-                             :project-values project-values}
+                             :project-values project-values
+                             :exports-uri exports-uri
+                             :wildcard-alias wildcard-alias}
                       (= :idiomatic mode) (assoc :mode :idiomatic)))))
 
 (defn- file-project-values
@@ -421,23 +531,99 @@
     (into {} (remove (fn [[_ info]] (= ns (:ns info))))
           (:project-values index))))
 
+(def ^:private wildcard-aliases
+  "Deterministic candidates for the exports-shim require alias."
+  ["exports" "d2c-exports" "wildcard"])
+
 (defn convert-one
   "Translate one parsed unit and write `<out>/<rel>.cljd`.
 
   Returns `{:file rel :out path :ns ns}`."
-  [rel unit index {:keys [out] :as opts}]
+  [rel unit index {:keys [out exports-uri] :as opts}]
   (check-directives! unit rel)
-  (let [ns (path->ns rel opts)
-        resolver (file-resolver index rel unit)
-        source (str (emit-source unit rel ns (assoc opts
-                                                    :resolver resolver
-                                                    :project-types (:project-types index)
-                                                    :project-values (file-project-values index rel)))
+  (let [missing (get-in index [:exports rel :missing])]
+    (when (seq missing)
+      (let [uri (first missing)]
+        (throw (ex-info (str "dart2cljd: cannot resolve export " (pr-str uri)
+                             ": no converted file matches it")
+                        {:dart2cljd/kind :batch :file rel :uri uri})))))
+  (let [{:keys [resolver wildcard? aliases]} (file-resolver index rel unit)
+        _ (when (and wildcard? (nil? exports-uri))
+            (throw (ex-info (str "dart2cljd: " rel " imports a file that re-exports "
+                                 "external packages; pass --exports-file and "
+                                 "--exports-uri to generate the exports shim")
+                            {:dart2cljd/kind :batch :file rel})))
+        wildcard-alias (when (and wildcard? exports-uri)
+                         (or (first (remove aliases wildcard-aliases))
+                             (fresh-alias (first wildcard-aliases) aliases)))
+        ns (path->ns rel opts)
+        source (str (emit-source unit rel ns
+                                 (assoc opts
+                                        :resolver resolver
+                                        :project-types (:project-types index)
+                                        :project-values (file-project-values index rel)
+                                        :wildcard-alias wildcard-alias))
                     "\n")
         out-file (java.io.File. (str out) (str/replace rel #"\.dart$" ".cljd"))]
     (io/make-parents out-file)
     (spit out-file source)
     {:file rel :out (.getPath out-file) :ns ns}))
+
+(defn- write-exports-shim!
+  "Write the generated Dart shim re-exporting every external URI exported by
+  the converted tree. Returns the written path, or nil when there is nothing
+  to write (or no `:exports-file`)."
+  [{:keys [exports-file] :as _opts} index]
+  (let [uris (->> (:exports index)
+                  vals
+                  (mapcat :external)
+                  set
+                  sort)]
+    (when (and (seq uris) exports-file)
+      (let [file (java.io.File. (str exports-file))]
+        (io/make-parents file)
+        (spit file (str "// Generated by dart2cljd: re-exports for Dart `export`"
+                        " directives.\n"
+                        "// Do not edit; regenerate with the converter.\n"
+                        (str/join "\n" (map #(str "export '" % "';") uris))
+                        "\n"))
+        (.getPath file)))))
+
+(defn- file-imports
+  "Converted files this unit imports (relative paths)."
+  [index rel unit]
+  (let [ns->file (into {} (map (fn [[f ns]] [ns f])) (:file->ns index))]
+    (into #{}
+          (keep (fn [imp]
+                  (let [t (project-target index rel (get-in imp [:uri :value]))]
+                    (when (symbol? t) (get ns->file t)))))
+          (filter #(= :import (:ir %)) (:directives unit)))))
+
+(defn- propagate-import-failures
+  "Mark files that (transitively) import a failed file as failed too and
+  delete their output: their requires point at a namespace that was never
+  generated, so they must not look converted."
+  [index units converted failed]
+  (loop [converted (vec converted) failed (vec failed)]
+    (let [failed-files (set (map :file failed))
+          failed-dep (fn [{:keys [file]}]
+                       (some #(when (contains? failed-files %) %)
+                             (file-imports index file (get units file))))
+          bad (filter failed-dep converted)
+          good (remove failed-dep converted)]
+      (if (empty? bad)
+        [good failed]
+        (do
+          (doseq [{:keys [out]} bad]
+            (when out (.delete (io/file out))))
+          (recur (vec good)
+                 (into failed
+                       (map (fn [{:keys [file]}]
+                              {:file file
+                               :error (ex-info (str "dart2cljd: imports failed file "
+                                                    (failed-dep {:file file}))
+                                               {:dart2cljd/kind :batch :file file})})
+                            bad))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; batch runner
@@ -461,6 +647,11 @@
     :package     Dart package name for own-`package:` imports (optional;
                  defaults to the nearest pubspec.yaml `name:`)
     :mode        :faithful (default) | :idiomatic
+    :exports-file path of the generated Dart shim re-exporting the tree's
+                 external `export`s (optional; needed when a converted file
+                 re-exports external packages)
+    :exports-uri URI under which generated code requires that shim
+                 (e.g. `package:mycljd/d2c_exports.dart`)
     :root/:dart  astdump frontend options (dart2cljd.frontend)
 
   Pass 1 parses every file and builds the cross-file project index (imports,
@@ -491,6 +682,14 @@
         ok (into [] (filter :unit) parsed)
         parse-failed (into [] (remove :unit) parsed)
         index (build-index ok opts)
+        shim (write-exports-shim! opts index)
+        warnings (cond-> (:warnings index)
+                   (and (seq (mapcat :external (vals (:exports index))))
+                        (nil? (:exports-uri opts)))
+                   (conj (str "the converted tree re-exports external packages; "
+                              "pass :exports-file/:exports-uri (CLI "
+                              "--exports-file/--exports-uri) so importers can "
+                              "resolve those names")))
         emitted (mapv (fn [{:keys [file unit]}]
                         (try
                           {:ok (convert-one file unit index opts)}
@@ -499,10 +698,14 @@
         converted (into [] (keep :ok) emitted)
         failed (->> (concat parse-failed (remove :ok emitted))
                     (sort-by :file)
-                    vec)]
+                    vec)
+        units (into {} (map (fn [{:keys [file unit]}] [file unit])) ok)
+        [converted failed] (propagate-import-failures index units converted failed)
+        failed (vec (sort-by :file failed))]
     {:converted converted
      :skipped skipped
      :failed failed
-     :warnings (:warnings index)
+     :warnings warnings
+     :exports-file shim
      :package (:package index)
      :exit (if (empty? failed) 0 1)}))

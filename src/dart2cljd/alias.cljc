@@ -78,10 +78,15 @@
     :project-values map of top-level value name -> project info (ns/kinds)
                     for values declared in *other* files of the batch
                     conversion; consulted by the emitter's fallbacks
+    :wildcard-alias alias of the exports shim (batch mode): when a file
+                    imports a library that re-exports external packages,
+                    names that resolve to none of the above are qualified
+                    through this alias instead of the default alias
     :resolver       fn [uri] -> {:ns sym :alias sym} for imports that resolve
                     into the converted project tree (nil for external libs)"
   ([imports] (context imports nil))
-  ([imports {:keys [default-alias local-names project-types project-values resolver]
+  ([imports {:keys [default-alias local-names project-types project-values
+                    wildcard-alias resolver]
              :or {default-alias "m" local-names #{}}}]
    (let [entries (for [imp imports
                        :let [uri (get-in imp [:uri :value])
@@ -107,7 +112,14 @@
       :local-names (set local-names)
       :project-types (or project-types {})
       :project-values (or project-values {})
+      :wildcard-alias (some-> wildcard-alias str)
       :default-alias (some-> default-alias str)})))
+
+(defn- registered-alias?
+  "True when `a` is the alias of an actual import of the current file (the
+  default alias of an unsed import must not shadow the exports shim)."
+  [a ctx]
+  (boolean (some #(= (str a) (str (:alias %))) (:entries ctx))))
 
 (def snippet-context
   "Default context for bare snippets: Flutter material is assumed to be
@@ -134,6 +146,11 @@
         (first (remove #(contains? prefix->uri %) ["f" "fl"]))
         "cljd-flutter")))
 
+(defn- wildcard-qualify
+  "Qualify `id` through the exports shim when one is in scope."
+  [id ctx]
+  (symbol (str (:wildcard-alias ctx) "/" id)))
+
 (defn qualify
   "Resolve a bare Dart identifier to a cljd symbol.
 
@@ -141,7 +158,9 @@
   other files of the same batch conversion get their generated namespace
   (`project-types`); known import prefixes are kept as `prefix/name`;
   dart:core names stay bare; type-like names (UpperCamelCase) get the default
-  alias; everything else stays bare."
+  alias, or the exports shim alias when the file imports a library that
+  re-exports external packages and the default alias is not an actual import;
+  everything else stays bare (or goes through the shim)."
   [id ctx]
   (let [id (str id)]
     (cond
@@ -151,9 +170,16 @@
       (symbol (str (get-in ctx [:project-types id :ns]) "/" id))
       (contains? core-symbols id) (symbol id)
       (import-prefix? id ctx) (symbol id)
-      (class-name? id) (if-let [a (:default-alias ctx)]
-                         (symbol (str a "/" id))
-                         (symbol id))
+      (class-name? id)
+      (let [a (:default-alias ctx)
+            wildcard (:wildcard-alias ctx)]
+        (cond
+          (and (some? a) (or (nil? wildcard) (registered-alias? a ctx)))
+          (symbol (str a "/" id))
+          wildcard (wildcard-qualify id ctx)
+          (some? a) (symbol (str a "/" id))
+          :else (symbol id)))
+      (:wildcard-alias ctx) (wildcard-qualify id ctx)
       :else (symbol id))))
 
 (defn qualify-member
@@ -178,13 +204,18 @@
   With a `resolver` (batch mode) and an import that resolves into the
   converted tree, the require is a *symbol* require of the generated
   namespace (`[app.widgets.button :as button]`); otherwise the Dart URI
-  stays a string require."
+  stays a string require. `show` on a re-exporting target is rejected: the
+  shown names may be defined in any of the re-exported namespaces."
   ([imp] (require-clause imp nil))
   ([imp resolver]
    (let [uri (get-in imp [:uri :value])
          explicit (:as imp)
          show (:show imp)
          resolved (when resolver (resolver uri))]
+     (when (and resolved (seq show) (seq (:project-exports resolved)))
+       (throw (ex-info (str "dart2cljd: `show` on " uri
+                            ", which re-exports other libraries, is not supported")
+                       {:dart2cljd/kind :emit :uri uri})))
      (if resolved
        (cond-> [(symbol (name (:ns resolved)))]
          (or explicit (:alias resolved))
@@ -198,11 +229,27 @@
 
 (defn require-clauses
   "All `:require` vectors for the given imports, skipping implicit libs and
-  deterministic de-duplication."
-  ([imports] (require-clauses imports nil))
-  ([imports resolver]
+  deterministic de-duplication.
+
+  A project import whose target re-exports other converted files adds bare
+  requires for them (their names are referenced by full namespace, so no
+  alias is needed); when it re-exports external packages, the exports shim
+  (`:exports-uri`) is required once under `:wildcard-alias`."
+  ([imports] (require-clauses imports nil nil))
+  ([imports resolver] (require-clauses imports resolver nil))
+  ([imports resolver {:keys [exports-uri wildcard-alias]}]
    (->> imports
         (remove #(contains? implicit-uris (get-in % [:uri :value])))
-        (map #(require-clause % resolver))
+        (mapcat (fn [imp]
+                  (let [resolved (when resolver
+                                   (resolver (get-in imp [:uri :value])))]
+                    (concat
+                     [(require-clause imp resolver)]
+                     (when resolved
+                       (concat
+                        (for [ns (:project-exports resolved)]
+                          [(symbol (name ns))])
+                        (when (and (:external? resolved) exports-uri)
+                          [[exports-uri :as (symbol wildcard-alias)]])))))))
         distinct
         vec)))
