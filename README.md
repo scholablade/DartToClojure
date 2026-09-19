@@ -67,7 +67,7 @@ The CLI keeps DartClojure's flag surface, so editor integrations port over:
 | `--ns-prefix P` | batch mode: prefix for generated namespaces |
 | `--exclude GLOB` | batch mode: skip files matching GLOB (repeatable) |
 | `--package NAME` | batch mode: Dart package name (default: nearest `pubspec.yaml`) |
-| `--exports-file PATH` | batch mode: write the external-exports Dart shim here |
+| `--exports-file PATH` | batch mode: write the external imports/exports Dart shim here |
 | `--exports-uri URI` | batch mode: URI under which generated code requires that shim |
 
 ### Batch conversion (`--dir`)
@@ -101,14 +101,27 @@ top-level vars (`set!`), static fields, setters and increments across files.
 `dart:*` and external packages stay string requires.
 
 **Barrel files (`export`)**: importing a re-exporting file pulls in the
-generated namespaces of its project exports, and — when it re-exports
-packages — one require of a generated **exports shim** under the alias
-`exports`, through which otherwise-unresolved names are qualified
-(`exports/BlocProvider`). Pass `--exports-file PATH --exports-uri URI` to
-write that shim (it must live in the target project's Dart package, e.g.
-`lib/d2c_exports.dart` / `package:my_app/d2c_exports.dart`); without the flags
-files that need it fail with an actionable message. `part`, `part of` and
-mixins with fields fail loudly (ClojureDart cannot express them yet).
+generated namespaces of its project exports, and — when it re-exports or
+imports packages — one require of a generated **exports shim** under the
+alias `exports`, through which otherwise-unresolved names are qualified
+(`exports/BlocProvider`, `exports/AudioPlayer`, `exports/log`). The shim
+re-exports every external URI the converted tree imports or exports, which is
+how parse-only batch mode resolves names from unaliased `package:`/`dart:`
+imports. Pass `--exports-file PATH --exports-uri URI` to write it (it must
+live in the target project's Dart package, e.g. `lib/d2c_exports.dart` /
+`package:my_app/d2c_exports.dart`); without the flags the default-alias
+fallback is kept and files that strictly need the shim (barrels) fail with an
+actionable message.
+
+**Mixins with fields** are supported by *inlining*: a project mixin is
+emitted as a Dart `mixin` (its fields become `late`) and every applier
+(`class C with M`) inlines the mixin's fields and concrete methods and
+implements it (`implements M`), which keeps `is` checks and interface
+satisfaction. External mixins (`SingleTickerProviderStateMixin`, …) keep the
+Dart `with` clause. Generic mixins drop their type parameters (ClojureDart
+has no bounds support); members that reference a type parameter, static mixin
+members, `super` calls in mixin methods and member name collisions fail
+loudly. `part` and `part of` still fail loudly.
 
 ### API
 
@@ -254,10 +267,24 @@ These are deliberate and recorded with their probe evidence in
 
 - `e as T` → `^T` hint; the Dart runtime `CastError` is not reproduced.
 - Faithful `%` emits `(. a % b)` (Dart euclidean `%`); idiomatic mode uses `mod`.
-- Generators (`yield`, `async*`, `sync*`), `operator []=`, `part`/`part of`,
-  Dart extensions/extension types and mixins with fields fail loudly:
-  ClojureDart cannot express them (mixin inlining is planned, PLAN.md §13).
-  `export` is supported through the generated exports shim (batch mode).
+- Generators (`yield`, `async*`, `sync*`), `operator []=`, `part`/`part of`
+  and Dart extensions/extension types fail loudly: ClojureDart cannot express
+  them. `export` is supported through the generated exports shim (batch
+  mode); mixins with fields are supported by inlining (`implements` +
+  inlined members), with generic type parameters dropped.
+- `late` fields: `late T x;` is assigned after construction, but ClojureDart
+  constructors require every field. Non-nullable scalars (`int`, `num`,
+  `double`, `bool`, `String`) keep their declared type and get a zero-value
+  placeholder (a read before assignment returns the zero value instead of
+  throwing `LateInitializationError`); other non-nullable late fields are
+  emitted dynamic with a nil placeholder; `late final` fields are `^:mutable`
+  (single assignment is still enforced by the Dart input compiling).
+  Initializers that reference `this` (`vsync: this`) are assigned through
+  `this` after the constructor body, in declaration order — eager instead of
+  Dart's lazy-on-first-read. See RESEARCH M8.9.
+- Dart `String +=` maps to the numeric `+` compound operator (use
+  `s = '$s$t'` or `(str …)` in the source); general operator semantics still
+  depend on the syntactic type pass (RESEARCH R2/C2).
 - Non-const records are wrapped in `cljd.core/identity` (upstream compiler bug).
 - User-operator dispatch uses a syntactic type pass plus `dart/is?` guards for
   unknown *identifier* receivers; compound assignments and operators on other
@@ -272,11 +299,23 @@ These are deliberate and recorded with their probe evidence in
   target is a bare type parameter fails loudly at use sites; instance members
   inherited from outside the converted tree are invisible to the syntactic
   pass, so a cross-file value with the same name wins over them.
+- External *function typedefs* (`VoidCallback`, `ValueChanged<T>`, ...) are
+  emitted as `Function` hints. Batch mode resolves them through the analyzer
+  once per run (`--fn-typedefs` frontend mode; the source project must be
+  `pub get`-ed, otherwise conversion keeps the ordinary hint and the compile
+  fails loudly); ClojureDart's analyzer helper cannot resolve function-typedef
+  elements (RESEARCH M8.10). Class hints (`^m/Widget`) are unaffected.
+- Fields named after Dart reserved words/built-in identifiers (`base`,
+  `class`, `late`, ...) are munged by ClojureDart (`$base_`); `.-field!`
+  setters generated for constructor bodies/late initializers do not follow the
+  munging and fail at runtime (RESEARCH M8.12).
 - The astdump frontend is run through a kernel snapshot cached in
   `.dart2cljd-cache/` (`dart run` re-JITs `package:analyzer` at ~40 s per
   call; the snapshot is ~1.3 s and is rebuilt when `bin/astdump.dart`
   changes).
-- M8 batch features (barrel `export` support + exports shim, C-style
-  collection-for, statement-for fixes) are implemented and manually verified
-  but not yet covered by `make gate` fixtures; see `PLAN.md` §13 for the
-  remaining work.
+- M8 batch features (barrel `export` support + exports shim over imports,
+  mixin-with-fields inlining, C-style collection-for and collection-element
+  splicing, statement-for fixes) are covered by `make gate` fixtures
+  (`corpus/m3.dart`, `test/batchproj/`, 24 runtime checks). The remaining
+  M8 work is the compile triage of the generated probe tree
+  (`probe/probe/`); see `PLAN.md` §13 and `SESSION.md` "M8 continuation".
