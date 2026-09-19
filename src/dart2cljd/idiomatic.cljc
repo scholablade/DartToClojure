@@ -656,8 +656,8 @@
       :else (list* w (concat directives body)))))
 
 (defn- emit-method-fn [m ctx]
-  (let [{:keys [params body async]} (core/emit-callable m ctx)]
-    (with-meta (list* (symbol (:name m)) params body)
+  (let [{:keys [params body async rebinds]} (core/emit-callable m ctx)]
+    (with-meta (list* (symbol (:name m)) params (core/wrap-rebinds rebinds body))
       (when async {:async true}))))
 
 (defn emit-widget
@@ -724,7 +724,9 @@
         body (if key?
                (list (alias/qualify "KeyedSubtree" (:aliases ctx))
                      '.key 'key '.child widget)
-               widget)]
+               widget)
+         {:keys [params rebinds]} (core/emit-params params {} state-ctx)
+         body (if (seq rebinds) (list 'let rebinds body) body)]
     [(list* 'defn (symbol name)
-            (core/emit-params params {} state-ctx)
+            params
             [body])]))

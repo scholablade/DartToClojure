@@ -149,7 +149,7 @@
               "widgets/button.dart" 'app.widgets.button
               "widgets/mixins.dart" 'app.widgets.mixins}
              (:file->ns index)))
-      (is (= #{"Item" "Button" "Label" "Badge" "Labelled" "Holder"}
+      (is (= #{"Item" "Box" "Button" "Label" "Badge" "Labelled" "Holder"}
              (set (keys (:project-types index)))))
       (testing "mixin declarations are indexed for cross-file inlining"
         (is (= :mixin (get-in index [:project-mixins "Labelled" :kind])))

@@ -313,9 +313,30 @@ These are deliberate and recorded with their probe evidence in
   `.dart2cljd-cache/` (`dart run` re-JITs `package:analyzer` at ~40 s per
   call; the snapshot is ~1.3 s and is rebuilt when `bin/astdump.dart`
   changes).
+- A local initialized by `await` is bound dynamically (`cljd.core/identity`
+  wrapper): ClojureDart's `no-future` unwraps only a canonical `Future`, so a
+  value that merely implements Future (Supabase's `PostgrestBuilder` chains)
+  would otherwise be annotated with the pre-await type — an analyzer error and
+  a runtime cast failure (RESEARCH M8.18).
+- Non-scalar parameter hints are emitted only where they cannot break an
+  override or a cross-file call: scalar hints everywhere; project/class/type
+  variable hints only on `@override` methods whose local superclass chain
+  agrees (a hint on a method becomes part of the emitted Dart signature, and
+  ClojureDart cannot resolve a generated library's own class at a cross-file
+  call site). Same-file overrides of unhinted local bases stay dynamic
+  (RESEARCH M8.18).
+- C-style loop variables get scalar hints (`for (var i = 0; …)` → `^int i`):
+  ClojureDart types `loop` locals from the binding symbol, not the
+  initializer, and unhinted locals become `dynamic` (numeric interop then
+  inserts `as num` casts, which Dart promotes — breaking `i.isEven`).
+- `~/` emits the Dart interop operator `(. a "~/" b)` instead of
+  `cljd.core/quot`: `quot` is declared `^num` although Dart's `num.~/`
+  returns `int`, so int contexts (`int f() => (a ~/ 2).clamp(0, n)`) failed.
 - M8 batch features (barrel `export` support + exports shim over imports,
   mixin-with-fields inlining, C-style collection-for and collection-element
-  splicing, statement-for fixes) are covered by `make gate` fixtures
-  (`corpus/m3.dart`, `test/batchproj/`, 24 runtime checks). The remaining
-  M8 work is the compile triage of the generated probe tree
-  (`probe/probe/`); see `PLAN.md` §13 and `SESSION.md` "M8 continuation".
+  splicing, statement-for fixes) and the analyzer-triage fixes are covered by
+  `make gate` fixtures (`corpus/m3.dart`, `test/batchproj/`, 36 runtime
+  checks). The generated probe tree converts 34/34, compiles, and
+  `dart analyze` reports 3 residual errors — all the documented upstream
+  ClojureDart `^super` cast in classes that apply an external mixin
+  (RESEARCH M8.18).

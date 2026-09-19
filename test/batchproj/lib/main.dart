@@ -26,6 +26,9 @@ String touch() {
 
 double hyp(double a, double b) => math.sqrt(a * a + b * b);
 
+String mergeBoxes() =>
+    Box(Item('a', 1.0)).merge(Box(Item('b', 2.0)));
+
 // M8: `Badge` (declared in the barrel) applies a mixin from another file;
 // `Widget`/`Text` arrive through the barrel's external `export`, so the
 // generated file must require the exports shim.

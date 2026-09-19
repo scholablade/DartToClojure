@@ -65,7 +65,7 @@
     (testing "every watched atom subscribes the widget"
       (is (re-find #":watch \[_ count _ step _ d2c\$tick\]" o)))
     (testing "State methods become local fns"
-      (is (re-find #"\(increment \[\] \(do \(swap! count \+ \(deref step\)\) \(swap! d2c\$tick inc\)\)\)" o))
+      (is (re-find #"\(increment \[\] \(do \(swap! count \+ \(deref step\)\) \(swap! d2c\$tick inc\)\) nil\)" o))
       (is (re-find #"\(doubled \[\] \(\* \(deref count\) 2\)\)" o))
       (is (re-find #"\(doubled\)" o)))
     (testing "async State methods keep ^:async"
@@ -79,7 +79,7 @@
 (deftest set-state-tick
   (let [o (out)]
     (testing "a setState writing no state atom still bumps the tick"
-      (is (re-find #"\(bump \[\] \(do \(\.write \(deref buf\) \"x\"\) \(swap! d2c\$tick inc\)\)\)" o)))
+      (is (re-find #"\(bump \[\] \(do \(\.write \(deref buf\) \"x\"\) \(swap! d2c\$tick inc\)\) nil\)" o)))
     (testing "the tick atom is watched"
       (is (re-find #":watch \[_ buf _ d2c\$tick\]" o)))))
 

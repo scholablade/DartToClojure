@@ -36,7 +36,12 @@
   CtorBody)
 
 (defn ^CtorBody CtorBody-new []
-  (let [count 0 this (CtorBody count)] (.-count! this 3) (.-count! this (inc (.-count this))) this))
+  (let [count 0
+        this (CtorBody count)]
+    (.-count! this 3)
+    (.-count! this (inc (.-count this)))
+    nil
+    this))
 
 (deftype LateField
   [^:mutable ^int value]
@@ -56,7 +61,57 @@
   (^int sum [this] (+ fromCtor fromMethod)))
 
 (defn ^LateFinal LateFinal-new [^int v]
-  (let [fromCtor 0 fromMethod 0 this (LateFinal fromCtor fromMethod)] (.-fromCtor! this v) this))
+  (let [fromCtor 0 fromMethod 0 this (LateFinal fromCtor fromMethod)] (.-fromCtor! this v) nil this))
+
+(deftype d2c_PrivateBox
+  [^:mutable ^int value]
+  :type-only true
+  d2c_PrivateBox
+  (^int doubled [this] (* value 2)))
+
+(defn ^d2c_PrivateBox d2c_PrivateBox-new [^int value]
+  (let [this (d2c_PrivateBox value)] this))
+
+(defn privateBoxSum [^int v]
+  (.doubled (d2c_PrivateBox-new v)))
+
+(deftype Defaults
+  [^List values ^String label]
+  :type-only true
+  Defaults
+  (^int total [this] (+ (.-length values) (.-length label))))
+
+(defn ^Defaults Defaults-new [.values nil ^String .label "x"]
+  (let [values (if (nil? values) [1 2] values)] (let [this (Defaults values label)] this)))
+
+(defn defaultSum [.xs nil ^int .add 0]
+  (let [xs (if (nil? xs) [1 2 3] xs)] (+ (.-length xs) add)))
+
+(deftype VoidCallbackHost
+  [^:mutable ^int value]
+  :type-only true
+  VoidCallbackHost
+  (^void run [this cb] (cb) nil)
+  (^void bump
+    [this]
+    (.run this (let [d2c$cb0 (fn [] (.-value! this (+ (.-value this) 1)) nil)] d2c$cb0))
+    nil))
+
+(defn ^VoidCallbackHost VoidCallbackHost-new []
+  (let [value 0 this (VoidCallbackHost value)] this))
+
+(deftype ShadowHost
+  []
+  :type-only true
+  ShadowHost
+  (^num run
+    [this ^int let$local ^int when$local]
+    (let [and$local (volatile! (+ let$local when$local))]
+      (vswap! and$local inc)
+      (let [not$local (* (deref and$local) 2)] not$local))))
+
+(defn ^ShadowHost ShadowHost-new []
+  (let [this (ShadowHost)] this))
 
 (deftype LateInit
   [^:mutable ^int start ^:mutable ^int doubled ^:mutable self]
@@ -69,6 +124,7 @@
         self nil
         this (LateInit start doubled self)]
     (.-start! this v)
+    nil
     (.-doubled! this (* (.-start this) 2))
     (.-self! this this)
     this))
@@ -77,7 +133,7 @@
   [^:mutable ^int value]
   :type-only true
   ClosureField
-  (^Function writer [this] (fn [] (.-value! this 5)))
+  (^Function writer [this] (fn [] (.-value! this 5) nil))
   (^Function reader [this] (fn [] (.-value this))))
 
 (defn ^ClosureField ClosureField-new []
@@ -92,6 +148,62 @@
 
 (defn ^Child Child-new [^int n ^String name]
   (let [d2c$super0 name this (Child n d2c$super0)] this))
+
+(deftype ShadowField
+  [^String error]
+  :type-only true
+  ShadowField
+  (^String describe [this error] (error (.-error this))))
+
+(defn ^ShadowField ShadowField-new [^String error]
+  (let [this (ShadowField error)] this))
+
+(deftype ^{:type-params [T]} Holder
+  [^T value]
+  :type-only true
+  Holder)
+
+(defn Holder-new [value]
+  (let [this (Holder value)] this))
+
+(defn Holder-named [value]
+  (Holder-new value))
+
+(defn holderLength []
+  (-> (Holder-new [1 2 3]) .-value .-length))
+
+(deftype Greeter
+  []
+  :type-only true
+  Greeter
+  (^String greet [this other] "hi"))
+
+(defn ^Greeter Greeter-new []
+  (let [this (Greeter)] this))
+
+(deftype NarrowGreeter
+  []
+  :type-only true
+  :extends Greeter
+  NarrowGreeter
+  (^String greet [this other] (str "hi " (.-runtimeType other))))
+
+(defn ^NarrowGreeter NarrowGreeter-new []
+  (let [this (NarrowGreeter)] this))
+
+(defn narrowGreet []
+  (.greet (NarrowGreeter-new) (NarrowGreeter-new)))
+
+(defn loopVarEven [^int n]
+  (.-first
+    (vec
+      (concat
+        (loop [^int i 0
+               d2c$acc []]
+          (if (< i n) (let [d2c$seg [(.-isEven i)]] (recur (inc i) (into d2c$acc d2c$seg))) d2c$acc))))))
+
+(defn tripleDiv [^int a ^int b ^int c]
+  (. (. a "~/" b) "~/" c))
 
 (deftype Shape
   [^:mutable ^String label]
@@ -162,16 +274,19 @@
   Usage-hits)
 
 (defn set-total! [^int v]
-  (set! Usage-hits v))
+  (set! Usage-hits v)
+  nil)
 
 (defn Usage-record [^int n]
-  (set! Usage-hits (+ Usage-hits n)))
+  (set! Usage-hits (+ Usage-hits n))
+  nil)
 
 (defn Usage-summary []
   (str Usage-hits "/" (Usage-total)))
 
 (defn setTotal [^int v]
-  (set-total! v))
+  (set-total! v)
+  nil)
 
 (comment "typedef Cb (expanded at use sites)")
 
@@ -189,7 +304,9 @@
     (deref d2c$result)))
 
 (defn addAny [a b]
-  (let [d2c$a a d2c$b b] (if (dart/is? d2c$a Point) (. d2c$a + d2c$b) (+ d2c$a d2c$b))))
+  (let [d2c$a a
+        d2c$b b]
+    (if (and (dart/is? d2c$a Point) (dart/is? d2c$b Point)) (. d2c$a + d2c$b) (+ d2c$a d2c$b))))
 
 (deftype ^:mixin Tagged
   [^String prefix ^:mutable ^bool _active]
@@ -210,7 +327,7 @@
 (defn ^TaggedItem TaggedItem-new [^String name]
   (let [prefix "tag" _active false this (TaggedItem name prefix _active)] this))
 
-(deftype ^:mixin Counted
+(deftype ^:mixin ^{:type-params [T]} Counted
   [^:mutable ^int _count]
   :type-only true
   Counted
@@ -220,7 +337,7 @@
 (deftype CountedBox
   [^String label ^:mutable ^int _count]
   :type-only true
-  Counted
+  ^{:type-params [String]} Counted
   CountedBox
   (^String renderCount [this] (str label "=" (.-count this)))
   (^:getter ^int count [this] _count)
@@ -232,24 +349,29 @@
 (defn collect [^int n ^bool flag extra maybe]
   (vec
     (concat
-      (loop [i 0
+      (loop [^int i 0
              d2c$acc []]
         (if (< i n) (let [d2c$seg [(* i 2)]] (recur (inc i) (into d2c$acc d2c$seg))) d2c$acc))
       (if flag [100 200] [300])
       (mapcat
         (fn [x]
-          [x (let [d2c$a x d2c$b 1] (if (dart/is? d2c$a Point) (. d2c$a + d2c$b) (+ d2c$a d2c$b)))])
+          [x
+           (let [d2c$a x
+                 d2c$b 1]
+             (if (and (dart/is? d2c$a Point) (dart/is? d2c$b Point))
+               (. d2c$a + d2c$b)
+               (+ d2c$a d2c$b)))])
         extra)
       (if (nil? maybe) [] [maybe]))))
 
 (defn countUp [^int n]
   (let [total (volatile! 0)]
-    (loop [i 0] (when (< i n) (vswap! total + i) (recur (inc i))))
+    (loop [^int i 0] (when (< i n) (vswap! total + i) (recur (inc i))))
     (deref total)))
 
 (defn multiVar [^int n]
   (let [out (volatile! "")]
-    (loop [i 0
+    (loop [^int i 0
            j n]
       (when (< i j) (vreset! out (str (deref out) i "-" j ";")) (recur (inc i) (dec j))))
     (deref out)))
@@ -258,7 +380,7 @@
   (let [sum (volatile! 0)]
     (let [d2c$brk (volatile! false)
           d2c$cont (volatile! false)]
-      (loop [i 0]
+      (loop [^int i 0]
         (vreset! d2c$cont false)
         (when (and (not (or (deref d2c$brk) (deref d2c$cont))) (< i 10))
           (do
@@ -302,8 +424,10 @@
               (do (print (deref a)) (print rest)))
           (and (dart/is? d2c$subj Map) (contains? d2c$subj "k") (dart/is? (get d2c$subj "k") int))
             (let [v (get d2c$subj "k")] (print v))
-          (and (dart/is? d2c$subj Record) (dart/is? (.-$1 d2c$subj) int) (dart/is? (.-$2 d2c$subj) String))
-            (let [x (.-$1 d2c$subj) y (.-$2 d2c$subj)] (if (> x 0) (print y) nil))
+          (and (dart/is? d2c$subj Record) (dart/is? (.-$1 (cljd.core/identity d2c$subj)) int) (dart/is? (.-$2 (cljd.core/identity d2c$subj)) String))
+            (let [x (.-$1 (cljd.core/identity d2c$subj))
+                  y (.-$2 (cljd.core/identity d2c$subj))]
+              (if (> x 0) (print y) nil))
           :else (print "none")))
       (let [sw
               (let [d2c$subj (deref sum)]
@@ -313,15 +437,48 @@
                   :else "neg"))]
         (print sw)
         (let [d2c$pat #dart (1 2)
-              a (volatile! (.-$1 d2c$pat))
-              b (volatile! (.-$2 d2c$pat))]
+              a (volatile! (.-$1 (cljd.core/identity d2c$pat)))
+              b (volatile! (.-$2 (cljd.core/identity d2c$pat)))]
           (let [d2c$pat (cljd.core/identity #dart ((deref b) (deref a)))]
-            (do (vreset! a (.-$1 d2c$pat)) (vreset! b (.-$2 d2c$pat))))
-          (print (str (deref a) " " (deref b))))))))
+            (do
+              (vreset! a (.-$1 (cljd.core/identity d2c$pat)))
+              (vreset! b (.-$2 (cljd.core/identity d2c$pat)))))
+          (print (str (deref a) " " (deref b)))
+          nil)))))
 
 (defn ^:async work [^int x]
   (await (Future.delayed (Duration .seconds 1)))
   (+ x 1))
+
+(defn runCallback [cb]
+  (cb))
+
+(defn schedule [^int n report]
+  (runCallback (let [d2c$cb0 (fn [] (when (> n 0) (do (report n) nil)))] d2c$cb0))
+  nil)
+
+(defn ^:async delayedValue [^int x]
+  (let [d2c$a x
+        d2c$b 1]
+    (if (and (dart/is? d2c$a Point) (dart/is? d2c$b Point)) (. d2c$a + d2c$b) (+ d2c$a d2c$b))))
+
+(defn ^:async awaitLocal [^int x]
+  (let [value (cljd.core/identity (await (delayedValue x)))]
+    (let [d2c$a value
+          d2c$b 1]
+      (if (and (dart/is? d2c$a Point) (dart/is? d2c$b Point)) (. d2c$a + d2c$b) (+ d2c$a d2c$b)))))
+
+(defn guardedClosure [^int n]
+  (let [d2c$result (volatile! nil)
+        d2c$done (volatile! false)]
+    (do
+      (when (not (deref d2c$done))
+        (when (< n 0)
+          (when (not (deref d2c$done)) (do (vreset! d2c$result 0) (vreset! d2c$done true)))))
+      (when (not (deref d2c$done))
+        (let [f (fn [] (* n 2))]
+          (when (not (deref d2c$done)) (do (vreset! d2c$result (f)) (vreset! d2c$done true))))))
+    (deref d2c$result)))
 
 ^{:dart/annotations ["@Deprecated(\"use newName\")"]} ^:deprecated (def oldName 1)
 
@@ -339,4 +496,5 @@
     (Usage-record 2)
     (print (Usage-summary))
     (setTotal 5)
-    (print (Usage-summary))))
+    (print (Usage-summary))
+    nil))

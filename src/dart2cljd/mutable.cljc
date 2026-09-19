@@ -184,9 +184,15 @@
 
   Options:
     :params   collection of parameter names (declared, may be assigned)
-    :exclude  names that are not locals (e.g. instance fields)
+    :exclude  names that are not mutable locals (e.g. instance fields)
 
-  Returns {:mutable #{name} :captured #{name} :declared #{name}}."
+  Returns {:mutable #{name} :captured #{name} :declared #{name}}.
+
+  `:exclude` only removes names from `:mutable`/`:captured` (a field cannot be
+  boxed); `:declared` keeps them, because a parameter or local that *shadows*
+  a field is a real local: Dart scoping is innermost-first, so the emitter
+  must resolve it as one (`(error x)` calls the parameter, `(.error this x)`
+  the field)."
   [block {:keys [params exclude]}]
   (let [base {:declared (set params) :assigned #{} :free #{}}
         acc (walk block 0 base)
@@ -194,7 +200,7 @@
                     (set/difference (set exclude)))]
     {:mutable mutable
      :captured (set/intersection mutable (:free acc))
-     :declared (set/difference (:declared acc) (set exclude))}))
+     :declared (:declared acc)}))
 
 (defn assigns?
   "True when `node` contains a depth-0 assignment to the local `name`

@@ -68,6 +68,62 @@ class LateFinal {
   int sum() => fromCtor + fromMethod;
 }
 
+// M8: private Dart types are renamed (`_Foo` -> `d2c_Foo`): ClojureDart
+// declares the class as-is but resolves references through the generated
+// library's self-alias, and Dart rejects private names behind a prefix.
+class _PrivateBox {
+  int value;
+
+  _PrivateBox(this.value);
+
+  int doubled() => value * 2;
+}
+
+int privateBoxSum(int v) => _PrivateBox(v).doubled();
+
+// M8: non-constant parameter defaults (collections, calls, ...) cannot be Dart
+// parameter defaults; they become a nil default plus a body rebind.
+class Defaults {
+  final List<int> values;
+  final String label;
+
+  Defaults({this.values = const [1, 2], this.label = 'x'});
+
+  int total() => values.length + label.length;
+}
+
+int defaultSum({List<int> xs = const [1, 2, 3], int add = 0}) =>
+    xs.length + add;
+
+// M8: zero-parameter closures in argument position are lifted to a local, so
+// Dart does not infer them in a `void Function()` context (a value-returning
+// closure literal there is rejected).
+class VoidCallbackHost {
+  int value = 0;
+
+  void run(void Function() cb) {
+    cb();
+  }
+
+  void bump() {
+    run(() {
+      value = value + 1;
+    });
+  }
+}
+
+// M8: Dart locals whose names collide with cljd syntax (`when`, `let`, `and`,
+// `not`, ...) shadow the emitted forms (ClojureDart resolves locals before
+// macros/special forms); they are renamed to `<name>$local`.
+class ShadowHost {
+  num run(int let, int when) {
+    var and = let + when;
+    and++;
+    final not = and * 2;
+    return not;
+  }
+}
+
 // M8: `late` field initializers may reference `this` (`vsync: this`) or other
 // late fields; the generated make-fn assigns them after the constructor body.
 class LateInit {
@@ -102,6 +158,51 @@ class Child extends Base {
   @override
   String greet() => '${super.greet()}!';
 }
+
+// M8.18: a parameter that shadows a field is a real local (Dart scoping is
+// innermost-first): `error(...)` calls the parameter, it does not read the
+// field.
+class ShadowField {
+  final String error;
+
+  ShadowField(this.error);
+
+  String describe(String Function(String) error) => error(this.error);
+}
+
+// M8.18: a constructor parameter typed with the class's type variable must
+// not be hinted (`^T` is not in scope in the namespace-level make-fn).
+class Holder<T> {
+  final T value;
+
+  const Holder(this.value);
+
+  Holder.named(T value) : this(value);
+}
+
+int holderLength() => Holder<List<int>>([1, 2, 3]).value.length;
+
+// M8.18: non-scalar parameter hints are emitted only for overrides whose
+// superclass chain leaves the unit. A same-file base declares the method
+// unhinted (dynamic), so the override must stay dynamic too — Dart rejects an
+// override whose parameter type differs from the overridden method's.
+class Greeter {
+  String greet(Object other) => 'hi';
+}
+
+class NarrowGreeter extends Greeter {
+  @override
+  String greet(covariant Greeter other) => 'hi ${other.runtimeType}';
+}
+
+String narrowGreet() => NarrowGreeter().greet(NarrowGreeter());
+
+// M8.18: loop locals are hinted from their scalar initializer, so numeric
+// member reads do not see an `as num` cast (`i.isEven`).
+bool loopVarEven(int n) => [for (var i = 0; i < n; i++) i.isEven].first;
+
+// M8.18: `~/` chains must not be flattened (`quot` takes two arguments).
+int tripleDiv(int a, int b, int c) => a ~/ b ~/ c;
 
 abstract class Shape {
   String label;
@@ -192,8 +293,9 @@ class TaggedItem with Tagged {
   String describe() => '$name ${tag}';
 }
 
-// Generic mixin whose members do not mention the type parameter: the
-// parameter is dropped (ClojureDart has no bounds support).
+// Generic mixin whose members do not mention the type parameter: the mixin
+// declaration keeps the parameter (`on Base<T>` needs it), appliers implement
+// it raw; members that use the parameter fail loudly (no bounds support).
 mixin Counted<T> {
   int _count = 0;
   int get count => _count;
@@ -283,6 +385,38 @@ void loops() {
 Future<int> work(int x) async {
   await Future.delayed(const Duration(seconds: 1));
   return x + 1;
+}
+
+// M8.18: a closure whose tail is a void call discards the value (Dart
+// semantics); ClojureDart would otherwise `return` it (`void` in a
+// `Future<Null>`/`void` closure context).
+void runCallback(void Function() cb) => cb();
+
+void schedule(int n, void Function(int) report) {
+  runCallback(() {
+    if (n > 0) {
+      report(n);
+    }
+  });
+}
+
+// M8.18: a local initialized by `await` is bound dynamically: ClojureDart's
+// `no-future` only unwraps a canonical `Future`, so a type that merely
+// implements Future would be annotated with the pre-await type.
+Future<int> delayedValue(int x) async => x + 1;
+
+Future<int> awaitLocal(int x) async {
+  final value = await delayedValue(x);
+  return value + 1;
+}
+
+// M8.18: a nested closure has its own control flow; the enclosing function's
+// early-return guards must not leak into it (the closure runs after the
+// outer function returned, when the outer `d2c$done` flag is already set).
+int guardedClosure(int n) {
+  if (n < 0) return 0;
+  final f = () => n * 2;
+  return f();
 }
 
 @Deprecated('use newName')

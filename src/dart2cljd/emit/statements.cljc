@@ -109,8 +109,8 @@
   `deref`/`vreset!` consistently."
   [binds ctx]
   (vec (mapcat (fn [[n form]]
-                 (let [s (if (symbol? n) n (symbol n))
-                       nm (name s)]
+                 (let [s (core/local-symbol n ctx)
+                       nm (if (symbol? n) (name n) (str n))]
                    (if (contains? (:mutable ctx) nm)
                      [s (list (if (contains? (:captured ctx) nm)
                                 'atom 'volatile!)
@@ -121,9 +121,22 @@
 (defn- local-fn-form [d ctx]
   (when-not (= :fn (:kind d))
     (fail! d "local getters/setters are not supported"))
-  (let [{:keys [params body async]} (core/emit-callable d ctx)]
-    (with-meta (list* 'fn (symbol (:name d)) params body)
+  (let [{:keys [params body async rebinds]} (core/emit-callable d ctx)]
+    (with-meta (list* 'fn (symbol (:name d)) params (core/wrap-rebinds rebinds body))
       (when async {:async true}))))
+
+(defn- await-init
+  "ClojureDart's `no-future` unwraps only a canonical `Future`/`FutureOr`, so a
+  local initialized by `await` on a type that merely *implements* Future
+  (Supabase's `PostgrestBuilder` chains) is annotated with the pre-await type —
+  a Dart analyzer error and a runtime cast failure. The awaited type is not
+  knowable from the syntax, so such a local is bound through
+  `cljd.core/identity`, which makes ClojureDart infer `dynamic` (conservative,
+  and exact for dynamic dispatch)."
+  [init form]
+  (if (= :await (:ir init))
+    (list 'cljd.core/identity form)
+    form))
 
 (defn- decl->parts
   "A declaration statement -> {:bindings [...] :checks [form ...]}."
@@ -133,8 +146,9 @@
     {:bindings
      (vec (mapcat (fn [v]
                     (let [n (:name v)
-                          init (when (:init v) (emit-expr (:init v) ctx))]
-                      [(symbol n)
+                          init (when (:init v)
+                                 (await-init (:init v) (emit-expr (:init v) ctx)))]
+                      [(core/local-symbol n ctx)
                        (if (contains? (:mutable ctx) n)
                          (list (if (contains? (:captured ctx) n)
                                  'atom 'volatile!)
@@ -144,7 +158,8 @@
      :checks []}
 
     :fn-decl
-    {:bindings [(symbol (:name d)) (local-fn-form d ctx)] :checks []}
+    {:bindings [(core/local-symbol (:name d) ctx) (local-fn-form d ctx)]
+     :checks []}
 
     :pattern-var-decl-stmt
     (let [subj (symbol "d2c$pat")
@@ -173,10 +188,17 @@
 (defn- emit-direct [stmts ctx]
   (loop [ss (seq stmts) out []]
     (if-not ss
-      out
+      ;; Dart discards the value of a trailing expression statement; ClojureDart
+      ;; writes the last form of a *value* position as `return <form>;`, so
+      ;; append nil. This applies at every value tail, not only function
+      ;; bodies (`return_of_invalid_type` for a void call in an async closure).
+      (if (and (:value-tail? ctx) (seq stmts) (= :expr-stmt (:ir (last stmts))))
+        (conj out nil)
+        out)
       (let [s (first ss)
             last? (nil? (next ss))
-            sctx (assoc ctx :tail? (and last? (boolean (:tail? ctx))))]
+            sctx (assoc ctx
+                        :value-tail? (and last? (boolean (:value-tail? ctx))))]
         (case (:ir s)
           (:var-decl :fn-decl :pattern-var-decl-stmt)
           (let [[decls more] (split-with decl? ss)]
@@ -236,7 +258,7 @@
               (list 'do form inner)
               form)))
 
-        (let [form (guard (emit-stmt s (assoc ctx :tail? false)))]
+        (let [form (guard (emit-stmt s (assoc ctx :value-tail? false)))]
           (if-let [inner (recur-seq rest-stmts)]
             (list 'do form inner)
             form))))))
@@ -262,7 +284,7 @@
                        done (list 'volatile! false)]
                  (or (emit-guarded-seq stmts ctx') nil)
                  (list 'deref result))])
-        (emit-direct stmts ctx)))
+        (emit-direct stmts (assoc ctx :value-tail? true))))
     (emit-body-forms stmts ctx)))
 
 ;; ---------------------------------------------------------------------------
@@ -290,16 +312,25 @@
       (alt-form (first alts))
       (list* 'or (concat (map alt-form alts) [else])))))
 
+(defn- branch-form
+  "Emit one if/else branch statement in `ctx`. A *bare* expression statement
+  in a value tail appends nil: Dart discards its value, while ClojureDart
+  writes the branch's last form as `return <form>;`. (Block branches are
+  handled by `emit-direct`, which appends the same nil.)"
+  [st ctx]
+  (if (seq (:guards ctx))
+    (or (emit-guarded-seq (stmt-stmts st) ctx) nil)
+    (let [form (emit-stmt st ctx)]
+      (if (and (:value-tail? ctx) (= :expr-stmt (:ir st)))
+        (list 'do form nil)
+        form))))
+
 (defn- emit-if-case [s ctx]
   (let [p (:pattern (:case s))
         subj (symbol "d2c$subj")
-        then (if (seq (:guards ctx))
-               (or (emit-guarded-seq (stmt-stmts (:then s)) ctx) nil)
-               (emit-stmt (:then s) ctx))
+        then (branch-form (:then s) ctx)
         else (when (:else s)
-               (if (seq (:guards ctx))
-                 (or (emit-guarded-seq (stmt-stmts (:else s)) ctx) nil)
-                 (emit-stmt (:else s) ctx)))]
+               (branch-form (:else s) ctx))]
     (list 'let [subj (emit-expr (:cond s) ctx)]
           (match-form p subj ctx then else))))
 
@@ -307,10 +338,9 @@
   (let [c (emit-expr (:cond s) ctx)
         then-s (:then s)
         els (:else s)
-        branch (fn [st]
-                 (if (seq (:guards ctx))
-                   (or (emit-guarded-seq (stmt-stmts st) ctx) nil)
-                   (emit-stmt st (assoc ctx :tail? (boolean (:tail? ctx))))))]
+        ;; A branch inherits the if's own tail position: in a value tail its
+        ;; last form becomes the returned value.
+        branch (fn [st] (branch-form st ctx))]
     (cond
       (:case s) (emit-if-case s ctx)
 
@@ -402,7 +432,9 @@
     form))
 
 (defn- emit-loop-body [body ctx]
-  (do-form (emit-body-forms (stmt-stmts body) ctx)))
+  ;; A loop body's value is discarded (the loop yields the `recur` value), so
+  ;; a trailing expression statement needs no nil.
+  (do-form (emit-body-forms (stmt-stmts body) (assoc ctx :value-tail? false))))
 
 (defn- recur-form [ctx cont]
   (let [gs (remove #{cont} (:guards ctx))
@@ -477,7 +509,7 @@
                                       (:name v) " is not supported"))))
           {:keys [ctx brk cont]} (loop-ctx s ctx labels)
           bindings (vec (mapcat (fn [v]
-                                  [(symbol (:name v))
+                                  [(core/loop-var-symbol v ctx)
                                    (when (:init v) (emit-expr (:init v) ctx))])
                                 decl-vars))
           ;; Each loop variable's new value comes from *its own* updater;
@@ -491,7 +523,7 @@
                           {}
                           (:updaters loop))
           new-vals (map (fn [v]
-                          (get per-var (:name v) (symbol (:name v))))
+                          (get per-var (:name v) (core/local-symbol (:name v) ctx)))
                         decl-vars)
           updaters (keep (fn [u]
                            (let [r (updater-new-value u loop-names ctx)]
@@ -527,15 +559,17 @@
           {:keys [break? continue?]} (jump-info (:body s) labels false)
           iterable (emit-expr (:iterable loop) ctx)]
       (if (and (empty? (:guards ctx)) (not break?) (not continue?))
-        (list 'doseq [(symbol name) iterable]
-              (do-form (emit-body-forms (stmt-stmts (:body s)) ctx)))
+        (list 'doseq [(core/local-symbol name ctx) iterable]
+              (do-form (emit-body-forms (stmt-stmts (:body s))
+                                        (assoc ctx :value-tail? false))))
         (let [{:keys [ctx brk cont]} (loop-ctx s ctx labels)
               seq-sym (symbol "d2c$seq")
               body (emit-loop-body (:body s) (assoc ctx :guards (:guards ctx)))
               form (list* 'loop [seq-sym (list 'seq iterable)]
                           (concat (when cont [(list 'vreset! cont false)])
                                   [(list 'when (and-form (guards-form (:guards ctx)) seq-sym)
-                                         (list 'let [(symbol name) (list 'first seq-sym)]
+                                         (list 'let [(core/local-symbol name ctx)
+                                                     (list 'first seq-sym)]
                                                body
                                                (list 'when (guards-form (remove #{cont} (:guards ctx)))
                                                      (list 'recur (list 'next seq-sym)))))]))]
@@ -669,11 +703,19 @@
 (defn- emit-switch [s ctx]
   (let [{:keys [clauses default]} (switch-clauses s ctx)
         literals? (every? #(= :literal (:kind %)) clauses)
-        subject (emit-expr (:expr s) ctx)]
+        subject (emit-expr (:expr s) ctx)
+        ;; A switch statement without a default that is the tail of a
+        ;; non-void function body: Dart accepts it only when the cases are
+        ;; exhaustive (enum switches), where the fallback is unreachable —
+        ;; an implicit nil would not type-check, so emit a throwing stub
+        ;; instead of `nil` (M8.16).
+        fallback (if (and (nil? default) (:value-tail? ctx) (:non-void-body? ctx))
+                   (list 'throw (list 'UnsupportedError. "unreachable switch"))
+                   default)]
     (if (and literals? (every? #(literal? (:label %)) clauses))
       (list* 'case subject
              (concat (mapcat (fn [{:keys [label body]}] [label body]) clauses)
-                     [default]))
+                     [fallback]))
       (let [subj (symbol "d2c$subj")
             clauses' (map (fn [{:keys [kind label tests binds guard body]}]
                             (case kind
@@ -693,8 +735,8 @@
         (list 'let [subj subject]
               (if (seq clauses')
                 (list* 'cond (concat (mapcat identity clauses')
-                                     (when default [:else default])))
-                default))))))
+                                     (when fallback [:else fallback])))
+                fallback))))))
 
 ;; ---------------------------------------------------------------------------
 ;; try / catch
@@ -704,11 +746,11 @@
   (let [ty (if (:exception-type c)
              (core/type-symbol (:exception-type c) ctx)
              'dynamic)
-        e (symbol (or (:exception-var c) "_"))
-        st (:stack-var c)
+        e (core/local-symbol (or (:exception-var c) "_") ctx)
+        st (when (:stack-var c) (core/local-symbol (:stack-var c) ctx))
         ctx' (assoc ctx :catch-exception e)
         body (emit-body-forms (:stmts (:body c)) ctx')]
-    (list* 'catch ty e (concat (when st [(symbol st)]) body))))
+    (list* 'catch ty e (concat (when st [st]) body))))
 
 (defn- emit-try [s ctx]
   (let [body (emit-body-forms (:stmts (:body s)) ctx)
@@ -717,7 +759,10 @@
     (list* 'try
            (concat body catches
                    (when fin
-                     [(list* 'finally (emit-body-forms (:stmts fin) ctx))])))))
+                     ;; A finally block's value is discarded.
+                     [(list* 'finally
+                             (emit-body-forms (:stmts fin)
+                                              (assoc ctx :value-tail? false)))])))))
 
 ;; ---------------------------------------------------------------------------
 ;; pattern statements
@@ -786,9 +831,10 @@
   [s ctx]
   (case (:ir s)
     :block (do-form (emit-body-forms (:stmts s) ctx))
-    :expr-stmt (if (= :pattern-assign (:ir (:expr s)))
-                 (emit-pattern-assign (:expr s) ctx)
-                 (core/emit-expr-stmt (:expr s) ctx))
+    :expr-stmt
+    (if (= :pattern-assign (:ir (:expr s)))
+      (emit-pattern-assign (:expr s) ctx)
+      (core/emit-expr-stmt (:expr s) ctx))
     :var-decl (first (emit-body [s] (assoc ctx :fn-body? false)))
     :fn-decl (first (emit-body [s] (assoc ctx :fn-body? false)))
     :pattern-var-decl-stmt (first (emit-body [s] (assoc ctx :fn-body? false)))
@@ -799,7 +845,7 @@
     :labeled (labeled-loop s ctx)
     :switch-stmt (emit-switch s ctx)
     :try (emit-try s ctx)
-    :return (if (:tail? ctx)
+    :return (if (:value-tail? ctx)
               (when (:expr s) (emit-expr (:expr s) ctx))
               (fail! s "return outside of a function body"))
     :throw (list 'throw (emit-expr (:expr s) ctx))

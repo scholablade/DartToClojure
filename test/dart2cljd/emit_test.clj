@@ -69,7 +69,9 @@
       (testing "setters end in nil instead of returning a value"
         (is (re-find #"\^:setter norm \[this \^double v\] \(set! x v\) \(set! y v\) nil\)" out)))
       (testing "guarded returns guard every following statement"
-        (is (re-find #"(?s)\(defn fib.*\(when \(not \(deref d2c\$done\)\)\s*\(do \(vreset! d2c\$result \(\+ \(fib" out))))))
+        (is (re-find #"(?s)\(defn fib.*\(when \(not \(deref d2c\$done\)\)\s*\(do \(vreset! d2c\$result \(\+ \(fib" out)))
+      (testing "override parameters stay unhinted when the local base is unhinted"
+        (is (re-find #"\^String greet \[this other\]" out))))))
 
 (deftest fn-typedef-type-symbol
   (testing "external function typedefs map to Function (ClojureDart's analyzer
@@ -93,7 +95,7 @@
           {"p01_add" "(+ 1 2)"
            "p02_arith_chain" "(- (+ 1 2 3) 4)"
            "p03_div" "(/ 7 2)"
-           "p04_intdiv" "(quot 7 2)"
+           "p04_intdiv" "(. 7 \"~/\" 2)"
            "p05_mod" "(. 7 % 3)"
            "p06_logic" "(or (and true false) (not true))"
            "p07_ifnull" "(or nil 3)"
@@ -115,7 +117,7 @@
            "p23_list_spread" "(vec (concat [1] xs))"
            "p23b_list_spread_if" "(vec (concat [1] (if c [2 3] nil) [4]))"
            "p23c_list_spread_if_else" "(vec (concat (if c [1] [2 3])))"
-           "p23d_list_for_spread" "(vec (concat (loop [i 0 d2c$acc []] (if (< i n) (let [d2c$seg [i i]] (recur (inc i) (into d2c$acc d2c$seg))) d2c$acc))))"
+           "p23d_list_for_spread" "(vec (concat (loop [^int i 0 d2c$acc []] (if (< i n) (let [d2c$seg [i i]] (recur (inc i) (into d2c$acc d2c$seg))) d2c$acc))))"
            "p23e_list_null_aware" "(vec (concat (if (nil? maybe) [] [maybe])))"
            "p24_set" "#{1 2 3}"
            "p25_map" "{\"a\" 1 \"b\" 2}"
@@ -161,7 +163,7 @@
            "p66_prefixed_ctor" "(m/Text \"x\")"
            "p67_widget_column" "(m/Column .children [(m/Question (get (get questions _questionIndex) \"questionText\")) (-> ^List (get (get questions _questionIndex) \"answers\") (.map (fn [answer] (m/Answer _answerQuestion answer))) (.toList)) (m/Numb .sorted (and (< 1 2) (< 2 3) (< 3 a) (= a b)))])"
            "p68_widget_app" "(m/MaterialApp .title \"Cljd Demo\" .theme (m/ThemeData .primarySwatch m/Colors.blue) .home (m/Scaffold .appBar (m/AppBar .title (m/Text \"Home\")) .body (m/Center .child (m/Text \"Hi\"))))"
-           "p69_ternary_lambda" "(m/TextButton .onPressed (if _searchEnabled (fn [] (pop)) nil))"
+           "p69_ternary_lambda" "(m/TextButton .onPressed (if _searchEnabled (fn [] (pop) nil) nil))"
            "p70_interp_factory" "(m/Text (str \"Some \" field \" and \" (m/Factory.create)))"
            "p71_get_chain" "(get (get questions 1) \"two\")"
            "p72_const_list" "(m/SizedBox .height 8)"}]
@@ -174,17 +176,17 @@
 
 (deftest statement-parity
   (doseq [[name expected]
-          {"s_if" "(defn s_if [^int a]\n  (when (> a 0) (print \"pos\")))"
-           "s_if_else" "(defn s_if_else [^int a]\n  (if (> a 0) (print \"pos\") (print \"neg\")))"
-           "s_else_if" "(defn s_else_if [^int a]\n  (cond (> a 0) (print \"pos\") (< a 0) (print \"neg\") :else (print \"zero\")))"
+          {"s_if" "(defn s_if [^int a]\n  (when (> a 0) (do (print \"pos\") nil)))"
+           "s_if_else" "(defn s_if_else [^int a]\n  (if (> a 0) (do (print \"pos\") nil) (do (print \"neg\") nil)))"
+           "s_else_if" "(defn s_else_if [^int a]\n  (cond (> a 0) (do (print \"pos\") nil) (< a 0) (do (print \"neg\") nil) :else (do (print \"zero\") nil)))"
            "s_for_in" "(defn s_for_in [xs]\n  (doseq [x xs] (print x)))"
-           "s_switch" "(defn s_switch [^int x]\n  (case x 1 (print \"one\") 2 (print \"2or3\") 3 (print \"2or3\") (print \"other\")))"
-           "s_try" "(defn s_try []\n  (try (print 1) (catch StateError e st (print e)) (catch dynamic e (print e)) (finally (print 2))))"
+           "s_switch" "(defn s_switch [^int x]\n  (case x\n    1 (do (print \"one\") nil)\n    2 (do (print \"2or3\") nil)\n    3 (do (print \"2or3\") nil)\n    (do (print \"other\") nil)))"
+           "s_try" "(defn s_try []\n  (try\n    (print 1)\n    nil\n    (catch StateError e st (print e) nil)\n    (catch dynamic e (print e) nil)\n    (finally (print 2))))"
            "s_return" "(defn s_return [^int a]\n  (+ a 1))"
            "s_expr_body" "(defn s_expr_body [^int a]\n  (* a 2))"
-           "s_vars" "(defn s_vars []\n  (let [a 1 b 2] (print (+ a b))))"
+           "s_vars" "(defn s_vars []\n  (let [a 1 b 2] (print (+ a b)) nil))"
            "s_assert" "(defn s_assert [^int a]\n  (assert (> a 0) \"positive\"))"
-           "s_nested_block" "(defn s_nested_block [^int a]\n  (print a))"
+           "s_nested_block" "(defn s_nested_block [^int a]\n  (do (print a) nil))"
            "s_await" "(defn ^:async s_await [f]\n  (await f))"}]
     (testing name
       (is (= expected (emit-defn-str name))))))

@@ -8,6 +8,17 @@ void bumpCount() {
 
 String tag(Item item) => '${item.label}:$itemCount';
 
+// M8.18: a method parameter typed with a class declared in the same file must
+// not be hinted: the hint would become part of the emitted Dart signature and
+// a cross-file caller cannot resolve it (`Can't resolve type Box`).
+class Box {
+  final Item item;
+
+  Box(this.item);
+
+  String merge(Box other) => '${item.label}+${other.item.label}';
+}
+
 class Item {
   static const String kind = 'item';
 

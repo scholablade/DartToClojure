@@ -254,20 +254,114 @@
           (symbol (str base "." n))
           base)))))
 
+(defn- void-callback-literal?
+  "True for an anonymous zero-parameter fn. A closure *literal* whose body
+  returns a value is rejected in a Dart `void Function()` context
+  (`setState`, listeners, timers: `return_of_invalid_type_from_closure`); an
+  indirect reference is accepted."
+  [node]
+  (and (= :fn (:ir node)) (empty? (:params node))))
+
+(defn- lift-closure-arg
+  "Wrap a zero-parameter closure *positional* argument in a `let` so it is
+  not a Dart closure literal in the argument position; ClojureDart hoists the
+  binding into a local function declaration, which Dart accepts in void
+  contexts. Named arguments are left alone: they are usually typed callbacks
+  (`onRefresh:`, `onPressed:`), where the hoisted local's `dynamic Function()`
+  type is not assignable to the parameter type (RESEARCH M8.18)."
+  [expr node named? idx]
+  (if (and (not named?) (void-callback-literal? node))
+    (let [sym (symbol (str "d2c$cb" idx))]
+      (list 'let [sym expr] sym))
+    expr))
+
 (defn emit-args
   "Flatten IR arguments into a cljd argument sequence: positional values
-  interleaved with `.name value` pairs for named arguments."
+  interleaved with `.name value` pairs for named arguments.
+
+  Zero-parameter closure positional arguments are lifted out of the argument
+  position (see `lift-closure-arg`)."
   [args ctx]
-  (mapcat (fn [a]
-            (let [e (emit-expr (:expr a) ctx)]
+  (mapcat (fn [idx a]
+            (let [node (:expr a)
+                  e (lift-closure-arg (emit-expr node ctx) node (some? (:name a)) idx)]
               (if-let [n (:name a)]
                 [(symbol (str "." n)) e]
                 [e])))
+          (range)
           args))
 
 ;; ---------------------------------------------------------------------------
 ;; parameters
 ;; ---------------------------------------------------------------------------
+
+(def ^:private cljd-reserved-locals
+  "cljd names the emitter emits as syntax or as bare core calls. A Dart local
+  with one of these names shadows the emitted form — ClojureDart resolves
+  locals before macros/special forms, so `(when …)` under a local `when`
+  compiles as a call on the local (probe: RESEARCH M8.16) — therefore such
+  locals are renamed."
+  #{"let" "when" "and" "or" "not" "deref" "do" "defn" "recur" "fn" "def"
+    "cond" "into" "str" "quot" "mod" "count" "concat" "vec" "first" "drop"
+    "doto" "doseq" "case" "loop" "inc" "dec" "get" "next" "seq" "merge"
+    "mapcat" "atom" "assert" "ns" "deftype" "comment" "letfn"})
+
+(defn local-renames
+  "`name -> name$local` for bound names that collide with a cljd name the
+  emitter emits; see `cljd-reserved-locals`."
+  [names]
+  (into {}
+        (for [n names
+              :let [s (str n)]
+              :when (contains? cljd-reserved-locals s)]
+          [s (str s "$local")])))
+
+(defn local-symbol
+  "Binding symbol for local `name`: renamed when `ctx` carries a rename for it
+  (readers use the same helper, so binding and references stay in sync)."
+  [name ctx]
+  (symbol (get (:local-renames ctx) (str name) (str name))))
+
+(def ^:private scalar-type-names
+  #{"int" "double" "num" "bool" "String"})
+
+(defn- strip-paren [node]
+  (if (= :paren (:ir node)) (recur (:expr node)) node))
+
+(defn- literal-tag
+  "cljd tag symbol for a scalar literal expression, or nil."
+  [node]
+  (let [n (strip-paren node)]
+    (case (:ir n)
+      :int-lit 'int
+      :double-lit 'double
+      :string-lit 'String
+      :bool-lit 'bool
+      :prefix (when (= "-" (:op n)) (literal-tag (:operand n)))
+      nil)))
+
+(defn loop-var-symbol
+  "Binding symbol for a C-style loop variable.
+
+  ClojureDart types `loop` locals from the *binding symbol's* tag, not from the
+  initializer (compiler `emit-loop*`), so an unhinted `[i 0]` becomes
+  `dc.dynamic i$1 = 0` and later numeric interop inserts `(i as num)` casts —
+  which promote `i` to `num` in Dart and break int member reads (`i.isEven`).
+  Scalar-typed or scalar-literal-initialized loop variables get a `^Type`
+  hint, matching Dart's inference for `var i = 0`."
+  [v ctx]
+  (let [s (local-symbol (:name v) ctx)
+        ty (:type v)]
+    (cond
+      (and (map? ty) (= :named-type (:ir ty)) (nil? (:prefix ty))
+           (not (:nullable ty))
+           (contains? scalar-type-names (str (:name ty))))
+      (vary-meta s assoc :tag (symbol (str (:name ty))))
+
+      (and (nil? ty) (:init v) (literal-tag (:init v)))
+      (vary-meta s assoc :tag (literal-tag (:init v)))
+
+      :else s)))
 
 (def ^:private param-hint-types
   "Dart scalar types emitted as `^Type` metadata on cljd fn parameters.
@@ -278,58 +372,118 @@
 
 (defn param-symbol
   "cljd binding symbol for a Dart formal parameter (after renaming, when the
-  parameter is a reassigned local). Scalar Dart types are emitted as `^Type`
-  hints; other types are left unhinted, since an unresolvable cljd type hint
-  would break compilation."
-  [p rename _ctx]
+  parameter is a reassigned local).
+
+  Scalar Dart types are always emitted as `^Type` hints (int literals reaching
+  `double` slots need them). Non-scalar types — local classes, batch project
+  types, type variables — are hinted only in `@override` positions
+  (`:override-params?`): a hint becomes part of the emitted Dart method
+  signature, and ClojureDart cannot map a *generated* library's own class back
+  to a cljd symbol at a cross-file call site (`Can't resolve type
+  <generated-class>`). Overrides are called by the Flutter framework, never from
+  another generated namespace, and their hint is what makes the parameter's
+  members resolve (`didUpdateWidget(covariant <WidgetType> oldWidget)`).
+  External types are left unhinted (an unresolvable cljd hint would break
+  compilation), except that the batch exports shim resolves them."
+  [p rename ctx]
   (let [s (symbol (get rename (:name p) (:name p)))
         ty (:type p)
         n (when (and (= :named-type (:ir ty)) (nil? (:prefix ty)))
-            (str (:name ty)))]
-    (if (and (contains? param-hint-types n) (not (:nullable ty)))
-      (vary-meta s assoc :tag (symbol n))
-      s)))
+            (str (:name ty)))
+        hint? (and n
+                   (not (:nullable ty))
+                   (or (contains? param-hint-types n)
+                       (and (:override-params? ctx)
+                            (or (some? (project-type-info n ctx))
+                                (contains? (get-in ctx [:unit-info :classes]) n)
+                                (contains? (:type-vars ctx) n)))))
+        ;; `type-symbol` expands typedefs and qualifies project types; the
+        ;; scalar set maps to itself.
+        tag (when hint? (type-symbol ty ctx))]
+    (if tag (vary-meta s assoc :tag tag) s)))
+
+(defn- dart-const-default?
+  "True when `form` can be written into a Dart parameter default.
+
+  Dart requires compile-time constants and ClojureDart writes the emitted form
+  verbatim into the parameter list: a collection or call would inline
+  construction statements there (`dc.dynamic options = final lcoc_core...;
+  ...`), which is not valid Dart. Only scalar literals and nil are safe."
+  [form]
+  (or (nil? form) (boolean? form) (number? form) (string? form)))
 
 (defn emit-params
-  "Dart formal parameter list -> cljd fn parameter vector.
+  "Dart formal parameter list ->
+  `{:params [...] :rebinds [[sym default] ...]}`.
 
-  Required positional params first, then Dart optional positional params
-  after a `...` delimiter, then Dart named params as `.name default` pairs."
+  Required positional params first, then Dart optional positional params after
+  a `...` delimiter, then Dart named params as `.name default` pairs.
+
+  A default that is not a Dart constant (collection, call, interpolation, ...)
+  cannot appear in the Dart parameter list: the parameter gets a `nil` default
+  and the real default is bound at the top of the body (`:rebinds`).
+  Divergence: an argument explicitly passed as nil also takes the default
+  (Dart would keep the nil)."
   [params rename ctx]
-  (let [required (filter #(= :required-positional (:kind %)) params)
-        optional (filter #(= :optional-positional (:kind %)) params)
-        named (filter #(= :named (:kind %)) params)]
-    (vec
-     (concat
-      (map #(param-symbol % rename ctx) required)
-      (when (seq optional)
-        (cons '...
-              (mapcat (fn [p]
-                        [(param-symbol p rename ctx)
-                         (if (:default p)
-                           (emit-expr (:default p) ctx)
-                           nil)])
-                      optional)))
-      (mapcat (fn [p]
-                (let [s (param-symbol p rename ctx)
-                      nsym (symbol (str "." (:name p)))]
-                  (if (and (:default p) (not (:required p)))
-                    [(vary-meta nsym merge (meta s))
-                     (emit-expr (:default p) ctx)]
-                    [(vary-meta nsym merge (meta s))])))
-              named)))))
+  (let [handled (mapv (fn [p]
+                        (let [s (param-symbol p rename ctx)
+                              has-default? (and (:default p) (not (:required p)))
+                              d (when has-default? (emit-expr (:default p) ctx))
+                              const? (dart-const-default? d)]
+                          {:kind (:kind p)
+                           :name (:name p)
+                           :sym s
+                           :has-default? has-default?
+                           :default (if const? d nil)
+                           :rebind (when (and has-default? (not const?))
+                                     [s (list 'if (list 'nil? s) d s)])}))
+                      params)
+        reqs (filter #(= :required-positional (:kind %)) handled)
+        opts (filter #(= :optional-positional (:kind %)) handled)
+        nms (filter #(= :named (:kind %)) handled)
+        params-vec
+        (vec
+         (concat
+          (map :sym reqs)
+          (when (seq opts)
+            (cons '...
+                  (mapcat (fn [{:keys [sym default]}] [sym default]) opts)))
+          (mapcat (fn [{:keys [name sym default has-default?]}]
+                    (let [nsym (symbol (str "." name))]
+                      (if has-default?
+                        [(vary-meta nsym merge (meta sym)) default]
+                        [(vary-meta nsym merge (meta sym))])))
+                  nms)))]
+    {:params params-vec
+     :rebinds (vec (mapcat :rebind handled))}))
 
 (defn- box-form [captured? init]
   (list (if captured? 'atom 'volatile!) init))
 
+(defn wrap-rebinds
+  "Wrap `body` forms in the parameter-default rebinds from `emit-params`
+  (non-constant Dart defaults become a nil default plus a body binding).
+  Constructor emitters place them *before* the field bindings/constructor
+  call, so the default reaches the field values."
+  [rebinds body]
+  (if (seq rebinds)
+    [(list* 'let rebinds (if (seq body) body [nil]))]
+    body))
+
 (defn emit-callable
   "Emit a function-like node (`:params` + `:body`) into
-  `{:params [...] :body [...] :async bool}`.
+  `{:params [...] :rebinds [...] :body [...] :async bool}`.
 
   Block bodies get a mutability analysis (R1); reassigned parameters are
-  renamed and re-bound to a box so mutation compiles."
+  renamed and re-bound to a box so mutation compiles. `:rebinds` are not
+  applied to `:body` (callers decide where; see `wrap-rebinds`).
+
+  The enclosing function's control-flow context (early-return guards, loop
+  break/continue flags) is cleared: a nested function has its own control
+  flow and must not skip its statements on the outer function's state."
   [node ctx]
-  (let [params (:params node)
+  (let [ctx (dissoc ctx :guards :result :done :break-syms :continue-syms)
+        params (:params node)
         body (:body node)
         async (:async body)
         generator? (and async (re-find #"\*" (str async)))]
@@ -337,8 +491,13 @@
       (fail! body "generators (async*/sync*) are not supported by ClojureDart"))
     (case (:ir body)
       :expr-body
-      (let [ctx' (update ctx :locals set/union (set (keep :name params)))]
-        {:params (emit-params params {} ctx')
+      (let [renames (local-renames (keep :name params))
+            ctx' (-> ctx
+                     (update :locals set/union (set (keep :name params)))
+                     (update :local-renames merge renames))
+            {:keys [params rebinds]} (emit-params params renames ctx')]
+        {:params params
+         :rebinds rebinds
          :body [(emit-expr (:expr body) ctx')]
          :async (some? async)})
 
@@ -349,7 +508,15 @@
                                   {:params param-names
                                    :exclude (:fields ctx)})
             mutated (set/intersection (:mutable info) (set param-names))
-            rename (into {} (map (fn [n] [n (str n "$param")])) mutated)
+            ;; Reserved names are renamed first (`when` -> `when$local`), then
+            ;; reassigned parameters get the `$param` suffix so the box and the
+            ;; parameter binding stay distinct.
+            base-renames (local-renames (concat param-names (:declared info)))
+            rename (into {}
+                         (for [n param-names
+                               :let [base (get base-renames n n)]
+                               :when (or (contains? mutated n) (not= base n))]
+                           [n (str base (when (contains? mutated n) "$param"))]))
             ctx' (assoc ctx
                         :mutable (:mutable info)
                         :captured (:captured info)
@@ -357,22 +524,31 @@
                                       (:block body)
                                       (get-in ctx [:unit-info :classes])
                                       params)
-                        :locals (set/union (:locals ctx) (:declared info)))
+                        :locals (set/union (:locals ctx) (:declared info))
+                        :local-renames (merge (:local-renames ctx) base-renames))
             body-forms ((:emit-body ctx') stmts (assoc ctx' :fn-body? true))
             bindings (vec (mapcat (fn [n]
-                                    [(symbol n)
+                                    [(local-symbol n ctx')
                                      (box-form (contains? (:captured info) n)
-                                               (symbol (str n "$param")))])
+                                               (symbol (get rename n n)))])
                                   (sort mutated)))
             body-forms (if (seq mutated)
                          [(list* 'let bindings (if (seq body-forms) body-forms [nil]))]
-                         body-forms)]
-        {:params (emit-params params rename ctx')
+                         body-forms)
+            {:keys [params rebinds]} (emit-params params rename ctx')]
+        {:params params
+         :rebinds rebinds
          :body body-forms
          :async (some? async)})
 
       :empty-body
-      {:params (emit-params params {} ctx) :body [nil] :async (some? async)}
+      (let [{:keys [params rebinds]} (emit-params params
+                                                  (local-renames (keep :name params))
+                                                  ctx)]
+        {:params params
+         :rebinds rebinds
+         :body [nil]
+         :async (some? async)})
 
       :native-body (fail! body "native function bodies are not supported")
       (fail! body (str "unsupported function body " (:ir body))))))
@@ -653,7 +829,7 @@
       :else
       (list* (if (and (:wildcard-alias (:aliases ctx)) (not (known-bare? n ctx)))
                (alias/qualify n (:aliases ctx))
-               (symbol n))
+               (local-symbol n ctx))
              (emit-args (:args node) ctx)))))
 
 ;; ---------------------------------------------------------------------------
@@ -667,6 +843,11 @@
    "&" 'bit-and "|" 'bit-or "^" 'bit-xor
    "<<" 'bit-shift-left ">>" 'bit-shift-right ">>>" 'unsigned-bit-shift-right})
 
+(def ^:private non-variadic-ops
+  "Dart operators whose cljd function takes exactly two arguments: a
+  same-operator chain must not be flattened into one call (`(quot a b c)`)."
+  #{"~/" "<<" ">>" ">>>"})
+
 (defn compound-fn
   "Function form implementing a Dart compound assignment operator. Accepts
   either the compound spelling (`+=`) or the bare operator (`+`)."
@@ -678,9 +859,6 @@
       "&" 'bit-and "|" 'bit-or "^" 'bit-xor
       "<<" 'bit-shift-left ">>" 'bit-shift-right ">>>" 'unsigned-bit-shift-right
       (fail! {:src nil} (str "unsupported compound assignment operator " op)))))
-
-(defn- strip-paren [node]
-  (if (= :paren (:ir node)) (recur (:expr node)) node))
 
 (def ^:private operator-call-names
   "Dart binary operators that can be user-defined, as cljd method names.
@@ -753,11 +931,16 @@
   "Two-argument fallback for an overloadable operator. No same-operator
   flattening here: guarded operands are pre-bound locals."
   [op ctx a b]
-  (if (= op "%")
-    (if (= :idiomatic (:mode ctx))
-      (list 'mod a b)
-      (list '. a (symbol "%") b))
-    (list (binary-ops op) a b)))
+  (cond
+    (= op "%") (if (= :idiomatic (:mode ctx))
+                 (list 'mod a b)
+                 (list '. a (symbol "%") b))
+    ;; `cljd.core/quot` is declared `^num` although Dart's `num.~/` returns
+    ;; `int`; the interop form keeps the int static type, which int contexts
+    ;; need (`int f() => (a ~/ 2).clamp(0, n)`). The member name must be the
+    ;; string `"~/"`: the bare symbol `~/` reads as `unquote`.
+    (= op "~/") (list '. a "~/" b)
+    :else (list (binary-ops op) a b)))
 
 (defn- unknown-id-receiver?
   "True when `node` is an identifier whose type is not known (not a unit
@@ -777,16 +960,25 @@
 
 (defn- emit-guarded-binary
   "Runtime dispatch for an operator whose receiver type is unknown:
-  `(let [d2c$a A d2c$b B] (if (dart/is? d2c$a C1) (. d2c$a + d2c$b) … fallback))`."
+  `(let [d2c$a A d2c$b B] (if (and (dart/is? d2c$a C1) (dart/is? d2c$b C1))
+  (. d2c$a + d2c$b) … fallback))`.
+
+  Both operands are narrowed: Dart promotes them inside the branch, which is
+  what makes the call type-check against a hinted operator parameter
+  (`Point.+ [this ^Point o]`) — the source would only reach it with a `C1`
+  right-hand side anyway."
   [node ctx]
   (let [a 'd2c$a b 'd2c$b
         method (operator-method-symbol (get operator-call-names (:op node)))
         fallback (plain-binary-form (:op node) ctx a b)
         chain (reduce (fn [else class]
-                        (list 'if
-                              (list 'dart/is? a (type-symbol-for class ctx))
-                              (list '. a method b)
-                              else))
+                        (let [t (type-symbol-for class ctx)]
+                          (list 'if
+                                (list 'and
+                                      (list 'dart/is? a t)
+                                      (list 'dart/is? b t))
+                                (list '. a method b)
+                                else)))
                       fallback
                       (reverse (operator-candidates ctx (:op node) 1)))]
     (list 'let [a (emit-expr (:lhs node) ctx)
@@ -833,8 +1025,18 @@
         (list 'mod (emit-expr (:lhs node) ctx) (emit-expr (:rhs node) ctx))
         (list '. (emit-expr (:lhs node) ctx) (symbol "%") (emit-expr (:rhs node) ctx)))
 
+      ;; `cljd.core/quot` is declared `^num` although Dart's `num.~/` returns
+      ;; `int`; the interop form keeps the int static type, which int contexts
+      ;; need (`int f() => (a ~/ 2).clamp(0, n)`). The member name must be the
+      ;; string `"~/"`: the bare symbol `~/` reads as `unquote`.
+      (= op "~/")
+      (list '. (emit-expr (:lhs node) ctx) "~/" (emit-expr (:rhs node) ctx))
+
       (contains? binary-ops op)
-      (list* (binary-ops op) (flatten-same op node ctx))
+      (let [args (if (contains? non-variadic-ops op)
+                   [(emit-expr (:lhs node) ctx) (emit-expr (:rhs node) ctx)]
+                   (flatten-same op node ctx))]
+        (list* (binary-ops op) args))
 
       :else (fail! node (str "unsupported binary operator " op)))))
 
@@ -977,19 +1179,19 @@
             (when (contains? (:mutable ctx) n)
               (fail! node (str "increment/decrement of reassigned class-typed local "
                                n " is not supported")))
-            (let [form (user-op-form (symbol n) (:op node) 1)]
+            (let [form (user-op-form (local-symbol n ctx) (:op node) 1)]
               (if prefix?
-                (list 'set! (symbol n) form)
-                (list 'let [(symbol "d2c$old") (symbol n)]
-                      (list 'set! (symbol n) form)
+                (list 'set! (local-symbol n ctx) form)
+                (list 'let [(symbol "d2c$old") (local-symbol n ctx)]
+                      (list 'set! (local-symbol n ctx) form)
                       (symbol "d2c$old")))))
 
           (contains? (:mutable ctx) n)
           (let [write (list (if (contains? (:captured ctx) n) 'swap! 'vswap!)
-                            (symbol n) op)]
+                            (local-symbol n ctx) op)]
             (if prefix?
               write
-              (list 'let [(symbol "d2c$old") (list 'deref (symbol n))]
+              (list 'let [(symbol "d2c$old") (list 'deref (local-symbol n ctx))]
                     write (symbol "d2c$old"))))
 
           (and (or (:ctor-body? ctx) (:in-fn ctx))
@@ -1037,10 +1239,12 @@
               :else (fail! node (str n " is not modifiable"))))
 
           :else
-          (let [write (list 'set! (symbol n) (list op (symbol n)))]
+          (let [write (list 'set! (local-symbol n ctx)
+                            (list op (local-symbol n ctx)))]
             (if prefix?
               write
-              (list 'let [(symbol "d2c$old") (symbol n)] write (symbol "d2c$old"))))))
+              (list 'let [(symbol "d2c$old") (local-symbol n ctx)]
+                    write (symbol "d2c$old"))))))
 
       :prop (emit-increment-place target node ctx op prefix?)
       :prefixed-id (emit-increment-place (assoc target :ir :prop
@@ -1059,20 +1263,21 @@
       (contains? (:mutable ctx) n)
       (let [setter (if (contains? (:captured ctx) n) 'swap! 'vswap!)
             resetter (if (contains? (:captured ctx) n) 'reset! 'vreset!)
-            d (list 'deref (symbol n))
+            l (local-symbol n ctx)
+            d (list 'deref l)
             m (when (contains? (get-in (:local-types ctx) [:classes]) n)
                 (get operator-call-names (bare-operator op)))]
         (case op
-          nil (list resetter (symbol n) rhs)
-          "??" (list 'if (list 'nil? d) (list resetter (symbol n) rhs) d)
-          "&&" (list 'if d (list resetter (symbol n) rhs) d)
-          "||" (list 'if d d (list resetter (symbol n) rhs))
+          nil (list resetter l rhs)
+          "??" (list 'if (list 'nil? d) (list resetter l rhs) d)
+          "&&" (list 'if d (list resetter l rhs) d)
+          "||" (list 'if d d (list resetter l rhs))
           (if m
-            (list setter (symbol n)
+            (list setter l
                   (list 'fn ['d2c$a 'd2c$b]
                         (list '. 'd2c$a (operator-method-symbol m) 'd2c$b))
                   rhs)
-            (list setter (symbol n) (compound-fn op) rhs))))
+            (list setter l (compound-fn op) rhs))))
 
       (contains? (:atom-fields ctx) n)
       (let [a (get (:atom-fields ctx) n)
@@ -1094,7 +1299,8 @@
 
       (and (contains? (get-in (:local-types ctx) [:classes]) n)
            (contains? operator-call-names (bare-operator op)))
-      (list 'set! (symbol n) (user-op-form (symbol n) op rhs))
+      (list 'set! (local-symbol n ctx)
+            (user-op-form (local-symbol n ctx) op rhs))
 
       (contains? (get-in ctx [:unit-info :top-setters]) n)
       (list (symbol (str "set-" n "!")) rhs)
@@ -1135,18 +1341,19 @@
           :else (fail! lhs (str n " is not assignable"))))
 
       :else
-      (case op
-        nil (list 'set! (symbol n) rhs)
-        "??" (list 'if (list 'nil? (symbol n))
-                   (list 'set! (symbol n) rhs)
-                   (symbol n))
-        "&&" (list 'if (symbol n)
-                   (list 'set! (symbol n) rhs)
-                   (symbol n))
-        "||" (list 'if (symbol n)
-                   (symbol n)
-                   (list 'set! (symbol n) rhs))
-        (list 'set! (symbol n) (list (compound-fn op) (symbol n) rhs))))))
+      (let [l (local-symbol n ctx)]
+        (case op
+          nil (list 'set! l rhs)
+          "??" (list 'if (list 'nil? l)
+                     (list 'set! l rhs)
+                     l)
+          "&&" (list 'if l
+                     (list 'set! l rhs)
+                     l)
+          "||" (list 'if l
+                     l
+                     (list 'set! l rhs))
+          (list 'set! l (list (compound-fn op) l rhs)))))))
 
 (defn- assign-slot [read write op rhs]
   (case op
@@ -1252,7 +1459,7 @@
     :for-element
     (let [loop (:loop node)]
       (case (:ir loop)
-        :for-in (let [v (symbol (:name (:var loop)))
+        :for-in (let [v (local-symbol (:name (:var loop)) ctx)
                       coll (emit-expr (:iterable loop) ctx)
                       body (:body node)]
                   (if (simple-elem? body)
@@ -1319,14 +1526,15 @@
     (let [n (:name (:operand u))
           op (:op u)]
       (when (and (contains? names n) (contains? #{"++" "--"} op))
-        (list (if (= "++" op) 'inc 'dec) (symbol n))))
+        (list (if (= "++" op) 'inc 'dec) (local-symbol n ctx))))
 
     :assign
     (let [lhs (:lhs u)]
       (when (and (= :id (:ir lhs)) (contains? names (:name lhs)))
         (if (= "=" (:op u))
           (emit-expr (:rhs u) ctx)
-          (list (compound-fn (:op u)) (symbol (:name lhs)) (emit-expr (:rhs u) ctx)))))
+          (list (compound-fn (:op u)) (local-symbol (:name lhs) ctx)
+                (emit-expr (:rhs u) ctx)))))
 
     nil))
 
@@ -1354,7 +1562,7 @@
                     (update :mutable #(apply disj % names))
                     (update :captured #(apply disj % names)))
             bindings (vec (mapcat (fn [v]
-                                    [(symbol (:name v))
+                                    [(loop-var-symbol v ctx)
                                      (when (:init v) (emit-expr (:init v) ctx))])
                                   decl-vars))
             new-by-var (reduce (fn [m u]
@@ -1369,7 +1577,7 @@
                                {}
                                (:updaters loop))
             new-vals (mapv (fn [v]
-                             (get new-by-var (:name v) (symbol (:name v))))
+                             (get new-by-var (:name v) (local-symbol (:name v) ctx)))
                            decl-vars)
             cond (when (:cond loop) (emit-expr (:cond loop) ctx))
             seg (if (simple-elem? (:body node))
@@ -1404,8 +1612,8 @@
   ;; Inside a nested function (Dart closure) ClojureDart captures deftype
   ;; fields by value and forbids `set!` on them; accessing them through
   ;; `this` preserves Dart's read-at-call-time/mutable-field semantics.
-  (let [{:keys [params body async]} (emit-callable node (assoc ctx :in-fn true))]
-    (with-meta (list* 'fn params body)
+  (let [{:keys [params body async rebinds]} (emit-callable node (assoc ctx :in-fn true))]
+    (with-meta (list* 'fn params (wrap-rebinds rebinds body))
       (when async {:async true}))))
 
 ;; ---------------------------------------------------------------------------
@@ -1443,8 +1651,8 @@
   (let [n (str name)
         sm (static-member-info n ctx)]
     (cond
-      (contains? (:mutable ctx) n) (list 'deref (symbol n))
-      (contains? (:locals ctx) n) (symbol n)
+      (contains? (:mutable ctx) n) (list 'deref (local-symbol n ctx))
+      (contains? (:locals ctx) n) (local-symbol n ctx)
       ;; In a constructor body the deftype field is not a local of the
       ;; generated make-fn (its initial value was passed to the constructor
       ;; call), and in a nested function ClojureDart snapshots field locals
@@ -1638,8 +1846,10 @@
                      (emit-expr e ctx)))
 
                  :block-body
+                 ;; Not a value tail: the form is inlined where the tick (or
+                 ;; the enclosing expression) follows.
                  (let [forms ((:emit-body ctx) (:stmts (:block body))
-                              (assoc ctx :fn-body? false))]
+                              (assoc ctx :fn-body? false :value-tail? false))]
                    (cond
                      (empty? forms) nil
                      (= 1 (count forms)) (first forms)

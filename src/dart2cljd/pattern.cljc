@@ -61,10 +61,19 @@
                 (first (alternatives e (list 'get subject i) ctx opts))]
             (recur (next els) (inc i) (into tests sub-tests) (into binds sub-binds) rest?))))))))
 
-(defn- record-field-subject [subject pfield pos]
-  (if-let [n (:name pfield)]
-    (list (symbol (str ".-" n)) subject)
-    (list (symbol (str ".-$" pos)) subject)))
+(defn- record-field-subject
+  "Field access on a record pattern's subject.
+
+  The subject is wrapped in `cljd.core/identity`: Dart's flow analysis promotes
+  a local tested with `is Record` to `Record` inside the branch (the tests are
+  lowered to final boolean locals), and the raw `Record` interface has no `$n`
+  getters — `The getter '$1' isn't defined for the type 'Record'`. The call
+  result is dynamic and cannot be promoted."
+  [subject pfield pos]
+  (let [subject (list 'cljd.core/identity subject)]
+    (if-let [n (:name pfield)]
+      (list (symbol (str ".-" n)) subject)
+      (list (symbol (str ".-$" pos)) subject))))
 
 (defn- map-pattern-alt [p subject ctx opts]
   (let [base (when (get opts :structural-tests? true)

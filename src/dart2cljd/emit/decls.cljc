@@ -403,18 +403,37 @@
   [m]
   (= "void" (str (:name (:return-type m)))))
 
+(defn- override-method?
+  "True when the method carries `@override` (the annotation is dropped from
+  the output, but it decides whether non-scalar parameter hints are safe; see
+  `core/param-symbol`)."
+  [m]
+  (boolean (some #(= "override" (dart-expr-str (:name %))) (:annotations m))))
+
 (defn- emit-method [m ctx {:keys [concrete-stubs?]}]
-  (let [{:keys [params body]} (core/emit-callable
-                               m (assoc ctx :params (:params m)))
+  (let [override-params? (contains? (get-in ctx [:unit-info :override-hints])
+                                    [(:class-name ctx) (:name m)])
+        {:keys [params body rebinds async]} (core/emit-callable
+                                             m (assoc ctx
+                                                      :params (:params m)
+                                                      :override-params? override-params?
+                                                      :non-void-body? (not (void-return? m))))
         body (cond
                (:abstract m) (if concrete-stubs? [(abstract-stub)] [])
-               (= :setter (:kind m)) (conj (vec body) nil)
+               (= :setter (:kind m)) (if (and (seq body) (nil? (last body)))
+                                       body
+                                       (conj (vec body) nil))
                ;; ClojureDart writes the last body form as `return <form>;`;
                ;; a Dart void method must not return a value (C4).
-               (void-return? m) (conj (vec body) nil)
-               :else body)]
+               (void-return? m) (if (and (seq body) (nil? (last body)))
+                                  body
+                                  (conj (vec body) nil))
+               :else body)
+        body (if (:abstract m) body (core/wrap-rebinds rebinds body))]
     (with-annotations
-     (list* (method-symbol m ctx) (into ['this] params) body)
+     (list* (with-async (method-symbol m ctx) async)
+            (into ['this] params)
+            body)
      m)))
 
 (defn- emit-static-member [m ctx]
@@ -434,13 +453,16 @@
             (get-in m [:fields :vars]))
 
       :method
-      (let [{:keys [params body async]} (core/emit-callable
-                                         m (assoc ctx :params (:params m)))
+      (let [{:keys [params body async rebinds]} (core/emit-callable
+                                                 m (assoc ctx
+                                                          :params (:params m)
+                                                          :non-void-body? (not (void-return? m))))
             name-sym (with-async (if (= :setter (:kind m))
                                    (symbol (str "set-" (:name m) "!"))
                                    sym)
                                  async)]
-        [(with-annotations (list* 'defn name-sym params body) m)])
+        [(with-annotations
+          (list* 'defn name-sym params (core/wrap-rebinds rebinds body)) m)])
       (core/fail! m (str "unsupported static member " (:ir m))))))
 
 ;; ---------------------------------------------------------------------------
@@ -525,6 +547,10 @@
         cname (:name ctor)
         params (fill-field-formal-types ctor fields)
         ctor' (assoc ctor :params params)
+        ;; The make-fn is namespace-level: the class's type parameters are not
+        ;; in scope there, so `^T` hints (or bare `T` type symbols) would fail
+        ;; with "Can't resolve type T" (probe: LoadState.data(T value)).
+        ctx (dissoc ctx :type-vars)
         ctx (update ctx :locals set/union (set (keep :name params)))
         shape (:super-shape d)
         super-values (when shape
@@ -537,18 +563,20 @@
         redirect (some #(when (= :redirect-init (:ir %)) %) (:initializers ctor))]
     (cond
       redirect
-      (let [{:keys [params]} (core/emit-callable ctor' ctx)
+      (let [{:keys [params rebinds]} (core/emit-callable ctor' ctx)
             target (core/ctor-symbol-for class (:name redirect))]
         [(with-annotations
-          (list 'defn (ctor-defn-name d cname nil) params
-                (list* target (core/emit-args (:args redirect) ctx)))
+          (list* 'defn (ctor-defn-name d cname nil) params
+                 (core/wrap-rebinds
+                  rebinds
+                  [(list* target (core/emit-args (:args redirect) ctx))]))
           ctor)])
 
       (:factory ctor)
-      (let [{:keys [params body async]} (core/emit-callable ctor' ctx)]
+      (let [{:keys [params body async rebinds]} (core/emit-callable ctor' ctx)]
         [(with-annotations
           (list* 'defn (ctor-defn-name d cname async)
-                 params body)
+                 params (core/wrap-rebinds rebinds body))
           ctor)])
 
       :else
@@ -561,7 +589,7 @@
       ;; exist while the make-fn's let bindings are computed. They are
       ;; assigned through `this` right after construction, before the Dart
       ;; constructor body (eager instead of lazy; documented divergence).
-      (let [{:keys [params body async]} (core/emit-callable ctor' (assoc ctx :ctor-body? true))
+      (let [{:keys [params body async rebinds]} (core/emit-callable ctor' (assoc ctx :ctor-body? true))
             this (symbol "this")
             all-fields (concat field-names
                                (when shape (map super-field-name (:keys shape))))
@@ -591,19 +619,20 @@
             body (if (and (empty? (remove nil? body))
                           (= :empty-body (:ir (:body ctor))))
                    []
-                   body)]
+                   body)
+            make-body (list* 'let (into field-bindings [this ctor-call])
+                             (concat (map #(list 'assert
+                                                 (core/emit-expr (:cond %) ctx)
+                                                 (when (:message %)
+                                                   (core/emit-expr (:message %) ctx)))
+                                          assert-inits)
+                                     body
+                                     late-assigns
+                                     [this]))]
         [(with-annotations
-          (list 'defn (ctor-defn-name d cname async)
-                params
-                (list* 'let (into field-bindings [this ctor-call])
-                       (concat (map #(list 'assert
-                                           (core/emit-expr (:cond %) ctx)
-                                           (when (:message %)
-                                             (core/emit-expr (:message %) ctx)))
-                                    assert-inits)
-                               body
-                               late-assigns
-                               [this])))
+          (list* 'defn (ctor-defn-name d cname async)
+                 params
+                 (core/wrap-rebinds rebinds [make-body]))
           ctor)]))))
 
 ;; ---------------------------------------------------------------------------
@@ -640,11 +669,24 @@
      (when super [:extends super])
      (for [i (:implements d)] (core/type-ref i ctx))
      ;; Project mixins (declaration known to the converter): their members
-     ;; are inlined into the class, the type becomes an `implements` clause
-     ;; (keeps `is` checks and interface satisfaction). Type arguments are
-     ;; dropped because generated mixins are never generic (M8).
-     (for [m (:with d) :when (mixin-decl m ctx)]
-       (core/type-symbol m ctx))
+     ;; are inlined into the class. A mixin *without* an `on` clause also
+     ;; becomes an `implements` clause (keeps `is` checks and interface
+     ;; satisfaction, type arguments preserved). A mixin with `on Base<T>`
+     ;; cannot: Dart rejects a class implementing `M<X>` whose `on` clause
+     ;; brings in `Base<Y>` when the class's own supertype is `Base<X>`
+     ;; (`conflicting_generic_interfaces`, the `on` arguments differ), and
+     ;; ClojureDart cannot emit `on Base<T>` with the `T extends …` bound the
+     ;; declaration would need (M8.15). Such appliers inline the members
+     ;; without the interface; `is M` checks on them are not preserved.
+     (for [m (:with d)
+           :when (and (mixin-decl m ctx)
+                      ;; `on Object` (and no `on`) constrain nothing; a
+                      ;; non-trivial `on Base<…>` would conflict with the
+                      ;; class's own supertype under `implements`.
+                      (or (empty? (:on (mixin-decl m ctx)))
+                          (every? #(= "Object" (str (:name %)))
+                                  (:on (mixin-decl m ctx)))))]
+       (core/type-ref m ctx))
      (for [m (:with d) :when (not (mixin-decl m ctx))]
        (with-meta (core/type-ref m ctx) {:mixin true})))))
 
@@ -713,21 +755,25 @@
 (defn- emit-mixin [d ctx]
   (check-mixin-inlinable! d)
   (let [fields (instance-field-specs d)
+        ;; Type parameters are kept on the mixin declaration: members that use
+        ;; them are rejected by `check-mixin-inlinable!`, but the declaration
+        ;; must be generic so appliers can `implements M<Widget>` without a
+        ;; `State<Widget>` vs raw-`State` conflict (M8.15). The `on` clause
+        ;; drops its type arguments: Dart requires `on State<T>` to bound
+        ;; `T extends StatefulWidget`, which ClojureDart cannot express, and
+        ;; the applier already carries the concrete supertype.
         class-ctx (member-ctx ctx (:name d) (:members d) fields {}
-                              ;; type parameters are dropped: ClojureDart has no
-                              ;; bounds, and `check-mixin-inlinable!` rejects
-                              ;; members that reference them.
-                              [])
+                              (keep :name (:type-params d)))
         on (:on d)
         extends (when-let [b (first on)] (core/type-symbol b class-ctx))
         deftype-form (list* 'deftype
-                            (type-name-symbol (assoc d :mixin? true :type-params []))
+                            (type-name-symbol (assoc d :mixin? true))
                             (mapv #(field-symbol % class-ctx) fields)
                             (concat
                              [:type-only true]
                              (when extends [:extends extends])
                              (for [i (:implements d)]
-                               (core/type-symbol i class-ctx))
+                               (core/type-ref i class-ctx))
                              [(symbol (:name d))]
                              (emit-class-members d class-ctx {})))]
     [deftype-form]))
@@ -835,7 +881,11 @@
           (:vars vl))))
 
 (defn- emit-top-fn [d ctx]
-  (let [{:keys [params body async]} (core/emit-callable d (assoc ctx :params (:params d)))]
+  (let [{:keys [params body async rebinds]} (core/emit-callable
+                                             d (assoc ctx
+                                                      :params (:params d)
+                                                      :non-void-body? (not (void-return? d))))
+        body (core/wrap-rebinds rebinds body)]
     (case (:kind d)
       :fn
       [(with-annotations
@@ -936,6 +986,51 @@
             {}
             classes)))
 
+(defn- local-super-name [d]
+  (let [s (:extends d)]
+    (when (and s (= :named-type (:ir s)) (nil? (:prefix s)))
+      (str (:name s)))))
+
+(defn- hintable-override-methods
+  "`#{[class method] ...}` whose non-scalar parameter hints are safe.
+
+  A non-scalar hint becomes part of the emitted Dart method signature, so an
+  override may only carry one when every same-named method in its *local*
+  superclass chain is hinted too (Dart rejects an override whose parameter
+  type differs from the one it overrides — `dynamic` vs `Type`). An override
+  whose chain leaves the unit (external superclass, e.g. Flutter's
+  `State.didUpdateWidget(covariant T …)`) is hinted: the base declares the
+  narrowing, and the hint is what makes the parameter's members resolve
+  (RESEARCH M8.17/M8.18)."
+  [unit]
+  (let [classes (into {}
+                      (for [d (:decls unit)
+                            :when (contains? #{:class :enum} (:ir d))]
+                        [(:name d) d]))
+        method (fn [d n] (some #(when (and (= :method (:ir %)) (= n (:name %))) %)
+                               (:members d)))
+        hint? (fn hint? [d m]
+                (loop [d d seen #{}]
+                  (if-let [sn (local-super-name d)]
+                    (if (contains? seen sn)
+                      true
+                      (if-let [sd (get classes sn)]
+                        (if-let [sm (method sd (:name m))]
+                          (if (override-method? sm)
+                            (recur sd (conj seen sn))
+                            false)
+                          (recur sd (conj seen sn)))
+                        true))
+                    true)))]
+    (into #{}
+          (for [d (:decls unit)
+                :when (contains? #{:class :enum} (:ir d))
+                m (:members d)
+                :when (and (= :method (:ir m))
+                           (override-method? m)
+                           (hint? d m))]
+            [(:name d) (:name m)]))))
+
 (defn unit-info
   "Whole-unit resolution table (classes/statics/typedefs/top-level names).
   Public for batch mode, which builds the cross-file project index from it." [unit]
@@ -943,6 +1038,7 @@
                   (for [d (:decls unit)
                         :when (contains? #{:class :enum} (:ir d))]
                     [(:name d) (class-unit-info d)]))
+   :override-hints (hintable-override-methods unit)
    :operator-classes (operator-classes unit)
    :typedefs (into {}
                    (for [d (:decls unit)
@@ -964,13 +1060,97 @@
                      [(:name v) {:const (boolean (get-in d [:vars :const]))
                                  :final (boolean (get-in d [:vars :final]))}]))})
 
+;; ---------------------------------------------------------------------------
+;; private type names
+;; ---------------------------------------------------------------------------
+
+(def ^:private type-decl-irs
+  "Declaration kinds whose :name is a Dart type name."
+  #{:class :class-alias :mixin :enum :extension :extension-type :type-alias})
+
+(defn- private-type? [n]
+  (and (string? n) (str/starts-with? n "_")))
+
+(defn- private-type-renames
+  "`_Foo` -> `d2c_Foo` for every private type declared in `unit` (or {}).
+
+  ClojureDart declares a deftype under its cljd name but resolves references
+  through the generated library's self-alias, and Dart rejects private names
+  behind a prefix (`lco_account._Foo`). Making the type public on both sides
+  fixes the reference; Dart privacy is library-scoped, so a private type
+  cannot be referenced from another converted file and the rewrite is
+  unit-local. A rename target that collides with a declared type fails
+  loudly."
+  [unit]
+  (let [declared (into #{}
+                       (comp (filter #(contains? type-decl-irs (:ir %)))
+                             (map :name))
+                       (:decls unit))]
+    (reduce
+     (fn [m d]
+       (if (and (contains? type-decl-irs (:ir d))
+                (private-type? (:name d)))
+         (let [target (str "d2c" (:name d))]
+           (when (contains? declared target)
+             (core/fail! d (str "private type " (:name d) " would collide with "
+                                target " when made public for ClojureDart")))
+           (assoc m (:name d) target))
+         m))
+     {}
+     (:decls unit))))
+
+(defn- rename-private-type-node
+  "Rewrite private type names in `node`: named types, static-access prefixes
+  and parse-only constructor calls (`_Foo(...)` is a target-less call, and a
+  named constructor parses as a call on an identifier target)."
+  [node renames]
+  (cond
+    (map? node)
+    (let [node (cond-> node
+                 (and (= :named-type (:ir node))
+                      (contains? renames (:name node)))
+                 (assoc :name (get renames (:name node)))
+                 (and (= :prefixed-id (:ir node))
+                      (contains? renames (:prefix node)))
+                 (assoc :prefix (get renames (:prefix node)))
+                 (and (= :call (:ir node))
+                      (nil? (:target node))
+                      (contains? renames (:name node)))
+                 (assoc :name (get renames (:name node)))
+                 (and (= :call (:ir node))
+                      (= :id (:ir (:target node)))
+                      (contains? renames (:name (:target node))))
+                 (assoc-in [:target :name] (get renames (:name (:target node)))))]
+      (reduce-kv (fn [acc k v] (assoc acc k (rename-private-type-node v renames)))
+                 {} node))
+    (vector? node) (mapv #(rename-private-type-node % renames) node)
+    :else node))
+
+(defn rename-private-types
+  "Rewrite private Dart type names (`_Foo` -> `d2c_Foo`) in a normalized unit.
+
+  See `private-type-renames`; a no-op when the unit declares no private type."
+  [unit]
+  (let [renames (private-type-renames unit)]
+    (if (empty? renames)
+      unit
+      (update unit :decls
+              (fn [decls]
+                (mapv (fn [d]
+                        (cond-> (rename-private-type-node d renames)
+                          (and (contains? type-decl-irs (:ir d))
+                               (contains? renames (:name d)))
+                          (assoc :name (get renames (:name d)))))
+                      decls))))))
+
 (defn emit-unit
   "Normalized :unit IR -> vector of top-level forms, ns first.
 
   In :idiomatic mode, recognized Flutter widget classes are emitted as
   builder fns and `cljd.flutter` is added to the requires."
   [unit {:keys [ns path aliases mode] :as opts}]
-  (let [info (unit-info unit)
+  (let [unit (rename-private-types unit)
+        info (unit-info unit)
         idiomatic? (= :idiomatic mode)
         plan (if idiomatic?
                (idiomatic/plan unit)

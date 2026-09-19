@@ -81,7 +81,8 @@
 (deftest cross-file-project
   (is (= "Button[b]: widget (3.5)" (bp/describe (item/Item-new "widget" 3.5))))
   (is (= "item: box" (bp/describeKind)))
-  (is (= 5.0 (bp/hyp 3.0 4.0))))
+  (is (= 5.0 (bp/hyp 3.0 4.0)))
+  (is (= "a+b" (bp/mergeBoxes))))
 
 (deftest cross-file-values-and-statics
   (bp/resetCounts)
@@ -197,3 +198,54 @@
     (is (= 3 (.-start l)))
     (is (= 6 (.-doubled l)))
     (is (identical? l (.-self l)))))
+
+(deftest private-types-are-renamed
+  (is (= 14 (g/privateBoxSum 7))))
+
+(deftest non-const-defaults
+  (is (= 3 (g/defaultSum)))
+  (is (= 5 (g/defaultSum .xs [9 9] .add 3)))
+  (let [d (g/Defaults-new)]
+    (is (= 3 (.total d))))
+  (let [d (g/Defaults-new .values [7 7 7] .label "ab")]
+    (is (= 5 (.total d)))))
+
+(deftest void-callback-closures
+  (let [h (g/VoidCallbackHost-new)]
+    (.bump h)
+    (is (= 1 (.-value h)))))
+
+(deftest reserved-local-names
+  (let [h (g/ShadowHost-new)]
+    (is (= 8 (.run h 1 2)))))
+
+;; ---------------------------------------------------------------------------
+;; M8.18: parameter scoping, loop-var types, value tails, await locals
+;; ---------------------------------------------------------------------------
+
+(deftest field-shadowing-parameters
+  (let [s (g/ShadowField-new "boom")]
+    (is (= "boom!" (.describe s (fn [e] (str e "!")))))))
+
+(deftest generic-constructor-parameters
+  (is (= 3 (g/holderLength)))
+  (is (= 7 (.-value (g/Holder-named 7)))))
+
+(deftest local-base-override-parameters
+  (is (= "hi NarrowGreeter" (g/narrowGreet))))
+
+(deftest loop-var-types
+  (is (true? (g/loopVarEven 3)))
+  (is (= 3 (g/tripleDiv 12 2 2))))
+
+(deftest value-tail-discard
+  (let [seen (volatile! nil)]
+    (g/schedule 5 (fn [n] (vreset! seen n)))
+    (is (= 5 (deref seen)))))
+
+(deftest await-init-locals
+  (is (= 3 (await (g/awaitLocal 1)))))
+
+(deftest nested-closure-control-flow
+  (is (= 6 (g/guardedClosure 3)))
+  (is (= 0 (g/guardedClosure -1))))
