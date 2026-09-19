@@ -21,6 +21,8 @@ import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/dart/analysis/utilities.dart';
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/token.dart';
+import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/type.dart';
 import 'package:analyzer/diagnostic/diagnostic.dart';
 import 'package:analyzer/source/line_info.dart';
 
@@ -33,10 +35,14 @@ int _lineOffset = 0;
 
 Future<void> main(List<String> args) async {
   var resolved = false;
+  var fnTypedefs = false;
   String? file;
+  final positional = <String>[];
   for (final a in args) {
     if (a == '--resolved') {
       resolved = true;
+    } else if (a == '--fn-typedefs') {
+      fnTypedefs = true;
     } else if (a == '--version') {
       stdout.writeln(':ast-version $astVersion');
       return;
@@ -47,8 +53,13 @@ Future<void> main(List<String> args) async {
       stderr.writeln('astdump: unknown option: $a');
       exit(2);
     } else {
+      positional.add(a);
       file = a;
     }
+  }
+  if (fnTypedefs) {
+    await _fnTypedefs(positional);
+    return;
   }
   final bool snippet;
   final String content;
@@ -140,10 +151,61 @@ Future<String> _resolvedInfo(String path) async {
   }
 }
 
+/// List the names `uris` export as Dart *function* typedefs.
+///
+/// ClojureDart's analyzer helper throws `TypeAliasElement type not handled`
+/// when it resolves a function-typedef element, so the converter must know
+/// which imported names are function types (they map to `Function` instead of
+/// a hint). The reference file anchors the analysis context (its enclosing
+/// package must be `pub get`-ed); `uris` are `dart:`/`package:` library URIs.
+Future<void> _fnTypedefs(List<String> args) async {
+  if (args.isEmpty) {
+    stderr.writeln('astdump: --fn-typedefs needs a reference Dart file '
+        '(and optionally library URIs)');
+    exit(2);
+  }
+  final ref = File(args.first).absolute.path;
+  if (!File(ref).existsSync()) {
+    stderr.writeln('astdump: no such file: ${args.first}');
+    exit(2);
+  }
+  final uris = args.skip(1).toList()..sort();
+  final buf = StringBuffer('{:fn-typedefs {');
+  var message = '';
+  try {
+    final collection = AnalysisContextCollection(includedPaths: [ref]);
+    final session = collection.contextFor(ref).currentSession;
+    for (final uri in uris) {
+      final names = <String>[];
+      final res = await session.getLibraryByUri(uri);
+      if (res is LibraryElementResult) {
+        for (final e in res.element.exportNamespace.definedNames2.values) {
+          if (e is TypeAliasElement && e.aliasedType is! InterfaceType) {
+            final n = e.name;
+            if (n != null && n.isNotEmpty) names.add(n);
+          }
+        }
+      }
+      names.sort();
+      buf.write('"${_escape(uri)}" '
+          '#{"${names.map(_escape).join('" "')}"} ');
+    }
+  } catch (e) {
+    message = '$e';
+  }
+  buf.write('} :errors [');
+  if (message.isNotEmpty) {
+    buf.write('{:message "${_escape(message)}"}');
+  }
+  buf.write(']}');
+  stdout.writeln(buf.toString());
+}
+
 void _usage() {
   stderr.writeln(
       'usage: dart run bin/astdump.dart [--resolved] [<file.dart>|-]\n'
       '  no file or "-" reads a Dart snippet from stdin\n'
+      '  --fn-typedefs <ref.dart> <uri>...  function typedefs exported by libs\n'
       '  --version  print the EDN schema version');
 }
 

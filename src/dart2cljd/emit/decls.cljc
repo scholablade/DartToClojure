@@ -36,7 +36,8 @@
   "Build an emission context for a unit (options may carry :aliases)."
   [aliases {:keys [mode] :or {mode :faithful} :as opts}]
   (core/ctx aliases
-            (assoc (select-keys opts [:unit-info :class-name :type-vars])
+            (assoc (select-keys opts [:unit-info :class-name :type-vars :mixins
+                                      :fn-typedefs])
                    :mode mode
                    :flutter-alias (alias/flutter-alias aliases)
                    :emit-body st/emit-body
@@ -137,30 +138,71 @@
 (defn- field-decl-specs [m]
   (let [vl (:fields m)
         base {:type (:type vl)
-              :mutable (not (or (:final vl) (:const vl)))
+              :late (:late vl)
+              ;; `late final` fields are assigned after construction (ctor
+              ;; bodies, `initState`); ClojureDart has no late fields, so the
+              ;; generated make-fn passes a placeholder and the assignment
+              ;; needs `^:mutable` (Dart still enforces single assignment at
+              ;; the source level because the Dart input compiled).
+              :mutable (not (or (:const vl)
+                                (and (:final vl) (not (:late vl)))))
               :annotations (:annotations m)}]
     (for [v (:vars vl)]
       (merge base {:name (:name v) :init (:init v) :src (:src v)}))))
 
-(defn- instance-field-specs [d]
-  (let [declared (vec (mapcat field-decl-specs
-                              (filter #(and (= :field-decl (:ir %))
-                                            (not (:static %)))
-                                      (:members d))))
-        declared-names (set (map :name declared))
-        implicit (for [m (:members d)
-                       :when (= :ctor (:ir m))
-                       p (:params m)
-                       :when (and (:this p)
-                                  (not (contains? declared-names (:name p))))]
-                   {:name (:name p) :type (:type p) :mutable false
-                    :init nil :annotations [] :src (:src p)})]
-    (vec (concat declared implicit))))
+(defn- instance-field-specs
+  ([d] (instance-field-specs d []))
+  ([d extra-fields]
+   (let [declared (vec (mapcat field-decl-specs
+                               (filter #(and (= :field-decl (:ir %))
+                                             (not (:static %)))
+                                       (:members d))))
+         declared-names (set (map :name declared))
+         implicit (for [m (:members d)
+                        :when (= :ctor (:ir m))
+                        p (:params m)
+                        :when (and (:this p)
+                                   (not (contains? declared-names (:name p))))]
+                    {:name (:name p) :type (:type p) :mutable false
+                     :init nil :annotations [] :src (:src p)})]
+     (vec (concat declared implicit extra-fields)))))
+
+(def ^:private scalar-late-defaults
+  "Placeholder a make-fn passes for a `late` non-nullable scalar field (the
+  value is assigned after construction: a constructor body, or a late
+  initializer moved after it). Dart would throw LateInitializationError on a
+  read before assignment; the generated code returns the type's zero value
+  instead (documented divergence). Non-scalar late fields stay dynamic with a
+  nil placeholder."
+  {"int" 0 "num" 0 "double" 0.0 "bool" false "String" ""})
+
+(defn- late-placeholder
+  "Placeholder for a `late` field, or nil when the field must stay dynamic
+  (non-nullable reference types have no value to fabricate)."
+  [f]
+  (when (and (:late f) (not (:nullable (:type f))))
+    (get scalar-late-defaults (str (:name (:type f))))))
+
+(defn- field-type-hint
+  "cljd type hint for a field, or nil to emit it dynamic.
+
+  A `late` field is assigned after the make-fn receives the field values
+  (Dart assigns it later), so it gets a placeholder: non-nullable scalars keep
+  their declared type plus a zero-value placeholder; other non-nullables would
+  need nil, which a non-nullable hint rejects, so they stay dynamic; nullable
+  types keep the `?` hint and the nil placeholder."
+  [f ctx]
+  (when (:type f)
+    (if (and (:late f) (not (:nullable (:type f)))
+             (nil? (late-placeholder f)))
+      nil
+      (core/type-symbol (:type f) ctx))))
 
 (defn- field-symbol [f ctx]
-  (let [m (cond-> {}
+  (let [tag (field-type-hint f ctx)
+        m (cond-> {}
             (:mutable f) (assoc :mutable true)
-            (:type f) (assoc :tag (core/type-symbol (:type f) ctx)))]
+            tag (assoc :tag tag))]
     (with-meta (symbol (:name f)) m)))
 
 (defn- class-static-members
@@ -214,6 +256,112 @@
          (instance-member-sets {:members members})))
 
 ;; ---------------------------------------------------------------------------
+;; project mixins (M8): inline members into appliers
+;; ---------------------------------------------------------------------------
+
+(defn- mixin-decl
+  "IR declaration of an applied project mixin: declared in the current unit or
+  (batch mode) in another converted file. Nil for external mixins, which keep
+  the Dart `with` clause."
+  [m ctx]
+  (get (:mixins ctx) (str (:name m))))
+
+(defn- ir-mentions?
+  "True when an IR node contains a node satisfying `pred`. Walks maps and
+  vectors, skipping :src and :annotations (positions and annotation bodies
+  never affect the emitted member semantics)."
+  [pred node]
+  (cond
+    (map? node) (or (and (not (contains? #{:src :annotations} (:ir node)))
+                         (pred node))
+                    (some (fn [[k v]]
+                            (when-not (contains? #{:src :annotations} k)
+                              (ir-mentions? pred v)))
+                          node))
+    (vector? node) (boolean (some #(ir-mentions? pred %) node))
+    (seq? node) (boolean (some #(ir-mentions? pred (second %)) (partition 2 node)))
+    :else false))
+
+(defn- named-type? [name node]
+  (and (map? node)
+       (= :named-type (:ir node))
+       (= name (str (:name node)))))
+
+(defn- check-mixin-inlinable!
+  "Fail loudly when a mixin cannot be represented by inlining or by the
+  generated mixin declaration."
+  [m]
+  (let [tps (set (keep :name (:type-params m)))]
+    (doseq [member (:members m)]
+      (case (:ir member)
+        (:field-decl :method) nil
+        (core/fail! member (str "unsupported mixin member " (:ir member)))))
+    ;; Type parameters are dropped: ClojureDart has no bounds support, and
+    ;; `on Base<T>` / `implements I<T>` are emitted raw (type arguments are
+    ;; erased). Members that actually use a type parameter cannot be
+    ;; inlined, because the applier's context has no such binding.
+    (when (seq tps)
+      (doseq [member (:members m)
+              :when (some #(ir-mentions? (partial named-type? %) member) tps)]
+        (core/fail! member
+                    (str "generic mixin " (:name m) " uses type parameter "
+                         "in a member; ClojureDart cannot emit bounded type "
+                         "parameters, so it cannot be inlined"))))
+    (when (> (count (:on m)) 1)
+      (core/fail! m "mixins with multiple `on` types are not supported"))
+    (when (some :static (:members m))
+      (core/fail! m "mixins with static members are not supported"))
+    (doseq [member (:members m)
+            :when (and (= :method (:ir member))
+                       (ir-mentions? #(= :super (:ir %)) member))]
+      (core/fail! member
+                  (str "mixin " (:name m) " calls `super` in a method; "
+                       "inlining cannot preserve mixin linearization")))))
+
+(defn- mixin-field-specs
+  "Inlined field specs of `mixins`, in declaration order."
+  [mixins]
+  (vec (for [m mixins
+             member (:members m)
+             :when (and (= :field-decl (:ir member)) (not (:static member)))
+             f (field-decl-specs member)]
+         f)))
+
+(defn- mixin-methods
+  "Concrete (non-abstract, non-static) method IR nodes of `mixins`, in
+  declaration order. Abstract methods are handled by `implements`."
+  [mixins]
+  (vec (for [m mixins
+             member (:members m)
+             :when (and (= :method (:ir member))
+                        (not (:static member))
+                        (not (:abstract member)))]
+         member)))
+
+(defn- check-mixin-collisions!
+  "Dart rejects a class member that collides with an applied mixin's member;
+  inlining must too. Compare fields and methods by name (a Dart field also
+  declares a getter/setter), including collisions between two mixins."
+  [d own-fields mixins]
+  (let [seen (volatile! (into (set (map :name own-fields))
+                              (for [m (:members d)
+                                    :when (and (= :method (:ir m))
+                                               (not (:static m)))]
+                                (:name m))))]
+    (doseq [m mixins
+            member (:members m)
+            :when (not (:static member))
+            :let [names (case (:ir member)
+                          :field-decl (map :name (get-in member [:fields :vars]))
+                          :method [(:name member)]
+                          [])]
+            name names]
+      (when (contains? @seen name)
+        (core/fail! member (str "member " name " collides with a member of the "
+                                "applier or of another applied mixin")))
+      (vswap! seen conj name))))
+
+;; ---------------------------------------------------------------------------
 ;; method specs
 ;; ---------------------------------------------------------------------------
 
@@ -250,12 +398,20 @@
 (defn- abstract-stub []
   (list 'throw (list 'UnsupportedError. "abstract method")))
 
+(defn- void-return?
+  "True when a method's Dart return type is `void` (setters included)."
+  [m]
+  (= "void" (str (:name (:return-type m)))))
+
 (defn- emit-method [m ctx {:keys [concrete-stubs?]}]
   (let [{:keys [params body]} (core/emit-callable
                                m (assoc ctx :params (:params m)))
         body (cond
                (:abstract m) (if concrete-stubs? [(abstract-stub)] [])
                (= :setter (:kind m)) (conj (vec body) nil)
+               ;; ClojureDart writes the last body form as `return <form>;`;
+               ;; a Dart void method must not return a value (C4).
+               (void-return? m) (conj (vec body) nil)
                :else body)]
     (with-annotations
      (list* (method-symbol m ctx) (into ['this] params) body)
@@ -396,18 +552,42 @@
           ctor)])
 
       :else
-      (let [{:keys [params body async]} (core/emit-callable ctor' ctx)
+      ;; The make-fn binds field values as locals before calling the
+      ;; constructor; inside the Dart constructor body bare field names refer
+      ;; to the fields, so reads/writes go through `this` (M8).
+      ;;
+      ;; `late` field initializers are the exception: Dart evaluates them
+      ;; lazily and they may reference `this` (`vsync: this`), which does not
+      ;; exist while the make-fn's let bindings are computed. They are
+      ;; assigned through `this` right after construction, before the Dart
+      ;; constructor body (eager instead of lazy; documented divergence).
+      (let [{:keys [params body async]} (core/emit-callable ctor' (assoc ctx :ctor-body? true))
             this (symbol "this")
             all-fields (concat field-names
                                (when shape (map super-field-name (:keys shape))))
+            body-ctx (assoc ctx :ctor-body? true)
+            late-inits (for [f fields
+                             :when (and (:late f) (:init f))]
+                         {:name (:name f)
+                          :expr (core/emit-expr (:init f) body-ctx)})
+            late-init-names (set (map :name late-inits))
+            init-values (apply dissoc init-values late-init-names)
+            late-defaults (into {} (keep (fn [f]
+                                           (when-let [v (late-placeholder f)]
+                                             [(:name f) v])))
+                                fields)
             field-bindings (vec (mapcat (fn [f]
                                           (let [sym (if (string? f) (symbol f) f)
                                                 v (get super-values f
-                                                       (get init-values f))]
+                                                       (get init-values f
+                                                            (get late-defaults f)))]
                                             (if (= sym v) [] [sym v])))
                                         all-fields))
             ctor-call (list* (symbol class)
                              (map #(if (string? %) (symbol %) %) all-fields))
+            late-assigns (map (fn [{:keys [name expr]}]
+                                (list (symbol (str ".-" name "!")) this expr))
+                              late-inits)
             body (if (and (empty? (remove nil? body))
                           (= :empty-body (:ir (:body ctor))))
                    []
@@ -422,6 +602,7 @@
                                              (core/emit-expr (:message %) ctx)))
                                     assert-inits)
                                body
+                               late-assigns
                                [this])))
           ctor)]))))
 
@@ -458,7 +639,14 @@
     (concat
      (when super [:extends super])
      (for [i (:implements d)] (core/type-ref i ctx))
-     (for [m (:with d)] (with-meta (core/type-ref m ctx) {:mixin true})))))
+     ;; Project mixins (declaration known to the converter): their members
+     ;; are inlined into the class, the type becomes an `implements` clause
+     ;; (keeps `is` checks and interface satisfaction). Type arguments are
+     ;; dropped because generated mixins are never generic (M8).
+     (for [m (:with d) :when (mixin-decl m ctx)]
+       (core/type-symbol m ctx))
+     (for [m (:with d) :when (not (mixin-decl m ctx))]
+       (with-meta (core/type-ref m ctx) {:mixin true})))))
 
 (defn- emit-class-members [d ctx opts]
   (mapcat
@@ -483,7 +671,12 @@
 (defn- emit-class [d ctx]
   (when (:native d)
     (core/fail! d "native classes are not supported"))
-  (let [fields (instance-field-specs d)
+  (let [mixins (vec (keep #(mixin-decl % ctx) (:with d)))
+        _ (doseq [m mixins] (check-mixin-inlinable! m))
+        mfields (mixin-field-specs mixins)
+        mmethods (mixin-methods mixins)
+        fields (instance-field-specs d mfields)
+        _ (check-mixin-collisions! d (instance-field-specs d) mixins)
         ctors (filter #(= :ctor (:ir %)) (:members d))
         ctors (if (and (empty? ctors) (not (:abstract d)))
                 [{:ir :ctor :name nil :params [] :initializers []
@@ -498,7 +691,7 @@
                            (:keys shape))
         all-fields (into fields super-fields)
         concrete-stubs? (and (:abstract d) (seq fields))
-        class-ctx (member-ctx ctx (:name d) (:members d) all-fields
+        class-ctx (member-ctx ctx (:name d) (concat (:members d) mmethods) all-fields
                               (class-static-members d)
                               (keep :name (:type-params d)))
         type-sym (type-name-symbol d)
@@ -510,24 +703,34 @@
                                     (heritage-forms d' class-ctx)
                                     [(symbol (:name d))]
                                     (emit-class-members d class-ctx
-                                                        {:concrete-stubs? concrete-stubs?})))
+                                                        {:concrete-stubs? concrete-stubs?})
+                                    (map #(emit-method % class-ctx {:concrete-stubs? false})
+                                         mmethods)))
         make-fns (mapcat #(emit-ctor d' % fields class-ctx) ctors)
         static-forms (emit-static-members d class-ctx)]
     (into [deftype-form] (concat make-fns static-forms))))
 
 (defn- emit-mixin [d ctx]
-  (let [fields (instance-field-specs d)]
-    (when (seq fields)
-      (core/fail! d "mixins with fields are not supported by ClojureDart"))
-    (let [class-ctx (member-ctx ctx (:name d) (:members d) [] {}
-                                (keep :name (:type-params d)))
-          deftype-form (list* 'deftype (type-name-symbol (assoc d :mixin? true)) []
-                              (concat [:type-only true]
-                                      (for [i (:implements d)]
-                                        (core/type-ref i class-ctx))
-                                      [(symbol (:name d))]
-                                      (emit-class-members d class-ctx {})))]
-      [deftype-form])))
+  (check-mixin-inlinable! d)
+  (let [fields (instance-field-specs d)
+        class-ctx (member-ctx ctx (:name d) (:members d) fields {}
+                              ;; type parameters are dropped: ClojureDart has no
+                              ;; bounds, and `check-mixin-inlinable!` rejects
+                              ;; members that reference them.
+                              [])
+        on (:on d)
+        extends (when-let [b (first on)] (core/type-symbol b class-ctx))
+        deftype-form (list* 'deftype
+                            (type-name-symbol (assoc d :mixin? true :type-params []))
+                            (mapv #(field-symbol % class-ctx) fields)
+                            (concat
+                             [:type-only true]
+                             (when extends [:extends extends])
+                             (for [i (:implements d)]
+                               (core/type-symbol i class-ctx))
+                             [(symbol (:name d))]
+                             (emit-class-members d class-ctx {})))]
+    [deftype-form]))
 
 ;; ---------------------------------------------------------------------------
 ;; enums
@@ -540,7 +743,9 @@
   "Bind a constructor's parameters to the constant's arguments."
   [ctor args ctx]
   (let [pos-args (vec (remove :name args))
-        named (into {} (filter :name) args)
+        named (into {} (keep (fn [a]
+                               (when-let [n (:name a)] [n a]))
+                             args))
         param-value (fn [p i]
                       (if (= :named (:kind p))
                         (some-> (get named (:name p)) :expr (core/emit-expr ctx))
@@ -548,18 +753,24 @@
     (vec (mapcat (fn [[i p]] [(symbol (:name p)) (param-value p i)])
                  (map-indexed vector (:params ctor))))))
 
-(defn- emit-enum-constant [d c i class-ctx fields ctor]
+(defn- emit-enum-constant [d c i class-ctx fields ctor implicit]
   (let [init-values (if ctor (field-init-values ctor fields class-ctx) {})
         bindings (if ctor (ctor-arg-values ctor (:args c) class-ctx) [])
-        values (into [(:name c) i]
-                     (mapcat (fn [f]
+        field-values (mapcat (fn [f]
                                [(or (get init-values (:name f))
                                     (when (and ctor (:this (some #(when (= (:name %)
                                                                             (:name f)) %)
                                                                 (:params ctor))))
                                       (symbol (:name f)))
                                     nil)])
-                             fields))]
+                             fields)
+        implicit-values (mapcat (fn [f]
+                                  (case (:name f)
+                                    "name" [(:name c)]
+                                    "index" [i]
+                                    []))
+                                implicit)
+        values (into (vec implicit-values) field-values)]
     (with-annotations
      (list 'def (core/member-symbol (:name d) (:name c))
            (if (seq bindings)
@@ -570,11 +781,18 @@
 (defn- emit-enum [d ctx]
   (let [class (:name d)
         fields (instance-field-specs d)
-        name-field {:name "name" :type (named-type "String" (:src d))
-                    :mutable false :init nil :annotations []}
-        index-field {:name "index" :type (named-type "int" (:src d))
-                     :mutable false :init nil :annotations []}
-        all-fields (into [name-field index-field] fields)
+        declared (set (map :name fields))
+        ;; Dart enums have implicit `name`/`index`; a declared field with the
+        ;; same name overrides it (a user-declared field), so the
+        ;; synthesized field is only added when not shadowed.
+        implicit (cond-> []
+                   (not (contains? declared "name"))
+                   (conj {:name "name" :type (named-type "String" (:src d))
+                          :mutable false :init nil :annotations []})
+                   (not (contains? declared "index"))
+                   (conj {:name "index" :type (named-type "int" (:src d))
+                          :mutable false :init nil :annotations []}))
+        all-fields (into implicit fields)
         class-ctx (member-ctx ctx class (:members d) fields {}
                               (keep :name (:type-params d)))
         ctor (some #(when (and (= :ctor (:ir %)) (nil? (:name %))) %) (:members d))
@@ -585,7 +803,7 @@
                                       (core/type-ref i class-ctx))
                                     [(symbol class)]
                                     (emit-class-members d class-ctx {})))
-        constants (map-indexed #(emit-enum-constant d %2 %1 class-ctx fields ctor)
+        constants (map-indexed #(emit-enum-constant d %2 %1 class-ctx fields ctor implicit)
                                (:constants d))]
     (into [deftype-form]
           (concat constants
@@ -758,9 +976,15 @@
                (idiomatic/plan unit)
                {:widgets {} :consumed #{}})
         info (assoc info :widget-fns (:widgets plan))
-        local-names (set (keys (:classes info)))
+        local-mixins (into {}
+                           (for [d (:decls unit) :when (= :mixin (:ir d))]
+                             [(:name d) d]))
+        local-names (into (set (keys (:classes info))) (keys local-mixins))
+        ;; project mixins (batch mode) come from the index; same-unit
+        ;; declarations win (identical content).
+        mixins (merge (:project-mixins opts) local-mixins)
         aliases (or aliases (unit-aliases unit (assoc opts :local-names local-names)))
-        base-ctx (ctx-for aliases (assoc opts :unit-info info))
+        base-ctx (ctx-for aliases (assoc opts :unit-info info :mixins mixins))
         ns-name (or ns (some-> (library-name unit) symbol) (path->ns path) 'main)
         requires (alias/require-clauses
                   (filter #(= :import (:ir %)) (:directives unit))
@@ -774,6 +998,17 @@
                    (conj requires
                          [(symbol "cljd.flutter")
                           :as (symbol (alias/flutter-alias aliases))])
+                   requires)
+        ;; A barrel file (external `export`s) needs the exports shim itself;
+        ;; for importers the shim is added by `require-clauses` through the
+        ;; re-exporting import.
+        requires (if (and (:wildcard-alias opts)
+                          (:exports-uri opts)
+                          (not-any? #(= (:exports-uri opts) (str (first %)))
+                                    requires))
+                   (conj requires
+                         [(:exports-uri opts)
+                          :as (symbol (:wildcard-alias opts))])
                    requires)
         ns-form (list* 'ns ns-name
                        (when (seq requires)

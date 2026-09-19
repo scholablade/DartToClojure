@@ -118,3 +118,23 @@
         cmd (dart-bin opts)
         path (str (.getAbsoluteFile (io/file path)))]
     (run-astdump root cmd [path] nil)))
+
+(defn fn-typedefs
+  "Set of names `uris` export as Dart *function* typedefs.
+
+  ClojureDart's analyzer helper throws `TypeAliasElement type not handled`
+  when it resolves a function-typedef element, so the emitter maps these names
+  to `Function` instead of emitting a hint (RESEARCH M8.10). `:ref` is a Dart
+  file inside the source project (its `package_config.json` resolves `uris`).
+
+  Returns #{} when there is nothing to resolve or the project cannot be
+  resolved; conversion then keeps its ordinary hints, exactly as before."
+  [uris {:keys [ref] :as opts}]
+  (if (or (empty? uris) (nil? ref))
+    #{}
+    (let [root (root opts)
+          cmd (dart-bin opts)
+          ref (str (.getAbsoluteFile (io/file ref)))
+          doc (run-astdump root cmd (into ["--fn-typedefs" ref] (sort uris)) nil)]
+      (into #{} (comp (mapcat val) (remove str/blank?))
+            (:fn-typedefs doc)))))

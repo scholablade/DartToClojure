@@ -385,18 +385,39 @@
                                   ui (decls/unit-info unit)]
                             [name info] (values-map ns ui)]
                         {:file file :name name :info info})
-        base (-> {:project-types {} :project-values {} :warnings []}
+        mixin-entries (for [{:keys [file unit]} parsed
+                            d (:decls unit)
+                            :when (= :mixin (:ir d))]
+                        {:file file :name (:name d)
+                         :info {:decl d :kind :mixin
+                                :ns (get file->ns file)}})
+        base (-> {:project-types {} :project-values {} :project-mixins {}
+                  :warnings []}
                  (add-index-entries :project-types "type" entries)
-                 (add-index-entries :project-values "value" value-entries))
+                 (add-index-entries :project-values "value" value-entries)
+                 (add-index-entries :project-mixins "mixin" mixin-entries))
         base (update base :project-types #(resolve-typedefs % parsed))
+        project-index (assoc base :file->ns file->ns :package (:package opts))
         direct (into {} (for [{:keys [file unit]} parsed]
-                          [file (direct-exports (assoc base
-                                                       :file->ns file->ns
-                                                       :package (:package opts))
-                                                file unit)]))]
+                          [file (direct-exports project-index file unit)]))
+        ;; Every external URI imported anywhere: parse-only mode cannot say
+        ;; which library an otherwise-unresolved name comes from, so the
+        ;; generated shim re-exports these too and unresolved names are
+        ;; routed through it (M8).
+        external-imports (into #{}
+                                (for [{:keys [file unit]} parsed
+                                      d (:directives unit)
+                                      :when (= :import (:ir d))
+                                      :let [uri (get-in d [:uri :value])]
+                                      :when (and uri
+                                                 (not (contains? alias/implicit-uris uri))
+                                                 (nil? (project-target project-index
+                                                                       file uri)))]
+                                  uri))]
     (-> base
         (assoc :file->ns file->ns
                :package (:package opts)
+               :external-imports external-imports
                :exports (export-closures direct file->ns)))))
 
 ;; ---------------------------------------------------------------------------
@@ -492,11 +513,22 @@
                  {}
                  classified)
         external-uris (into #{} (mapcat #(get-in % [:exports :external]))
-                            classified)]
+                            classified)
+        ;; A barrel file re-exports external packages itself: its own
+        ;; otherwise-unresolved names (and those of its importers) can only be
+        ;; resolved through the generated exports shim.
+        own-external (get-in index [:exports file :external])
+        ;; Direct external imports of this file: parse-only mode cannot tell
+        ;; which library an unresolved name comes from, so with the shim
+        ;; enabled they are routed through it as well (M8).
+        external-imports (into #{} (keep (fn [{:keys [uri target]}]
+                                           (when (nil? target) uri)))
+                               classified)]
     {:resolver (fn [uri] (get entries uri))
-     :wildcard? (boolean (seq external-uris))
+     :wildcard? (boolean (or (seq external-uris) (seq own-external)))
      :aliases (into #{} (map :alias (vals entries)))
-     :external-uris external-uris}))
+     :external-uris (into external-uris own-external)
+     :external-imports external-imports}))
 
 ;; ---------------------------------------------------------------------------
 ;; per-file conversion
@@ -512,15 +544,17 @@
   "Emit one unit for batch output (ns from the path, project index attached,
   mode and exports shim honored)."
   [unit rel ns {:keys [mode resolver project-types project-values
-                       exports-uri wildcard-alias]}]
+                       project-mixins exports-uri wildcard-alias fn-typedefs]}]
   (printer/print-forms
    (decls/emit-unit unit
                     (cond-> {:ns ns :path rel
                              :resolver resolver
                              :project-types project-types
                              :project-values project-values
+                             :project-mixins project-mixins
                              :exports-uri exports-uri
-                             :wildcard-alias wildcard-alias}
+                             :wildcard-alias wildcard-alias
+                             :fn-typedefs fn-typedefs}
                       (= :idiomatic mode) (assoc :mode :idiomatic)))))
 
 (defn- file-project-values
@@ -530,6 +564,16 @@
   (let [ns (get (:file->ns index) rel)]
     (into {} (remove (fn [[_ info]] (= ns (:ns info))))
           (:project-values index))))
+
+(defn- file-project-mixins
+  "Mixin declarations of *other* files, for member inlining into appliers
+  (same-file declarations are resolved from the unit itself)."
+  [index rel]
+  (let [ns (get (:file->ns index) rel)]
+    (into {}
+          (comp (remove (fn [[_ info]] (= ns (:ns info))))
+                (map (fn [[name info]] [name (:decl info)])))
+          (:project-mixins index))))
 
 (def ^:private wildcard-aliases
   "Deterministic candidates for the exports-shim require alias."
@@ -547,13 +591,19 @@
         (throw (ex-info (str "dart2cljd: cannot resolve export " (pr-str uri)
                              ": no converted file matches it")
                         {:dart2cljd/kind :batch :file rel :uri uri})))))
-  (let [{:keys [resolver wildcard? aliases]} (file-resolver index rel unit)
+  (let [{:keys [resolver wildcard? aliases external-imports]}
+        (file-resolver index rel unit)
         _ (when (and wildcard? (nil? exports-uri))
             (throw (ex-info (str "dart2cljd: " rel " imports a file that re-exports "
                                  "external packages; pass --exports-file and "
                                  "--exports-uri to generate the exports shim")
                             {:dart2cljd/kind :batch :file rel})))
-        wildcard-alias (when (and wildcard? exports-uri)
+        ;; With the shim enabled, unresolved names from any external import
+        ;; are routed through it (the shim re-exports every external URI the
+        ;; tree imports). Without the flags the M6 default-alias fallback is
+        ;; kept.
+        shim? (or wildcard? (and exports-uri (seq external-imports)))
+        wildcard-alias (when (and shim? exports-uri)
                          (or (first (remove aliases wildcard-aliases))
                              (fresh-alias (first wildcard-aliases) aliases)))
         ns (path->ns rel opts)
@@ -562,6 +612,8 @@
                                         :resolver resolver
                                         :project-types (:project-types index)
                                         :project-values (file-project-values index rel)
+                                        :project-mixins (file-project-mixins index rel)
+                                        :fn-typedefs (:fn-typedefs index)
                                         :wildcard-alias wildcard-alias))
                     "\n")
         out-file (java.io.File. (str out) (str/replace rel #"\.dart$" ".cljd"))]
@@ -570,20 +622,19 @@
     {:file rel :out (.getPath out-file) :ns ns}))
 
 (defn- write-exports-shim!
-  "Write the generated Dart shim re-exporting every external URI exported by
-  the converted tree. Returns the written path, or nil when there is nothing
-  to write (or no `:exports-file`)."
+  "Write the generated Dart shim re-exporting every external URI the
+  converted tree imports or re-exports. Returns the written path, or nil when
+  there is nothing to write (or no `:exports-file`)."
   [{:keys [exports-file] :as _opts} index]
-  (let [uris (->> (:exports index)
-                  vals
-                  (mapcat :external)
+  (let [uris (->> (concat (mapcat :external (vals (:exports index)))
+                          (:external-imports index))
                   set
                   sort)]
     (when (and (seq uris) exports-file)
       (let [file (java.io.File. (str exports-file))]
         (io/make-parents file)
         (spit file (str "// Generated by dart2cljd: re-exports for Dart `export`"
-                        " directives.\n"
+                        " directives and imports.\n"
                         "// Do not edit; regenerate with the converter.\n"
                         (str/join "\n" (map #(str "export '" % "';") uris))
                         "\n"))
@@ -636,6 +687,34 @@
        ", skipped " (count skipped)
        ", failed " (count failed)))
 
+(defn- resolve-fn-typedefs
+  "Union of the names the tree's external libraries export as Dart *function*
+  typedefs, resolved through the analyzer (`frontend/fn-typedefs`).
+
+  Parse-only mode cannot tell a function typedef from a class, and
+  ClojureDart's analyzer helper crashes when it resolves a function-typedef
+  element, so the emitter maps these names to `Function` (RESEARCH M8.10).
+  Returns #{} when nothing external is imported or the source project cannot
+  be resolved (e.g. no `pub get`): conversion then behaves exactly as before,
+  and any such hint fails loudly at compile time."
+  [index parsed {:keys [dir] :as opts}]
+  (let [uris (:external-imports index)]
+    (if (empty? uris)
+      #{}
+      (let [ref (some->> parsed
+                         (map :file)
+                         sort
+                         first
+                         (io/file dir))]
+        (try
+          (frontend/fn-typedefs uris (assoc opts :ref (str ref)))
+          (catch Exception e
+            (println (str "dart2cljd: warning: could not resolve external "
+                          "function typedefs (" (ex-message e)
+                          "); hints naming Dart function typedefs will fail in "
+                          "ClojureDart's analyzer helper"))
+            #{}))))))
+
 (defn convert-dir
   "Translate every Dart file under `:dir` into `:out`.
 
@@ -682,6 +761,7 @@
         ok (into [] (filter :unit) parsed)
         parse-failed (into [] (remove :unit) parsed)
         index (build-index ok opts)
+        index (assoc index :fn-typedefs (resolve-fn-typedefs index ok opts))
         shim (write-exports-shim! opts index)
         warnings (cond-> (:warnings index)
                    (and (seq (mapcat :external (vals (:exports index))))

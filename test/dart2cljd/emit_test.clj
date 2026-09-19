@@ -71,6 +71,17 @@
       (testing "guarded returns guard every following statement"
         (is (re-find #"(?s)\(defn fib.*\(when \(not \(deref d2c\$done\)\)\s*\(do \(vreset! d2c\$result \(\+ \(fib" out))))))
 
+(deftest fn-typedef-type-symbol
+  (testing "external function typedefs map to Function (ClojureDart's analyzer
+            helper crashes on function-typedef elements; RESEARCH M8.10)"
+    (let [ctx (assoc (core/ctx {} {}) :fn-typedefs #{"VoidCallback"})
+          named (fn [n nullable]
+                  {:ir :named-type :prefix nil :name n :nullable nullable})]
+      (is (= 'Function (core/type-symbol (named "VoidCallback" false) ctx)))
+      (is (= 'Function? (core/type-symbol (named "VoidCallback" true) ctx)))
+      (testing "names the pass did not resolve keep their ordinary hint"
+        (is (= 'Widget (core/type-symbol (named "Widget" false) ctx)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; expression parity (seeded from DartClojure's corpus, corrected to
 ;; canonical cljd syntax: nil instead of null, dot-symbols for named args,
@@ -100,8 +111,12 @@
            "p19_list" "[1 2 3]"
            "p20_list_typed" "[1 2]"
            "p21_list_if" "[(if true 1 2)]"
-           "p22_list_for" "[(for [i [1 2]] i)]"
-           "p23_list_spread" "(into [1] (concat xs))"
+           "p22_list_for" "(vec (concat (for [i [1 2]] i)))"
+           "p23_list_spread" "(vec (concat [1] xs))"
+           "p23b_list_spread_if" "(vec (concat [1] (if c [2 3] nil) [4]))"
+           "p23c_list_spread_if_else" "(vec (concat (if c [1] [2 3])))"
+           "p23d_list_for_spread" "(vec (concat (loop [i 0 d2c$acc []] (if (< i n) (let [d2c$seg [i i]] (recur (inc i) (into d2c$acc d2c$seg))) d2c$acc))))"
+           "p23e_list_null_aware" "(vec (concat (if (nil? maybe) [] [maybe])))"
            "p24_set" "#{1 2 3}"
            "p25_map" "{\"a\" 1 \"b\" 2}"
            "p26_map_spread" "(merge {\"a\" 1} other)"

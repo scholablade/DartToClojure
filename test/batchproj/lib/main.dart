@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:batchproj/barrel.dart';
 import 'package:batchproj/models/item.dart';
 import 'package:batchproj/widgets/button.dart';
 
@@ -24,3 +25,26 @@ String touch() {
 }
 
 double hyp(double a, double b) => math.sqrt(a * a + b * b);
+
+// M8: `Badge` (declared in the barrel) applies a mixin from another file;
+// `Widget`/`Text` arrive through the barrel's external `export`, so the
+// generated file must require the exports shim.
+String badgeText(String text) {
+  final badge = Badge(text);
+  badge.mark();
+  return badge.render();
+}
+
+Widget makeLabel(String text) => Text(text);
+
+class Holder {
+  final Widget child;
+
+  Holder(this.child);
+}
+
+// A same-file top-level value: with the exports shim in scope it must stay
+// bare (`_motto`), not be routed through the shim.
+final String _motto = 'motto';
+
+String motto() => _motto;

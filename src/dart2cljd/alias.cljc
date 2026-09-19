@@ -44,7 +44,14 @@
     "Error" "StateError" "ArgumentError" "UnsupportedError"
     "UnimplementedError" "RangeError" "FormatException" "NoSuchMethodError"
     "StackTrace" "StringBuffer" "Stopwatch" "Runes" "Null" "Never"
-    "dynamic" "void" "print" "identical" "identity" "assert"})
+    "dynamic" "void" "print" "identical" "identity" "assert"
+    ;; further dart:core declarations (audited against
+    ;; sky_engine/lib/core): without these, `MapEntry`, `Pattern`, ... are
+    ;; routed through an import alias / the exports shim and fail to resolve
+    "AssertionError" "Comparator" "ConcurrentModificationError" "Deprecated"
+    "Expando" "Finalizer" "IndexError" "IntegerDivisionByZeroException"
+    "Invocation" "MapEntry" "Match" "OutOfMemoryError" "Pattern" "RegExpMatch"
+    "RuneIterator" "Sink" "StringSink" "TypeError" "UriData" "WeakReference"})
 
 (defn class-name?
   "Dart type-name convention: starts with an upper-case letter."
@@ -115,12 +122,6 @@
       :wildcard-alias (some-> wildcard-alias str)
       :default-alias (some-> default-alias str)})))
 
-(defn- registered-alias?
-  "True when `a` is the alias of an actual import of the current file (the
-  default alias of an unsed import must not shadow the exports shim)."
-  [a ctx]
-  (boolean (some #(= (str a) (str (:alias %))) (:entries ctx))))
-
 (def snippet-context
   "Default context for bare snippets: Flutter material is assumed to be
   imported as `m` and cljd.flutter as `f` (matching DartClojure's CLI
@@ -157,10 +158,10 @@
   Referred names and local declarations stay bare; names of types declared in
   other files of the same batch conversion get their generated namespace
   (`project-types`); known import prefixes are kept as `prefix/name`;
-  dart:core names stay bare; type-like names (UpperCamelCase) get the default
-  alias, or the exports shim alias when the file imports a library that
-  re-exports external packages and the default alias is not an actual import;
-  everything else stays bare (or goes through the shim)."
+  dart:core names stay bare; type-like names (UpperCamelCase) go through the
+  exports shim alias when one is in scope (the shim re-exports every external
+  library the file or its barrel re-exports), otherwise get the default
+  alias; everything else stays bare."
   [id ctx]
   (let [id (str id)]
     (cond
@@ -174,8 +175,10 @@
       (let [a (:default-alias ctx)
             wildcard (:wildcard-alias ctx)]
         (cond
-          (and (some? a) (or (nil? wildcard) (registered-alias? a ctx)))
-          (symbol (str a "/" id))
+          ;; The exports shim re-exports every external URI the file (or the
+          ;; barrel it imports) re-exports, so it resolves names the default
+          ;; alias cannot (`AudioPlayer` from an unaliased audioplayers
+          ;; import, while `m` is only flutter/material).
           wildcard (wildcard-qualify id ctx)
           (some? a) (symbol (str a "/" id))
           :else (symbol id)))

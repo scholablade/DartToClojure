@@ -22,6 +22,9 @@
     :local-types {:classes map of local name -> unit class name,
                   :scalars set of names known to be Dart scalars}, from
                  dart2cljd.typeinfo (unit-info :classes feeds it)
+    :mixins      project mixin declarations by name (same unit and, in batch
+                 mode, cross-file). Appliers inline their members and use
+                 `implements` instead of Dart `with` (M8)
 
   Anything not representable fails loudly via `fail!` with the source
   position; no placeholder markers are emitted."
@@ -58,7 +61,8 @@
                             :class-name :unit-info :type-vars :this-sym
                             :local-types :instance-methods :instance-getters
                             :instance-setters :atom-fields :state-ctx
-                            :flutter-alias :thread-props])))
+                            :flutter-alias :thread-props :mixins
+                            :fn-typedefs])))
 
 ;; ---------------------------------------------------------------------------
 ;; unit info helpers (local classes, statics, typedefs)
@@ -172,33 +176,50 @@
       (with-meta sym {:type-params (mapv #(type-symbol % ctx) args)})
       sym)))
 
+(def ^:private never-nullable-types
+  "Dart types that must not carry the `?` nullability suffix."
+  #{"dynamic" "void" "Never" "Null"})
+
 (defn type-symbol
   "IR type annotation -> cljd type symbol.
 
   Typedefs declared in the current unit are expanded at use sites; type
   parameters in scope stay bare; type arguments are dropped (ClojureDart
-  resolves Dart generics from the declaration site)."
+  resolves Dart generics from the declaration site). Nullable Dart types get
+  the ClojureDart `?` suffix (`^String?`), so nil defaults and nulls keep
+  type-checking like the Dart original.
+
+  External *function* typedefs (`VoidCallback`, `ValueChanged<T>`, ...) map to
+  `Function`: ClojureDart's analyzer helper crashes on function-typedef
+  elements, and parse-only mode cannot tell them from classes, so batch mode
+  resolves the names first (`:fn-typedefs`, RESEARCH M8.10)."
   [node ctx]
   (when node
-    (case (:ir node)
-      :named-type
-      (let [{:keys [prefix name]} node
-            name (str name)
-            ptype (project-type-info name ctx)]
-        (cond
-          prefix (symbol (str prefix "/" name))
-          (contains? (:type-vars ctx) name) (symbol name)
-          (typedef-type name ctx) (type-symbol (typedef-type name ctx) ctx)
-          (:typedef-target ptype) (:typedef-target ptype)
-          (= :typedef (:kind ptype))
-          (fail! node (str "cannot expand typedef " name " (defined in "
-                           (:file ptype) "); use a concrete type instead"))
-          (contains? bare-types name) (symbol name)
-          :else (alias/qualify name (:aliases ctx))))
+    (let [sym (case (:ir node)
+                :named-type
+                (let [{:keys [prefix name]} node
+                      name (str name)
+                      ptype (project-type-info name ctx)
+                      fn-typedef? (contains? (:fn-typedefs ctx) name)]
+                  (cond
+                    prefix (if fn-typedef? 'Function
+                               (symbol (str prefix "/" name)))
+                    (contains? (:type-vars ctx) name) (symbol name)
+                    (typedef-type name ctx) (type-symbol (typedef-type name ctx) ctx)
+                    (:typedef-target ptype) (:typedef-target ptype)
+                    (= :typedef (:kind ptype))
+                    (fail! node (str "cannot expand typedef " name " (defined in "
+                                     (:file ptype) "); use a concrete type instead"))
+                    (contains? bare-types name) (symbol name)
+                    fn-typedef? 'Function
+                    :else (alias/qualify name (:aliases ctx))))
 
-      :fn-type 'Function
-      :record-type 'Record
-      (fail! node (str "unsupported type annotation " (:ir node))))))
+                :fn-type 'Function
+                :record-type 'Record
+                (fail! node (str "unsupported type annotation " (:ir node))))]
+      (if (and (:nullable node) (not (contains? never-nullable-types (str sym))))
+        (symbol (str sym "?"))
+        sym))))
 
 (defn- ctor-symbol [ctor ctx]
   (let [t (:type ctor)
@@ -531,30 +552,38 @@
       (if (and (static-base? base ctx) (project-type-info (:name base) ctx))
         (emit-project-static base links ctx node)
         (if (static-base? base ctx)
-          (if (every? #(= :get (:kind %)) links)
-            ;; static field/property path -> dotted symbol (m/Colors.grey.shade300)
-            (symbol (str (alias/qualify (:name base) (:aliases ctx))
-                         (apply str (map #(str "." (:name %)) links))))
-            ;; static method call, then optional further steps
-            (let [[f & more] links]
-              (when-not (= :call (:kind f))
-                (fail! node "unsupported static member chain"))
+          (let [[f & more] links]
+            (if (= :call (:kind f))
+              ;; static method call, then optional further steps
               (thread (list* (alias/qualify-member (:name base) (:name f) (:aliases ctx))
                              (emit-args (:args f) ctx))
                       (map #(link-step % ctx) more)
-                      (boolean (some :null-aware links)))))
+                      (boolean (some :null-aware links)))
+              ;; static field/getter path -> dotted symbol, then optional
+              ;; further steps (`WidgetsBinding.instance.addObserver(this)`,
+              ;; `Colors.black.withAlpha(12)`).
+              (let [getters (vec (take-while #(= :get (:kind %)) links))
+                    more (drop (count getters) links)]
+                (when (empty? getters)
+                  (fail! node "unsupported static member chain"))
+                (thread (symbol (str (alias/qualify (:name base) (:aliases ctx))
+                                     (apply str (map #(str "." (:name %)) getters))))
+                        (map #(link-step % ctx) more)
+                        (boolean (some :null-aware links))))))
           (thread (emit-base base ctx)
                   (map #(link-step % ctx) links)
                   null-aware?))))))
 
 (defn- known-bare?
   "True when a bare name is definitely not an implicit-this member access:
-  a local, parameter, top-level function, dart:core name, or referred name."
+  a local, parameter, top-level function/variable, dart:core name, or
+  referred name."
   [n ctx]
   (or (contains? (:locals ctx) n)
       (contains? (get-in ctx [:unit-info :top-fns]) n)
       (contains? (get-in ctx [:unit-info :top-getters]) n)
       (contains? (get-in ctx [:unit-info :top-setters]) n)
+      (contains? (get-in ctx [:unit-info :top-vars]) n)
       (contains? (get-in ctx [:unit-info :widget-fns]) n)
       (contains? alias/core-symbols n)
       (contains? (:referred (:aliases ctx)) n)
@@ -963,6 +992,13 @@
               (list 'let [(symbol "d2c$old") (list 'deref (symbol n))]
                     write (symbol "d2c$old"))))
 
+          (and (or (:ctor-body? ctx) (:in-fn ctx))
+               (:this-sym ctx)
+               (contains? (:fields ctx) n))
+          (increment-form (list (symbol (str ".-" n)) (:this-sym ctx))
+                          (fn [v] (list (symbol (str ".-" n "!")) (:this-sym ctx) v))
+                          op prefix?)
+
           (contains? (:atom-fields ctx) n)
           (let [a (get (:atom-fields ctx) n)
                 write (list 'swap! a op)]
@@ -1047,6 +1083,14 @@
           "&&" (list 'if d (list 'reset! a rhs) d)
           "||" (list 'if d d (list 'reset! a rhs))
           (list 'swap! a (compound-fn op) rhs)))
+
+      (and (or (:ctor-body? ctx) (:in-fn ctx))
+           (:this-sym ctx)
+           (contains? (:fields ctx) n))
+      (assign-slot (list (symbol (str ".-" n)) (:this-sym ctx))
+                   (fn [v] (list (symbol (str ".-" n "!")) (:this-sym ctx) v))
+                   (if (nil? op) "=" op)
+                   rhs)
 
       (and (contains? (get-in (:local-types ctx) [:classes]) n)
            (contains? operator-call-names (bare-operator op)))
@@ -1176,34 +1220,78 @@
 ;; collections
 ;; ---------------------------------------------------------------------------
 
-(declare emit-elem)
+(declare emit-elem emit-elem-seg elem-segments emit-for-parts-element
+         emit-list)
 
 (defn- spread? [x] (= :spread (:ir x)))
 
+(defn- simple-elem?
+  "An element that yields exactly one collection element. Collection-for
+  elements and spreads splice; an `if` element splices only when one of its
+  branches does."
+  [e]
+  (case (:ir e)
+    :for-element false
+    :spread false
+    :null-aware-elem false
+    :if-element (and (simple-elem? (:then e))
+                     (or (nil? (:else e)) (simple-elem? (:else e))))
+    true))
+
+(defn- emit-elem-seg
+  "Emit a collection element as a form evaluating to a *sequence* of elements
+  (a segment). Dart splices collection-for results and spreads into the
+  literal; segments let `concat` reproduce that (M8)."
+  [node ctx]
+  (case (:ir node)
+    :if-element
+    (list 'if (emit-expr (:cond node) ctx)
+          (emit-elem-seg (:then node) ctx)
+          (when (:else node) (emit-elem-seg (:else node) ctx)))
+
+    :for-element
+    (let [loop (:loop node)]
+      (case (:ir loop)
+        :for-in (let [v (symbol (:name (:var loop)))
+                      coll (emit-expr (:iterable loop) ctx)
+                      body (:body node)]
+                  (if (simple-elem? body)
+                    (list 'for [v coll] (emit-elem body ctx))
+                    (list 'mapcat (list 'fn [v] (emit-elem-seg body ctx)) coll)))
+        :for-parts (emit-for-parts-element node ctx)
+        (fail! node (str "unsupported collection-for " (:ir loop)))))
+
+    :spread (if (= :list-lit (:ir (:expr node)))
+              (emit-list (:expr node) ctx)
+              (emit-expr (:expr node) ctx))
+
+    :null-aware-elem (let [v (emit-expr (:expr node) ctx)]
+                       (list 'if (list 'nil? v) [] (vector v)))
+
+    (vector (emit-expr node ctx))))
+
+(defn- elem-segments
+  "Segments of an element list: consecutive single elements are coalesced
+  into a vector literal, splicing elements stay sequence-valued forms."
+  [elems ctx]
+  (mapcat (fn [group]
+            (if (every? simple-elem? group)
+              [(mapv #(emit-elem % ctx) group)]
+              (map #(emit-elem-seg % ctx) group)))
+          (partition-by simple-elem? elems)))
+
 (defn- emit-list [node ctx]
   (let [elems (:elements node)]
-    (if (some #(#{:spread :null-aware-elem} (:ir %)) elems)
-      (let [plain (remove #(#{:spread :null-aware-elem} (:ir %)) elems)
-            extras (keep (fn [e]
-                           (case (:ir e)
-                             :spread (emit-expr (:expr e) ctx)
-                             :null-aware-elem (let [v (emit-expr (:expr e) ctx)]
-                                                (list 'if (list 'nil? v)
-                                                      []
-                                                      (vector v)))
-                             nil))
-                         elems)]
-        (list 'into (mapv #(emit-elem % ctx) plain)
-              (list* 'concat extras)))
-      (mapv #(emit-elem % ctx) elems))))
+    (if (every? simple-elem? elems)
+      (mapv #(emit-elem % ctx) elems)
+      (list 'vec (list* 'concat (elem-segments elems ctx))))))
 
 (defn- emit-set [node ctx]
   (let [elems (:elements node)]
-    (if (some spread? elems)
-      (list 'into (apply form/set-lit (map #(emit-elem % ctx) (remove spread? elems)))
-            (list* 'concat (map #(emit-expr (:expr %) ctx)
-                                (filter spread? elems))))
-      (apply form/set-lit (map #(emit-elem % ctx) elems)))))
+    (if (every? simple-elem? elems)
+      (apply form/set-lit (map #(emit-elem % ctx) elems))
+      (list 'into (form/set-lit)
+            (list* 'concat (elem-segments elems ctx))))))
 
 (defn- emit-map [node ctx]
   (let [elems (:elements node)
@@ -1284,14 +1372,16 @@
                              (get new-by-var (:name v) (symbol (:name v))))
                            decl-vars)
             cond (when (:cond loop) (emit-expr (:cond loop) ctx))
-            elem (emit-elem (:body node) ctx)
+            seg (if (simple-elem? (:body node))
+                  (vector (emit-elem (:body node) ctx))
+                  (emit-elem-seg (:body node) ctx))
             acc (symbol "d2c$acc")
-            elem-sym (symbol "d2c$elem")]
+            seg-sym (symbol "d2c$seg")]
         (list 'loop (conj bindings acc [])
               (list 'if (if (some? cond) cond true)
-                    (list 'let [elem-sym elem]
+                    (list 'let [seg-sym seg]
                           (list* 'recur
-                                 (conj new-vals (list 'conj acc elem-sym))))
+                                 (conj new-vals (list 'into acc seg-sym))))
                     acc))))))
 
 (defn- emit-elem [node ctx]
@@ -1301,16 +1391,8 @@
           (emit-elem (:then node) ctx)
           (when (:else node) (emit-elem (:else node) ctx)))
 
-    :for-element
-    (let [loop (:loop node)]
-      (case (:ir loop)
-        :for-in (list 'for [(symbol (:name (:var loop)))
-                            (emit-expr (:iterable loop) ctx)]
-                      (emit-elem (:body node) ctx))
-        :for-parts (emit-for-parts-element node ctx)
-        (fail! node (str "unsupported collection-for " (:ir loop)))))
-
-    :null-aware-elem (emit-expr (:expr node) ctx)
+    :for-element (fail! node "collection-for in a single-element position")
+    :null-aware-elem (fail! node "null-aware element in a single-element position")
     :spread (fail! node "spread outside a collection literal")
     (emit-expr node ctx)))
 
@@ -1319,7 +1401,10 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- emit-fn [node ctx]
-  (let [{:keys [params body async]} (emit-callable node ctx)]
+  ;; Inside a nested function (Dart closure) ClojureDart captures deftype
+  ;; fields by value and forbids `set!` on them; accessing them through
+  ;; `this` preserves Dart's read-at-call-time/mutable-field semantics.
+  (let [{:keys [params body async]} (emit-callable node (assoc ctx :in-fn true))]
     (with-meta (list* 'fn params body)
       (when async {:async true}))))
 
@@ -1360,6 +1445,14 @@
     (cond
       (contains? (:mutable ctx) n) (list 'deref (symbol n))
       (contains? (:locals ctx) n) (symbol n)
+      ;; In a constructor body the deftype field is not a local of the
+      ;; generated make-fn (its initial value was passed to the constructor
+      ;; call), and in a nested function ClojureDart snapshots field locals
+      ;; by value; read through `this` in both cases.
+      (and (or (:ctor-body? ctx) (:in-fn ctx))
+           (:this-sym ctx)
+           (contains? (:fields ctx) n))
+      (list (symbol (str ".-" n)) (:this-sym ctx))
       (contains? (:fields ctx) n) (symbol n)
       (contains? (:atom-fields ctx) n) (list 'deref (get (:atom-fields ctx) n))
       sm (cond
@@ -1369,6 +1462,7 @@
            (:setter sm) (fail! {:src nil}
                                (str n " is a write-only static setter")))
       (contains? (get-in ctx [:unit-info :top-getters]) n) (list (symbol n))
+      (contains? (get-in ctx [:unit-info :top-vars]) n) (symbol n)
       (contains? (get-in ctx [:unit-info :widget-fns]) n) (symbol n)
       (and (project-value-info n ctx) (not (own-instance-member? n ctx)))
       (let [{:keys [kinds] :as info} (project-value-info n ctx)]

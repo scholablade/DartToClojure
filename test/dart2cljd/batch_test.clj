@@ -6,7 +6,8 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dart2cljd.api :as api]
-            [dart2cljd.batch :as batch]))
+            [dart2cljd.batch :as batch]
+            [dart2cljd.frontend :as frontend]))
 
 (def ^:private fixture-dir "test/batchproj/lib")
 
@@ -54,8 +55,8 @@
 (deftest discovery
   (let [{:keys [files skipped]} (batch/discover {:dir fixture-dir})]
     (testing "sorted relative paths, .dart only"
-      (is (= ["main.dart" "models/item.dart" "orphan_part.dart"
-              "widgets/button.dart"]
+      (is (= ["barrel.dart" "main.dart" "models/item.dart" "orphan_part.dart"
+              "widgets/button.dart" "widgets/mixins.dart"]
              files)))
     (testing "*.g.dart is skipped by default"
       (is (= [{:file "generated.g.dart" :reason :excluded}] skipped)))))
@@ -64,13 +65,15 @@
   (testing "user globs are matched against the relative path"
     (let [{:keys [files skipped]} (batch/discover {:dir fixture-dir
                                                    :exclude ["widgets/**"]})]
-      (is (= ["main.dart" "models/item.dart" "orphan_part.dart"] files))
-      (is (= ["generated.g.dart" "widgets/button.dart"]
+      (is (= ["barrel.dart" "main.dart" "models/item.dart" "orphan_part.dart"]
+             files))
+      (is (= ["generated.g.dart" "widgets/button.dart" "widgets/mixins.dart"]
              (map :file skipped)))))
   (testing "a pattern without / also matches the file name at any depth"
     (let [{:keys [files]} (batch/discover {:dir fixture-dir
                                            :exclude ["button.dart" "orphan*"]})]
-      (is (= ["main.dart" "models/item.dart"] files))))
+      (is (= ["barrel.dart" "main.dart" "models/item.dart"
+              "widgets/mixins.dart"] files))))
   (testing "other default excludes are recognized"
     (doseq [generated ["x.freezed.dart" "x.mocks.dart"]]
       (let [dir (temp-dir)]
@@ -136,15 +139,24 @@
 (deftest project-index
   (if-not (dart?)
     (is true "dart binary not present; skipped")
-    (let [parsed (fixture-parsed "main.dart" "models/item.dart"
-                                 "widgets/button.dart")
+    (let [parsed (fixture-parsed "barrel.dart" "main.dart" "models/item.dart"
+                                 "widgets/button.dart" "widgets/mixins.dart")
           index (batch/build-index parsed {:ns-prefix "app"
                                            :package "batchproj"})]
-      (is (= {"main.dart" 'app.main
+      (is (= {"barrel.dart" 'app.barrel
+              "main.dart" 'app.main
               "models/item.dart" 'app.models.item
-              "widgets/button.dart" 'app.widgets.button}
+              "widgets/button.dart" 'app.widgets.button
+              "widgets/mixins.dart" 'app.widgets.mixins}
              (:file->ns index)))
-      (is (= #{"Item" "Button" "Label"} (set (keys (:project-types index)))))
+      (is (= #{"Item" "Button" "Label" "Badge" "Labelled" "Holder"}
+             (set (keys (:project-types index)))))
+      (testing "mixin declarations are indexed for cross-file inlining"
+        (is (= :mixin (get-in index [:project-mixins "Labelled" :kind])))
+        (is (= 'app.widgets.mixins (get-in index [:project-mixins "Labelled" :ns])))
+        (is (= "Labelled" (get-in index [:project-mixins "Labelled" :decl :name]))))
+      (testing "external imports are collected for the exports shim"
+        (is (= #{"dart:math"} (:external-imports index))))
       (testing "class info: namespace, constructors and statics"
         (is (= 'app.models.item (get-in index [:project-types "Item" :ns])))
         (is (= :class (get-in index [:project-types "Item" :kind])))
@@ -185,6 +197,8 @@
 
 (defn- convert-fixture [out]
   (batch/convert-dir {:dir fixture-dir :out out :ns-prefix "batch"
+                      :exports-file (str out "/d2c_exports.dart")
+                      :exports-uri "package:batchproj/d2c_exports.dart"
                       :dart dart-bin}))
 
 (deftest convert-dir-report-and-output
@@ -193,7 +207,8 @@
     (let [out (temp-dir)
           r (convert-fixture out)]
       (testing "the run keeps going: converted, skipped and failed are separated"
-        (is (= ["main.dart" "models/item.dart" "widgets/button.dart"]
+        (is (= ["barrel.dart" "main.dart" "models/item.dart"
+                "widgets/button.dart" "widgets/mixins.dart"]
                (map :file (:converted r))))
         (is (= ["generated.g.dart"] (map :file (:skipped r))))
         (is (= ["orphan_part.dart"] (map :file (:failed r))))
@@ -237,6 +252,33 @@
       (testing "local fields shadow project import aliases"
         (let [button (slurp (io/file out "widgets/button.cljd"))]
           (is (str/includes? button "(.-display item)"))))
+      (testing "cross-file mixins are inlined and implemented"
+        (let [barrel (slurp (io/file out "barrel.cljd"))
+              mixins (slurp (io/file out "widgets/mixins.cljd"))]
+          (is (str/includes? mixins "(deftype ^:mixin Labelled"))
+          (is (str/includes? mixins "^String label"))
+          (is (str/includes? barrel "[batch.widgets.mixins :as mixins]"))
+          (is (str/includes? barrel "mixins/Labelled"))
+          (is (not (str/includes? barrel "^:mixin mixins/Labelled"))
+              "inlined mixins are implemented, not mixed in")
+          (is (str/includes? barrel "(.describeLabelled this"))))
+      (testing "the barrel requires the exports shim for its external exports"
+        (let [shim (slurp (io/file out "d2c_exports.dart"))
+              barrel (slurp (io/file out "barrel.cljd"))
+              main (slurp (io/file out "main.cljd"))]
+          (is (str/includes? shim "export 'package:flutter/material.dart';"))
+          (is (str/includes? barrel
+                             "[\"package:batchproj/d2c_exports.dart\" :as exports]"))
+          (is (str/includes? main
+                             "[\"package:batchproj/d2c_exports.dart\" :as exports]"))
+          (is (str/includes? main "exports/Text"))
+          (is (str/includes? main "^exports/Widget child"))
+          (is (str/includes? main "batch.barrel/Badge-new"))))
+      (testing "same-file top-level values stay bare under the shim"
+        (let [main (slurp (io/file out "main.cljd"))]
+          (is (str/includes? main "(def _motto"))
+          (is (str/includes? main "_motto)"))
+          (is (not (str/includes? main "exports/_motto")))))
       (testing "part files are not written"
         (is (not (.exists (io/file out "orphan_part.cljd")))))
       (testing "the skipped generated file is not written"
@@ -276,7 +318,25 @@
                                            "}\n")})]
         (is (= ["b.dart"] (map :file (:failed r))))
         (is (str/includes? (ex-message (:error (first (:failed r))))
-                           "cannot expand typedef")))))))
+                           "cannot expand typedef"))))
+    (testing "a generic mixin whose members use the type parameter"
+      (let [r (convert-temp {"a.dart" (str "mixin M<T> {\n"
+                                           "  T id(T x) => x;\n"
+                                           "}\n")
+                             "b.dart" (str "import 'a.dart';\n"
+                                           "class C with M<int> {}\n")})]
+        (is (= ["a.dart" "b.dart"] (map :file (:failed r))))
+        (is (str/includes? (ex-message (:error (first (:failed r))))
+                           "type parameter"))))
+    (testing "an applier member colliding with a mixin member"
+      (let [r (convert-temp {"a.dart" "mixin M {\n  int get x => 1;\n}\n"
+                             "b.dart" (str "import 'a.dart';\n"
+                                           "class C with M {\n"
+                                           "  int x = 2;\n"
+                                           "}\n")})]
+        (is (= ["b.dart"] (map :file (:failed r))))
+        (is (str/includes? (ex-message (:error (first (:failed r))))
+                           "collides")))))))
 
 (deftest convert-dir-is-deterministic
   (if-not (dart?)
@@ -315,6 +375,66 @@
                         (batch/convert-dir {:dir "x"}))))
 
 ;; ---------------------------------------------------------------------------
+;; external function typedefs (M8.10)
+;; ---------------------------------------------------------------------------
+
+(deftest fn-typedefs-become-function-hints
+  (if-not (dart?)
+    (is true "dart binary not present; skipped")
+    (let [src (temp-dir)
+          out (temp-dir)]
+      (write-file! src "holder.dart"
+                   (str "import 'package:flutter/material.dart';\n"
+                        "import 'package:dummy/dummy.dart';\n\n"
+                        "class Holder {\n"
+                        "  final VoidCallback onDone;\n"
+                        "  final VoidCallback? onCancel;\n"
+                        "  Holder(this.onDone, this.onCancel);\n"
+                        "}\n"))
+      ;; The resolved type-kind pass needs the source project's pub
+      ;; `package_config.json`; stub it so the emitter mapping is tested
+      ;; without a Flutter dependency.
+      (with-redefs [frontend/fn-typedefs (fn [_ _] #{"VoidCallback"})]
+        (let [r (batch/convert-dir {:dir src :out out :dart dart-bin
+                                    :root (System/getProperty "user.dir")})
+              source (slurp (io/file out "holder.cljd"))]
+          (is (= 1 (count (:converted r))))
+          (is (str/includes? source "^Function onDone"))
+          (is (str/includes? source "^Function? onCancel"))
+          (is (not (str/includes? source "VoidCallback"))))))))
+
+(deftest dart-core-names-stay-bare
+  (if-not (dart?)
+    (is true "dart binary not present; skipped")
+    (let [src (temp-dir)
+          out (temp-dir)]
+      (write-file! src "entries.dart"
+                   (str "import 'package:dummy/dummy.dart';\n\n"
+                        "final MapEntry entry = MapEntry('a', 1);\n"
+                        "final Pattern pat = RegExp('x');\n"))
+      (let [r (with-redefs [frontend/fn-typedefs (fn [_ _] #{})]
+                (batch/convert-dir {:dir src :out out :dart dart-bin
+                                    :root (System/getProperty "user.dir")}))
+            source (slurp (io/file out "entries.cljd"))]
+        (is (= 1 (count (:converted r))))
+        (testing "dart:core names are not routed through the default alias/shim"
+          (is (str/includes? source "(MapEntry \"a\" 1)"))
+          (is (str/includes? source "(RegExp \"x\")"))
+          (is (not (str/includes? source "m/MapEntry")))
+          (is (not (str/includes? source "exports/MapEntry"))))))))
+
+(deftest ^:integration fn-typedefs-mode-resolves-sdk-typedefs
+  (if-not (dart?)
+    (is true "dart binary not present; skipped")
+    (let [names (frontend/fn-typedefs ["dart:async"]
+                                      {:root (System/getProperty "user.dir")
+                                       :dart dart-bin
+                                       :ref "corpus/m3.dart"})]
+      (is (contains? names "ZoneCallback"))
+      (is (contains? names "ZoneUnaryCallback"))
+      (is (not (contains? names "Future")) "classes are not function typedefs"))))
+
+;; ---------------------------------------------------------------------------
 ;; CLI
 ;; ---------------------------------------------------------------------------
 
@@ -334,9 +454,13 @@
           {:keys [exit out err]} (run-cli-captured ["--dir" fixture-dir
                                                     "--out" dir
                                                     "--ns-prefix" "batch"
+                                                    "--exports-file"
+                                                    (str dir "/d2c_exports.dart")
+                                                    "--exports-uri"
+                                                    "package:batchproj/d2c_exports.dart"
                                                     "--dart" dart-bin])]
       (is (= 1 exit))
-      (is (str/includes? out "converted 3, skipped 1, failed 1"))
+      (is (str/includes? out "converted 5, skipped 1, failed 1"))
       (is (str/includes? err "orphan_part.dart"))
       (is (str/includes? err "part of"))
       (is (.exists (io/file dir "main.cljd"))))))

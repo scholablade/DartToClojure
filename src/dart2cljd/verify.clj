@@ -148,13 +148,17 @@
   unexpected conversion or failure is a gate error. Returns the
   `convert-dir` report."
   [root entry]
-  (let [{:keys [name dir out ns-prefix package mode expect-failures]} entry
+  (let [{:keys [name dir out ns-prefix package mode expect-failures
+                exports-file exports-uri]} entry
         result (api/convert-dir
                 (cond-> {:dir (.getPath (io/file root dir))
                          :out (.getPath (io/file root out))
                          :root root}
                   ns-prefix (assoc :ns-prefix ns-prefix)
                   package (assoc :package package)
+                  exports-file (assoc :exports-file
+                                      (.getPath (io/file root exports-file)))
+                  exports-uri (assoc :exports-uri exports-uri)
                   (= :idiomatic mode) (assoc :mode :idiomatic)))
         failed (set (map :file (:failed result)))
         expected (set expect-failures)]
@@ -200,7 +204,8 @@
 
 (defn generated-dart-files
   "Dart files the compile step should produce for the entries (paths relative
-  to verify/), plus the generated verify.main."
+  to verify/), plus the generated verify.main and every generated exports
+  shim."
   [root entries]
   (let [verify-dir (.toPath (io/file root "verify"))
         gen-dir (io/file root "verify/lib/cljd-out/verify/gen")
@@ -217,7 +222,11 @@
                                               (str/ends-with? (.getName ^java.io.File %) ".dart"))))))
                        [(io/file gen-dir (str (:name entry) ".dart"))]))
                    entries)
-           [(io/file root "verify/lib/cljd-out/verify/main.dart")]))))
+           [(io/file root "verify/lib/cljd-out/verify/main.dart")]
+           (for [entry entries
+                 :when (= :dir (entry-kind entry))
+                 :when (:exports-file entry)]
+             (io/file root (:exports-file entry)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; steps

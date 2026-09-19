@@ -30,6 +30,59 @@
 (defn ^Base Base-new [^String name]
   (let [this (Base name)] this))
 
+(deftype CtorBody
+  [^:mutable ^int count]
+  :type-only true
+  CtorBody)
+
+(defn ^CtorBody CtorBody-new []
+  (let [count 0 this (CtorBody count)] (.-count! this 3) (.-count! this (inc (.-count this))) this))
+
+(deftype LateField
+  [^:mutable ^int value]
+  :type-only true
+  LateField
+  (^void setIt [this ^int v] (set! value v) nil)
+  (^int readIt [this] value))
+
+(defn ^LateField LateField-new []
+  (let [value 0 this (LateField value)] this))
+
+(deftype LateFinal
+  [^:mutable ^int fromCtor ^:mutable ^int fromMethod]
+  :type-only true
+  LateFinal
+  (^void init [this] (set! fromMethod 7) nil)
+  (^int sum [this] (+ fromCtor fromMethod)))
+
+(defn ^LateFinal LateFinal-new [^int v]
+  (let [fromCtor 0 fromMethod 0 this (LateFinal fromCtor fromMethod)] (.-fromCtor! this v) this))
+
+(deftype LateInit
+  [^:mutable ^int start ^:mutable ^int doubled ^:mutable self]
+  :type-only true
+  LateInit)
+
+(defn ^LateInit LateInit-new [^int v]
+  (let [start 0
+        doubled 0
+        self nil
+        this (LateInit start doubled self)]
+    (.-start! this v)
+    (.-doubled! this (* (.-start this) 2))
+    (.-self! this this)
+    this))
+
+(deftype ClosureField
+  [^:mutable ^int value]
+  :type-only true
+  ClosureField
+  (^Function writer [this] (fn [] (.-value! this 5)))
+  (^Function reader [this] (fn [] (.-value this))))
+
+(defn ^ClosureField ClosureField-new []
+  (let [value 0 this (ClosureField value)] this))
+
 (deftype Child
   [^:mutable ^int n d2c$super0]
   :type-only true
@@ -84,6 +137,17 @@
 
 (def Suit-values [Suit-hearts Suit-spades])
 
+(deftype Rank
+  [^int index ^String id ^String name ^int weight]
+  :type-only true
+  Rank)
+
+(def Rank-bronze (let [id "b" name "Bronze" weight 1] (Rank 0 id name weight)))
+
+(def Rank-gold (let [id "g" name "Gold" weight 3] (Rank 1 id name weight)))
+
+(def Rank-values [Rank-bronze Rank-gold])
+
 (deftype Usage
   []
   :type-only true
@@ -126,6 +190,69 @@
 
 (defn addAny [a b]
   (let [d2c$a a d2c$b b] (if (dart/is? d2c$a Point) (. d2c$a + d2c$b) (+ d2c$a d2c$b))))
+
+(deftype ^:mixin Tagged
+  [^String prefix ^:mutable ^bool _active]
+  :type-only true
+  Tagged
+  (^:getter ^String tag [this] (str prefix ":" _active))
+  (^void activate [this] (set! _active true) nil))
+
+(deftype TaggedItem
+  [^String name ^String prefix ^:mutable ^bool _active]
+  :type-only true
+  Tagged
+  TaggedItem
+  (^String describe [this] (str name " " (.-tag this)))
+  (^:getter ^String tag [this] (str prefix ":" _active))
+  (^void activate [this] (set! _active true) nil))
+
+(defn ^TaggedItem TaggedItem-new [^String name]
+  (let [prefix "tag" _active false this (TaggedItem name prefix _active)] this))
+
+(deftype ^:mixin Counted
+  [^:mutable ^int _count]
+  :type-only true
+  Counted
+  (^:getter ^int count [this] _count)
+  (^void bump [this] (set! _count (inc _count)) nil))
+
+(deftype CountedBox
+  [^String label ^:mutable ^int _count]
+  :type-only true
+  Counted
+  CountedBox
+  (^String renderCount [this] (str label "=" (.-count this)))
+  (^:getter ^int count [this] _count)
+  (^void bump [this] (set! _count (inc _count)) nil))
+
+(defn ^CountedBox CountedBox-new [^String label]
+  (let [_count 0 this (CountedBox label _count)] this))
+
+(defn collect [^int n ^bool flag extra maybe]
+  (vec
+    (concat
+      (loop [i 0
+             d2c$acc []]
+        (if (< i n) (let [d2c$seg [(* i 2)]] (recur (inc i) (into d2c$acc d2c$seg))) d2c$acc))
+      (if flag [100 200] [300])
+      (mapcat
+        (fn [x]
+          [x (let [d2c$a x d2c$b 1] (if (dart/is? d2c$a Point) (. d2c$a + d2c$b) (+ d2c$a d2c$b)))])
+        extra)
+      (if (nil? maybe) [] [maybe]))))
+
+(defn countUp [^int n]
+  (let [total (volatile! 0)]
+    (loop [i 0] (when (< i n) (vswap! total + i) (recur (inc i))))
+    (deref total)))
+
+(defn multiVar [^int n]
+  (let [out (volatile! "")]
+    (loop [i 0
+           j n]
+      (when (< i j) (vreset! out (str (deref out) i "-" j ";")) (recur (inc i) (dec j))))
+    (deref out)))
 
 (defn loops []
   (let [sum (volatile! 0)]

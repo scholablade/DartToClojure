@@ -21,4 +21,6 @@
   :package "batchproj"
   :mode :faithful
   :expect-failures ["orphan_part.dart"]
-  :entry "main"}]
+  :entry "main"
+  :exports-file "verify/lib/d2c_exports.dart"
+  :exports-uri "package:cljd_verify/d2c_exports.dart"}]

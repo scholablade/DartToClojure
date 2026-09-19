@@ -128,3 +128,72 @@
     (await (pumpWidget (m/MaterialApp .home (i/Fader))))
     (ft/expect (ft/find.text "fade") ft/findsOneWidget)
     (await (pumpWidget (m/MaterialApp .home (m/SizedBox))))))
+
+;; ---------------------------------------------------------------------------
+;; M8: mixins with fields (inlined into appliers) and collection splicing
+;; ---------------------------------------------------------------------------
+
+(deftest mixins-with-fields
+  (let [t (g/TaggedItem-new "x")]
+    (is (= "x tag:false" (.describe t)))
+    (.activate t)
+    (is (= "x tag:true" (.describe t))))
+  (let [b (g/CountedBox-new "c")]
+    (.bump b)
+    (.bump b)
+    (is (= "c=2" (.renderCount b)))))
+
+(deftest collection-elements
+  (is (= [0 2 4 100 200 7 8] (g/collect 3 true [7] nil)))
+  (is (= [0 2 4 300 7 8] (g/collect 3 false [7] nil)))
+  (is (= [0 2 4 100 200 7 8 5] (g/collect 3 true [7] 5))))
+
+(deftest statement-for-shapes
+  (is (= 6 (g/countUp 4)))
+  (is (= "0-4;1-3;" (g/multiVar 4))))
+
+;; ---------------------------------------------------------------------------
+;; M8: cross-file mixin + barrel with project and external exports
+;; ---------------------------------------------------------------------------
+
+(deftest cross-file-mixin-and-barrel
+  (is (= "L:x:true" (bp/badgeText "x")))
+  (is (= "x" (.-data (bp/makeLabel "x")))))
+
+(deftest enum-named-arguments
+  (is (= "b" (.-id g/Rank-bronze)))
+  (is (= "Gold" (.-name g/Rank-gold)))
+  (is (= 1 (.-index g/Rank-gold)))
+  (is (= 3 (.-weight g/Rank-gold)))
+  (is (= 2 (count g/Rank-values))))
+
+(deftest constructor-body-field-writes
+  (is (= 4 (.-count (g/CtorBody-new)))))
+
+(deftest same-file-top-level-value
+  (is (= "motto" (bp/motto))))
+
+(deftest closure-field-access
+  (let [c (g/ClosureField-new)
+        read (.reader c)
+        write (.writer c)]
+    (is (= 0 (read)))
+    (write)
+    (is (= 5 (read)))))
+
+(deftest late-fields
+  (let [l (g/LateField-new)]
+    (.setIt l 7)
+    (is (= 7 (.readIt l)))))
+
+(deftest late-final-fields
+  (let [l (g/LateFinal-new 3)]
+    (is (= 3 (.-fromCtor l)))
+    (.init l)
+    (is (= 10 (.sum l)))))
+
+(deftest late-init-fields
+  (let [l (g/LateInit-new 3)]
+    (is (= 3 (.-start l)))
+    (is (= 6 (.-doubled l)))
+    (is (identical? l (.-self l)))))
