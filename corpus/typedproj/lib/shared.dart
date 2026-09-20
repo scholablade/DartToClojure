@@ -6,6 +6,8 @@ int shared = 1;
 
 int length = 42;
 
+int base = 100;
+
 int bumpShared() => ++shared;
 
 void resetShared() {

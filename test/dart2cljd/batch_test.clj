@@ -676,6 +676,32 @@
       (is (contains? names "ZoneUnaryCallback"))
       (is (not (contains? names "Future")) "classes are not function typedefs"))))
 
+(deftest ^:integration typed-run-uses-doc-fn-typedefs
+  (if-not (dart?)
+    (is true "dart binary not present; skipped")
+    (let [src (temp-dir)
+          out (temp-dir)]
+      (write-file! src "holder.dart"
+                   (str "import 'dart:async';\n\n"
+                        "class Holder {\n"
+                        "  final ZoneCallback? onDone;\n"
+                        "  Holder(this.onDone);\n"
+                        "}\n"))
+      ;; With :types the per-file typed dump resolves the function typedefs of
+      ;; its external imports, so the separate `frontend/fn-typedefs` pass must
+      ;; not run (it would throw here) and the hint still maps to `Function`
+      ;; (M12 follow-up).
+      (with-redefs [frontend/fn-typedefs
+                    (fn [_ _]
+                      (throw (ex-info "the fn-typedefs pass must be skipped with :types"
+                                      {})))]
+        (let [r (batch/convert-dir {:dir src :out out :dart dart-bin :types true
+                                    :root (System/getProperty "user.dir")})
+              source (slurp (io/file out "holder.cljd"))]
+          (is (= 1 (count (:converted r))))
+          (is (str/includes? source "^Function? onDone"))
+          (is (not (str/includes? source "ZoneCallback"))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; CLI
 ;; ---------------------------------------------------------------------------

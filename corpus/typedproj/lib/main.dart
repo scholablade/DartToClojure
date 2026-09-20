@@ -22,3 +22,24 @@ int sharedValue() => shared;
 int topLength() => length;
 
 int bumpedShared() => bumpShared();
+
+// M12 follow-up: inherited-field writes (see `SubBuf`) must win over the
+// top-level `length`.
+int subLength(int v) {
+  final s = SubBuf(v);
+  s.setLength(v);
+  return s.readLength();
+}
+
+int subBumpedLength(int v) {
+  final s = SubBuf(v);
+  return s.bumpLength();
+}
+
+// M12 follow-up: a reserved-word field of another file's class written
+// through an instance (`base` is also a top-level value in shared.dart).
+int writeReservedBase(int v) {
+  final h = ReservedHolder();
+  h.base = v;
+  return h.readBase();
+}

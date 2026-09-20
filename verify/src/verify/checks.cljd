@@ -353,3 +353,15 @@
   (shared/resetShared)
   (is (= 1 (tp/sharedValue)))
   (is (= 2 (do (tp/bumpedShared) (tp/sharedValue)))))
+
+(deftest resolved-write-elements
+  ;; `length` is an inherited instance field of `SubBuf` and a top-level value
+  ;; in shared.dart: the instance member must win for writes and increments
+  ;; (without the write-element fact the top-level was written instead).
+  (is (= 7 (tp/subLength 7)))
+  (is (= 8 (tp/subBumpedLength 7)))
+  (is (= 42 (tp/topLength)))
+  ;; A reserved-word field of another file's class written through an instance
+  ;; uses ClojureDart's munged spelling (`$base_`); the plain `.-base!` sugar
+  ;; is a dynamic setter that fails at runtime.
+  (is (= 9 (tp/writeReservedBase 9))))

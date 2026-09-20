@@ -53,10 +53,18 @@
             :src (src 1 1)}
            (n {:ast :SimpleIdentifier :id "foo" :static-type "String"
                :element :getter :src (src 1 1)}))))
+  (testing "write facts become :dart-write-element / :dart-write-field-class"
+    (is (= {:ir :assign :op "=" :dart-write-element :field
+            :dart-write-field-class "Base" :lhs nil :rhs nil :src (src 1 1)}
+           (n {:ast :AssignmentExpression :op "="
+               :write-element :field :write-field-class "Base"
+               :src (src 1 1)}))))
   (testing "parse-only nodes carry neither fact"
     (let [node (n {:ast :SimpleIdentifier :id "foo" :src (src 1 1)})]
       (is (nil? (:dart-type node)))
-      (is (nil? (:dart-element node))))))
+      (is (nil? (:dart-element node)))
+      (is (nil? (:dart-write-element node)))
+      (is (nil? (:dart-write-field-class node))))))
 
 (deftest type-annotations
   (testing "NamedType"

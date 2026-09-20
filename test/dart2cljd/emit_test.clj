@@ -253,6 +253,68 @@
                               :rhs {:ir :int-lit :value 1 :raw "1"}}
                              ctx))))))
 
+(deftest resolved-write-elements
+  (testing "an inherited instance field write wins over a same-named
+            cross-file project value (Dart innermost-first)"
+    (let [ctx (core/ctx {:project-values {"length" {:ns 'app.shared :kinds #{:var}}}}
+                        {:this-sym 'this})
+          node {:ir :assign :op "="
+                :dart-write-element :field :dart-write-field-class "BaseBuf"
+                :lhs {:ir :id :name "length"}
+                :rhs {:ir :int-lit :value 7 :raw "7"}}]
+      (is (= '(.-length! this 7) (core/emit-expr node ctx))))
+    (testing "without the write fact the project value is written (parse-only)"
+      (let [ctx (core/ctx {:project-values {"length" {:ns 'app.shared :kinds #{:var}}}}
+                          {:this-sym 'this})
+            node {:ir :assign :op "="
+                  :lhs {:ir :id :name "length"}
+                  :rhs {:ir :int-lit :value 7 :raw "7"}}]
+        (is (= '(set! app.shared/length 7) (core/emit-expr node ctx))))))
+  (testing "an inherited field increment uses the munged-aware this route"
+    (let [ctx (core/ctx {} {:this-sym 'this})
+          node {:ir :postfix :op "++"
+                :dart-write-element :field :dart-write-field-class "BaseBuf"
+                :operand {:ir :id :name "length"}}]
+      (is (= '(let [d2c$old (.-length this)]
+                (.-length! this (inc d2c$old))
+                d2c$old)
+             (core/emit-expr node ctx)))))
+  (testing "a resolved local write is not routed to an own instance setter"
+    (let [ctx (core/ctx {} {:this-sym 'this :instance-setters #{"value"}})
+          node {:ir :assign :op "=" :dart-write-element :local
+                :lhs {:ir :id :name "value"}
+                :rhs {:ir :int-lit :value 2 :raw "2"}}]
+      (is (= '(set! value 2) (core/emit-expr node ctx))))
+    (testing "without the write fact the setter heuristic applies"
+      (let [ctx (core/ctx {} {:this-sym 'this :instance-setters #{"value"}})
+            node {:ir :assign :op "="
+                  :lhs {:ir :id :name "value"}
+                  :rhs {:ir :int-lit :value 2 :raw "2"}}]
+        (is (= '(.-value! this 2) (core/emit-expr node ctx))))))
+  (testing "a reserved-word field of a project class is written munged"
+    (let [ctx (core/ctx {:project-types {"ReservedHolder" {:ns 'app.collide}}}
+                        {:this-sym 'this :locals #{"h"}})
+          node {:ir :assign :op "="
+                :dart-write-element :field :dart-write-field-class "ReservedHolder"
+                :lhs {:ir :prop :name "base" :target {:ir :id :name "h"}}
+                :rhs {:ir :int-lit :value 9 :raw "9"}}]
+      (is (= '(.-$base_! h 9) (core/emit-expr node ctx)))))
+  (testing "a reserved-word field of an *external* class is not munged"
+    (let [ctx (core/ctx {} {:this-sym 'this :locals #{"h"}})
+          node {:ir :assign :op "="
+                :dart-write-element :field :dart-write-field-class "StringBuffer"
+                :lhs {:ir :prop :name "base" :target {:ir :id :name "h"}}
+                :rhs {:ir :int-lit :value 9 :raw "9"}}]
+      (is (= '(.-base! h 9) (core/emit-expr node ctx)))))
+  (testing "a reserved-word field of the current (local) class is munged"
+    (let [ctx (core/ctx {} {:this-sym 'this
+                            :unit-info {:classes {"LocalHolder" {}}}})
+          node {:ir :assign :op "="
+                :dart-write-element :field :dart-write-field-class "LocalHolder"
+                :lhs {:ir :prop :name "base" :target {:ir :this}}
+                :rhs {:ir :int-lit :value 3 :raw "3"}}]
+      (is (= '(.-$base_! this 3) (core/emit-expr node ctx))))))
+
 ;; ---------------------------------------------------------------------------
 ;; expression parity (seeded from DartClojure's corpus, corrected to
 ;; canonical cljd syntax: nil instead of null, dot-symbols for named args,
