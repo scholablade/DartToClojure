@@ -868,6 +868,36 @@
                (local-symbol n ctx))
              (emit-args (:args node) ctx)))))
 
+(defn- emit-value-call
+  "Emit `f(args)` where `f` is an *expression* rather than a method or
+  function invocation (analyzer `FunctionExpressionInvocation`).
+
+  A resolved unit turns a call to a top-level function-typed variable
+  (`debugPrint(...)`, `log(...)`) into this shape; the parse-only AST could
+  not tell it from an implicit-this method call. Such a name routes through
+  the import/shim alias (`exports/debugPrint`) instead of becoming
+  `(.-debugPrint this)`, which compiled to a dynamic member access that fails
+  at runtime. Names the regular identifier machinery already resolves
+  (locals, fields, instance members, statics, project values) and files
+  without an exports shim keep their previous emission."
+  [node ctx]
+  (let [f (:fn node)
+        n (when (= :id (:ir f)) (str (:name f)))]
+    (if (and n
+             (:wildcard-alias (:aliases ctx))
+             (not (known-bare? n ctx))
+             (not (contains? (:locals ctx) n))
+             (not (contains? (:fields ctx) n))
+             (not (contains? (:atom-fields ctx) n))
+             (not (contains? (:instance-getters ctx) n))
+             (not (contains? (:instance-methods ctx) n))
+             (not (contains? (:instance-setters ctx) n))
+             (not (static-member-info n ctx))
+             (not (project-value-info n ctx))
+             (not (project-type-info n ctx)))
+      (list* (alias/qualify n (:aliases ctx)) (emit-args (:args node) ctx))
+      (list* (emit-expr f ctx) (emit-args (:args node) ctx)))))
+
 ;; ---------------------------------------------------------------------------
 ;; operators
 ;; ---------------------------------------------------------------------------
@@ -939,20 +969,57 @@
          (or (contains? (get-in (:local-types ctx) [:scalars]) (:name n))
              (contains? (:scalar-fields ctx) (:name n))))))
 
+(defn- static-type
+  "Rendered analyzer type of a resolved expression node, or nil in parse-only
+  mode (M11 `--types`)."
+  [node]
+  (:dart-type (strip-paren node)))
+
+(defn- type-base-name
+  "Base name of a rendered Dart type (`Vec<Vec>?` -> `Vec`), or nil for
+  function/record types and other non-named renderings."
+  [t]
+  (when (string? t)
+    (let [t (str/replace t #"\?+$" "")
+          base (first (str/split t #"[<(]"))]
+      (when (re-matches #"[A-Za-z_$][A-Za-z0-9_$]*" base) base))))
+
+(defn- static-kind
+  "Coarse kind of a node's resolved static type: :string, :number, :class,
+  :dynamic, or nil when the node has no resolved type (parse-only mode).
+
+  `:dynamic` covers `dynamic`/`Object`/`void`/`Null`, the analyzer's
+  `InvalidType` (an unresolvable expression, e.g. a failed generic
+  substitution) and function/record types: the syntactic heuristics stay in
+  charge for those."
+  [node]
+  (when-let [t (static-type node)]
+    (let [n (type-base-name t)]
+      (cond
+        (nil? n) :dynamic
+        (= "String" n) :string
+        (contains? #{"int" "double" "num"} n) :number
+        (contains? #{"dynamic" "Object" "void" "Never" "Null"
+                     "InvalidType" "UnknownType"} n) :dynamic
+        :else :class))))
+
 (defn- string-expr?
   "True when `node` is syntactically known to evaluate to a Dart String
   (see dart2cljd.typeinfo/string-expr?): tracked String locals/parameters,
   implicit-this `String` fields, literals/interpolations, `toString`-style
-  calls and `+` with a String operand."
+  calls and `+` with a String operand. A resolved `:dart-type` (M11
+  `--types`) is authoritative when present."
   [node ctx]
   (let [n (strip-paren node)]
-    (if (and (= :prop (:ir n))
-             (= :this (:ir (:target n))))
-      (contains? (:string-fields ctx) (:name n))
-      (typeinfo/string-expr?
-       n
-       (into (set (get-in (:local-types ctx) [:strings]))
-             (:string-fields ctx))))))
+    (if (= :string (static-kind n))
+      true
+      (if (and (= :prop (:ir n))
+               (= :this (:ir (:target n))))
+        (contains? (:string-fields ctx) (:name n))
+        (typeinfo/string-expr?
+         n
+         (into (set (get-in (:local-types ctx) [:strings]))
+               (:string-fields ctx)))))))
 
 (defn- emit-user-operator [node ctx]
   (let [m (get operator-call-names (:op node))]
@@ -995,14 +1062,16 @@
 
 (defn- unknown-id-receiver?
   "True when `node` is an identifier whose type is not known (not a unit
-  class, not a scalar). Guards are restricted to identifiers: guarding
-  arbitrary expressions would add `dart/is?` checks to ordinary numeric
-  arithmetic (e.g. `(+ (fib (- n 1)) …)`)."
+  class, not a scalar, no resolved `--types` static type). Guards are
+  restricted to identifiers: guarding arbitrary expressions would add
+  `dart/is?` checks to ordinary numeric arithmetic (e.g.
+  `(+ (fib (- n 1)) …)`)."
   [node ctx]
   (let [n (strip-paren node)]
     (and (= :id (:ir n))
          (not (local-class-receiver n ctx))
-         (not (scalar-receiver? n ctx)))))
+         (not (scalar-receiver? n ctx))
+         (not (contains? #{:string :number :class} (static-kind n))))))
 
 (defn- guard-binary? [node ctx]
   (and (contains? guarded-binary-ops (:op node))
@@ -1064,8 +1133,14 @@
 (defn- emit-binary [node ctx]
   (let [op (:op node)]
     (cond
-      (and (local-class-receiver (:lhs node) ctx)
-           (contains? operator-call-names op))
+      ;; A known class receiver dispatches the operator as an interop call:
+      ;; a unit class from the syntactic pass, or any class-typed operand
+      ;; from a resolved `--types` static type. `==`/`!=` stay on cljd `=`
+      ;; (its IEquiv fallback already reaches Dart `.==`).
+      (and (contains? operator-call-names op)
+           (or (local-class-receiver (:lhs node) ctx)
+               (and (not (contains? #{"==" "!="} op))
+                    (= :class (static-kind (:lhs node))))))
       (emit-user-operator node ctx)
 
       ;; Dart `String.+` concatenates; either operand being a String makes the
@@ -1201,7 +1276,8 @@
   [st op rhs lhs]
   (when (and (nil? (:read st)) (not (contains? #{nil "="} op)))
     (fail! lhs "compound assignment needs a matching getter"))
-  (assign-slot (:read st) (:write st) (if (nil? op) "=" op) rhs))
+  (assign-slot (:read st) (:write st) (if (nil? op) "=" op) rhs
+               (= :string (static-kind lhs))))
 
 (defn- emit-increment-place
   "`x++` on a property/index target, incl. static members of classes."
@@ -1331,14 +1407,16 @@
             resetter (if (contains? (:captured ctx) n) 'reset! 'vreset!)
             l (local-symbol n ctx)
             d (list 'deref l)
-            m (when (contains? (get-in (:local-types ctx) [:classes]) n)
+            m (when (or (contains? (get-in (:local-types ctx) [:classes]) n)
+                        (= :class (static-kind lhs)))
                 (get operator-call-names (bare-operator op)))]
         (case op
           nil (list resetter l rhs)
           "??" (list 'if (list 'nil? d) (list resetter l rhs) d)
           "&&" (list 'if d (list resetter l rhs) d)
           "||" (list 'if d d (list resetter l rhs))
-          (if (and (= "+" (bare-operator op)) (string-name? n ctx))
+          (if (and (= "+" (bare-operator op))
+                   (or (string-name? n ctx) (= :string (static-kind lhs))))
             (list setter l 'str rhs)
             (if m
               (list setter l
@@ -1355,7 +1433,8 @@
           "??" (list 'if (list 'nil? d) (list 'reset! a rhs) d)
           "&&" (list 'if d (list 'reset! a rhs) d)
           "||" (list 'if d d (list 'reset! a rhs))
-          (if (and (= "+" (bare-operator op)) (string-name? n ctx))
+          (if (and (= "+" (bare-operator op))
+                   (or (string-name? n ctx) (= :string (static-kind lhs))))
             (list 'swap! a 'str rhs)
             (list 'swap! a (compound-fn op) rhs))))
 
@@ -1366,7 +1445,8 @@
                    (fn [v] (list (symbol (str ".-" n "!")) (:this-sym ctx) v))
                    (if (nil? op) "=" op)
                    rhs
-                   (contains? (:string-fields ctx) n))
+                   (or (contains? (:string-fields ctx) n)
+                       (= :string (static-kind lhs))))
 
       (and (contains? (get-in (:local-types ctx) [:classes]) n)
            (contains? operator-call-names (bare-operator op)))
@@ -1374,11 +1454,17 @@
             (user-op-form (local-symbol n ctx) op rhs))
 
       (contains? (get-in ctx [:unit-info :top-setters]) n)
-      (list (symbol (str "set-" n "!")) rhs)
+      (assign-static {:read (when (contains? (get-in ctx [:unit-info :top-getters]) n)
+                              (list (symbol n)))
+                      :write (fn [v] (list (symbol (str "set-" n "!")) v))}
+                     op rhs lhs)
 
       (and (:this-sym ctx)
            (contains? (:instance-setters ctx) n))
-      (list (symbol (str ".-" n "!")) (:this-sym ctx) rhs)
+      (assign-static {:read (when (contains? (:instance-getters ctx) n)
+                              (list (symbol (str ".-" n)) (:this-sym ctx)))
+                      :write (fn [v] (list (symbol (str ".-" n "!")) (:this-sym ctx) v))}
+                     op rhs lhs)
 
       (and sm (not (contains? (:locals ctx) n)))
       (let [{:keys [field getter setter]} sm]
@@ -1425,9 +1511,16 @@
                      l
                      (list 'set! l rhs))
           (list 'set! l
-                (if (and (= "+" (bare-operator op)) (string-name? n ctx))
+                (cond
+                  (and (= "+" (bare-operator op))
+                       (or (string-name? n ctx) (= :string (static-kind lhs))))
                   (list 'str l rhs)
-                  (list (compound-fn op) l rhs))))))))
+
+                  (and (= :class (static-kind lhs))
+                       (contains? operator-call-names (bare-operator op)))
+                  (user-op-form l op rhs)
+
+                  :else (list (compound-fn op) l rhs))))))))
 
 (defn- assign-slot
   ([read write op rhs] (assign-slot read write op rhs false))
@@ -1956,7 +2049,7 @@
 
             :else (emit-fn-call node ctx))
     :prop (emit-chain node ctx)
-    :call-fn (list* (emit-expr (:fn node) ctx) (emit-args (:args node) ctx))
+    :call-fn (emit-value-call node ctx)
     :index (let [target (emit-expr (:target node) ctx)
                  index (emit-expr (:index node) ctx)]
              (if (:null-aware node)

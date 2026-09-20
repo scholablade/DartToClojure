@@ -172,7 +172,7 @@
 (defn convert-dir
   "Batch mode (M6): translate a whole Dart directory tree.
 
-  Options: `:dir :out :ns-prefix :exclude :package :mode` — see
+  Options: `:dir :out :ns-prefix :exclude :package :mode :types` — see
   `dart2cljd.batch/convert-dir`. Returns the report map
   (`:converted :skipped :failed :exit`), never throws for per-file failures."
   [opts]
@@ -271,6 +271,7 @@
     :parse-fn str]
    [nil "--package NAME" "Batch mode: Dart package name (default: nearest pubspec.yaml)"
     :parse-fn str]
+   [nil "--types" "Use analyzer resolution: expression static types (file/dir modes)"]
    [nil "--exports-file PATH" "Batch mode: write the external-exports Dart shim here"
     :parse-fn str]
    [nil "--exports-uri URI" "Batch mode: URI under which generated code requires the shim"
@@ -279,12 +280,13 @@
 
 (defn cli-opts
   "CLI options -> conversion kwargs."
-  [{:keys [material flutter width faithful default-alias dart]} idiomatic?]
+  [{:keys [material flutter width faithful default-alias dart types]} idiomatic?]
   (cond-> {:material material
            :flutter flutter
            :width width
            :dart dart}
     (not (nil? default-alias)) (assoc :default-alias default-alias)
+    types (assoc :types true)
     (and idiomatic? (not faithful)) (assoc :mode :idiomatic)))
 
 (defn batch-opts
@@ -368,10 +370,20 @@
       :else
       (let [opts (cli-opts options (:idiomatic options))
             path (or (:path options) (first arguments))]
-        (if (nil? path)
+        (cond
+          (nil? path)
           (do (binding [*out* *err*]
                 (println "no arguments passed; use --help for usage"))
               2)
+
+          (and (:types options)
+               (or (nil? (:path options)) (= "-" path)))
+          (do (binding [*out* *err*]
+                (println (str "dart2cljd: --types requires a Dart file (-p PATH); "
+                              "snippets cannot be resolved")))
+              1)
+
+          :else
           (try
             (let [out (cond
                         (= "-" path) (apply convert (slurp *in*) (mapcat identity opts))

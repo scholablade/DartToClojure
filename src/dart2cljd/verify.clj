@@ -135,7 +135,9 @@
     (when-not (.exists dart-file)
       (throw (ex-info (str "dart2cljd.verify: missing " dart-file)
                       {:dart2cljd/kind :verify :file (.getPath dart-file)})))
-    (let [doc (api/astdump-file (str "corpus/" name ".dart") {:root root})
+    (let [doc (api/astdump-file (str "corpus/" name ".dart")
+                                (cond-> {:root root}
+                                  (:types entry) (assoc :types true)))
           unit (:unit (ast/normalize-doc doc))
           out (io/file root "verify/src/verify/gen" (str name ".cljd"))]
       (when (seq (library/part-uris unit))
@@ -155,11 +157,12 @@
   `convert-dir` report."
   [root entry]
   (let [{:keys [name dir out ns-prefix package mode expect-failures
-                exports-file exports-uri]} entry
+                exports-file exports-uri types]} entry
         result (api/convert-dir
                 (cond-> {:dir (.getPath (io/file root dir))
                          :out (.getPath (io/file root out))
                          :root root}
+                  types (assoc :types true)
                   ns-prefix (assoc :ns-prefix ns-prefix)
                   package (assoc :package package)
                   exports-file (assoc :exports-file

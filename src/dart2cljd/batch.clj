@@ -527,10 +527,20 @@
 ;; ---------------------------------------------------------------------------
 
 (defn parse-unit
-  "Parse a Dart file (path relative to `:dir`) and return its normalized unit."
+  "Parse a Dart file (path relative to `:dir`) and return its normalized unit.
+
+  With `:types` the frontend dumps the analyzer-resolved unit (expression
+  `:static-type` facts); when the file cannot be resolved the conversion falls
+  back to the syntactic passes and warns, so a missing `dart pub get` in the
+  source project is visible."
   [rel opts]
-  (let [path (java.io.File. (str (:dir opts)) rel)]
-    (:unit (ast/normalize-doc (frontend/astdump-file (.getPath path) opts)))))
+  (let [path (java.io.File. (str (:dir opts)) rel)
+        doc (frontend/astdump-file (.getPath path) opts)]
+    (when (and (:types opts) (false? (:resolved doc)))
+      (println (str "dart2cljd: warning: --types could not resolve " rel
+                    " (run `dart pub get` in the source project); using the "
+                    "syntactic passes for it")))
+    (:unit (ast/normalize-doc doc))))
 
 (defn- emit-source
   "Emit one unit for batch output (ns from the path, project index attached,
@@ -719,6 +729,11 @@
     :package     Dart package name for own-`package:` imports (optional;
                  defaults to the nearest pubspec.yaml `name:`)
     :mode        :faithful (default) | :idiomatic
+    :types       use the analyzer-resolved frontend (`astdump --types`) so
+                 expressions carry `:static-type` facts (operator dispatch,
+                 String concatenation); requires the source project to be
+                 resolvable (`dart pub get`), otherwise a warning and the
+                 syntactic fallback (M11)
     :exports-file path of the generated Dart shim re-exporting the tree's
                  external `export`s (optional; needed when a converted file
                  re-exports external packages)

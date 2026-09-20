@@ -13,6 +13,7 @@ golden:
 fixture:
 	$(DART) run bin/astdump.dart corpus/m3.dart > test/fixtures/m3.edn
 	$(DART) run bin/astdump.dart corpus/idiomatic.dart > test/fixtures/idiomatic.edn
+	$(DART) run bin/astdump.dart --types corpus/typed.dart > test/fixtures/typed.edn
 	$(DART) run bin/astdump.dart test/sample.dart > test/fixtures/sample.edn
 	$(DART) run bin/astdump.dart test/surface.dart > test/fixtures/surface.edn
 	$(DART) run bin/astdump.dart test/parity.dart > test/fixtures/parity.edn

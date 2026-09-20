@@ -11,6 +11,7 @@
 //   cat snippet.dart | dart run bin/astdump.dart -   snippet mode (stdin)
 //   dart run bin/astdump.dart --version        print the EDN schema version
 //   dart run bin/astdump.dart --resolved f.dart  attempt analysis-session resolution
+//   dart run bin/astdump.dart --types f.dart     resolved unit + :static-type per expression
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -33,14 +34,21 @@ final featureSet = FeatureSet.latestLanguageVersion();
 /// reported positions match the original snippet.
 int _lineOffset = 0;
 
+/// When true, expression nodes carry `:static-type "<rendered type>"` from
+/// the resolved unit (set by `--types`; requires file mode and resolution).
+bool _types = false;
+
 Future<void> main(List<String> args) async {
   var resolved = false;
+  var types = false;
   var fnTypedefs = false;
   String? file;
   final positional = <String>[];
   for (final a in args) {
     if (a == '--resolved') {
       resolved = true;
+    } else if (a == '--types') {
+      types = true;
     } else if (a == '--fn-typedefs') {
       fnTypedefs = true;
     } else if (a == '--version') {
@@ -106,6 +114,24 @@ Future<void> main(List<String> args) async {
   final li = unit.lineInfo;
   _lineOffset = wrapped ? 1 : 0;
 
+  // Typed mode: dump the *resolved* unit so every expression can carry its
+  // static type. Resolution needs a file inside a (possibly pub-get'ed)
+  // project; when it is unavailable the document falls back to the parse-only
+  // unit and no `:static-type` keys are emitted (`:resolved false`).
+  var resolvedTypes = false;
+  if (types) {
+    if (snippet) {
+      stderr.writeln('astdump: --types requires a file argument');
+      exit(2);
+    }
+    final ru = await _resolvedUnit(path);
+    if (ru != null) {
+      unit = ru.unit;
+      resolvedTypes = true;
+    }
+  }
+  _types = types && resolvedTypes;
+
   final buf = StringBuffer();
   buf.write('{:ast-version $astVersion :mode ${snippet ? ':snippet' : ':file'}');
   if (!snippet) buf.write(' :path "${_escape(path)}"');
@@ -117,7 +143,9 @@ Future<void> main(List<String> args) async {
         ':line ${loc.lineNumber - _lineOffset} :col ${loc.columnNumber}} ');
   }
   buf.write('] :resolved ');
-  if (!resolved) {
+  if (types) {
+    buf.write(b(resolvedTypes));
+  } else if (!resolved) {
     buf.write('nil');
   } else {
     buf.write(await _resolvedInfo(path));
@@ -136,20 +164,20 @@ Future<void> main(List<String> args) async {
   stdout.writeln(buf.toString());
 }
 
-Future<String> _resolvedInfo(String path) async {
+Future<ResolvedUnitResult?> _resolvedUnit(String path) async {
   final abs = File(path).absolute.path;
   try {
     final collection = AnalysisContextCollection(includedPaths: [abs]);
     final session = collection.contextFor(abs).currentSession;
     final ru = await session.getResolvedUnit(abs);
-    if (ru is ResolvedUnitResult) {
-      return 'true';
-    }
-    return 'false';
-  } catch (e) {
-    return 'false';
+    return ru is ResolvedUnitResult ? ru : null;
+  } catch (_) {
+    return null;
   }
 }
+
+Future<String> _resolvedInfo(String path) async =>
+    (await _resolvedUnit(path)) == null ? 'false' : 'true';
 
 /// List the names `uris` export as Dart *function* typedefs.
 ///
@@ -203,8 +231,9 @@ Future<void> _fnTypedefs(List<String> args) async {
 
 void _usage() {
   stderr.writeln(
-      'usage: dart run bin/astdump.dart [--resolved] [<file.dart>|-]\n'
+      'usage: dart run bin/astdump.dart [--resolved] [--types] [<file.dart>|-]\n'
       '  no file or "-" reads a Dart snippet from stdin\n'
+      '  --types    dump the resolved unit; expressions get :static-type\n'
       '  --fn-typedefs <ref.dart> <uri>...  function typedefs exported by libs\n'
       '  --version  print the EDN schema version');
 }
@@ -810,9 +839,20 @@ String dump(AstNode node, LineInfo li) {
       f.write(':expr ${dump(wc.expression, li)} ');
 
     default:
-      return dumpGeneric(node, li);
+      return _withType(node, dumpGeneric(node, li));
   }
-  return '{:ast ${kw(node)} $f:src ${srcOf(node, li)}}';
+  return _withType(node, '{:ast ${kw(node)} $f:src ${srcOf(node, li)}}');
+}
+
+/// Inject `:static-type "<rendered>"` into an expression's EDN map when the
+/// resolved unit knows the expression's type (`--types`).
+String _withType(AstNode node, String edn) {
+  if (!_types || node is! Expression) return edn;
+  final t = node.staticType;
+  if (t == null) return edn;
+  final head = '{:ast ${kw(node)}';
+  final rendered = t.getDisplayString(withNullability: true);
+  return '$head :static-type ${s(rendered)}${edn.substring(head.length)}';
 }
 
 // ---------------------------------------------------------------------------

@@ -111,13 +111,17 @@
 (defn astdump-file
   "Dump a Dart file (path) to an astdump EDN document.
 
+  `:types` dumps the analyzer-resolved unit so expression nodes carry
+  `:static-type` (`:resolved false` and no type keys when the file cannot be
+  resolved, e.g. the project is not `pub get`-ed).
+
   `path` is resolved against the caller's directory: the frontend runs with
   its working directory set to the dart2cljd checkout."
   [path opts]
   (let [root (root opts)
         cmd (dart-bin opts)
         path (str (.getAbsoluteFile (io/file path)))]
-    (run-astdump root cmd [path] nil)))
+    (run-astdump root cmd (cond-> [path] (:types opts) (conj "--types")) nil)))
 
 (defn fn-typedefs
   "Set of names `uris` export as Dart *function* typedefs.

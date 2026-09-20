@@ -229,7 +229,11 @@
         (let [base (cond-> {:ir (:ir spec) :src src}
                      (contains? raw :annotations)
                      (assoc :annotations
-                            (mapv normalize-node (:annotations raw))))
+                            (mapv normalize-node (:annotations raw)))
+                     ;; `--types` resolution facts (a rendered analyzer type,
+                     ;; e.g. "String", "Vec", "int?"); parse-only dumps have none.
+                     (contains? raw :static-type)
+                     (assoc :dart-type (:static-type raw)))
               fields (if-let [ov (get overrides tag)]
                        (ov raw)
                        (normalize-fields raw (:fields spec) src))]
