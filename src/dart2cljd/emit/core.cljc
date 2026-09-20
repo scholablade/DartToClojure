@@ -838,6 +838,39 @@
   [node]
   (contains? non-instance-element-kinds (element-kind node)))
 
+(defn- local-write?
+  "True when the resolved *write* element says the target is a local or
+  parameter: Dart locals shadow class members and top-level names, so the
+  instance/static/project-value heuristics must not apply."
+  [node]
+  (contains? #{:local :param} (:dart-element node)))
+
+(defn- converted-field-element?
+  "True when the resolved write element of `node` is a *field* declared by a
+  class this conversion emitted (the current unit or the batch project index),
+  so ClojureDart munged the field's Dart name to `$name_` (RESEARCH M12.2).
+
+  `node` carries the write facts either as `:dart-element` (an assignment
+  target after `with-write-facts`) or as `:dart-write-element` (the raw
+  assignment/increment node)."
+  [node ctx]
+  (let [kind (or (:dart-element node) (:dart-write-element node))]
+    (and (= :field kind)
+         (when-let [cls (:dart-write-field-class node)]
+           (boolean (or (local-class? cls ctx) (project-type-info cls ctx)))))))
+
+(defn- with-write-facts
+  "Copy an assignment/increment node's resolved write facts onto its target
+  node, where the assignment emitters expect them: `:dart-element` is then the
+  element being *written* (`:field`, `:setter`, `:local`, ...) and
+  `:dart-write-field-class` the declaring class of a written field."
+  [target node]
+  (cond-> target
+    (:dart-write-element node)
+    (assoc :dart-element (:dart-write-element node))
+    (:dart-write-field-class node)
+    (assoc :dart-write-field-class (:dart-write-field-class node))))
+
 (defn- widget-fn-info
   "Emission info for a class emitted as an idiomatic widget builder fn."
   [ctx class]
@@ -1311,6 +1344,16 @@
                 (= (str (:class-name ctx))
                    (get-in ctx [:local-types :classes (:name obj)]))))))
 
+(defn- field-write-name
+  "Dart spelling of a field write target: reserved-word fields of converted
+  classes are munged to `$name_` (RESEARCH M12.2). Uses the resolved write
+  facts when present (`converted-field-element?`) and the syntactic
+  this/same-class check otherwise."
+  [node name ctx]
+  (if (converted-field-element? node ctx)
+    (dart-field-name name)
+    name))
+
 (defn- increment-form
   "Build the cljd form for `place++`/`++place` (and --) given the read and
   write forms of the place. Dart evaluates the place once, so the old value
@@ -1397,7 +1440,9 @@
           setter (if (= :index (:ir target))
                    (fn [v] (list '. (emit-expr (:target target) ctx)
                                  "[]=" (emit-expr (:index target) ctx) v))
-                   (fn [v] (list (if (own-instance-field? (:target target) (:name target) ctx)
+                   (fn [v] (list (if (or (converted-field-element? node ctx)
+                                         (own-instance-field? (:target target)
+                                                              (:name target) ctx))
                                    (field-write-sym (:name target))
                                    (symbol (str ".-" (:name target) "!")))
                                  (emit-expr (:target target) ctx) v)))]
@@ -1411,7 +1456,7 @@
   "`x++` / `++x` (and --) preserving Dart value semantics."
   [node ctx prefix?]
   (let [op (if (= "++" (:op node)) 'inc 'dec)
-        target (:operand node)]
+        target (with-write-facts (:operand node) node)]
     (case (:ir target)
       :id
       (let [n (:name target)
@@ -1439,7 +1484,8 @@
 
           (and (or (:ctor-body? ctx) (:in-fn ctx))
                (:this-sym ctx)
-               (contains? (:fields ctx) n))
+               (contains? (:fields ctx) n)
+               (not (local-write? target)))
           (increment-form (list (field-read-sym n) (:this-sym ctx))
                           (fn [v] (list (field-write-sym n) (:this-sym ctx) v))
                           op prefix?)
@@ -1452,7 +1498,20 @@
               (list 'let [(symbol "d2c$old") (list 'deref a)]
                     write (symbol "d2c$old"))))
 
-          sm
+          ;; M12 follow-up: a resolved inherited instance field/setter (Dart
+          ;; innermost-first over same-named top-level/cross-file values).
+          (and (contains? #{:field :setter} (:dart-element target))
+               (:this-sym ctx)
+               (not (local-write? target))
+               (not (contains? (:locals ctx) n))
+               (not (contains? (:fields ctx) n)))
+          (let [dart-name (field-write-name target n ctx)]
+            (increment-form (list (symbol (str ".-" dart-name)) (:this-sym ctx))
+                            (fn [v] (list (symbol (str ".-" dart-name "!"))
+                                          (:this-sym ctx) v))
+                            op prefix?))
+
+          (and sm (not (local-write? target)))
           (let [{:keys [field getter setter]} sm]
             (cond
               field (increment-form field (fn [v] (list 'set! field v)) op prefix?)
@@ -1463,7 +1522,9 @@
                        (fail! node (str n " has no static getter; cannot modify it")))
               :else (fail! node (str n " is not modifiable"))))
 
-          (and (project-value-info n ctx) (not (own-instance-member? n ctx)))
+          (and (project-value-info n ctx)
+               (not (own-instance-member? n ctx))
+               (not (local-write? target)))
           (let [{:keys [kinds] :as info} (project-value-info n ctx)
                 sym (project-value-symbol info n)]
             (cond
@@ -1548,7 +1609,8 @@
 
       (and (or (:ctor-body? ctx) (:in-fn ctx))
            (:this-sym ctx)
-           (contains? (:fields ctx) n))
+           (contains? (:fields ctx) n)
+           (not (local-write? lhs)))
       (assign-slot (list (field-read-sym n) (:this-sym ctx))
                    (fn [v] (list (field-write-sym n) (:this-sym ctx) v))
                    (if (nil? op) "=" op)
@@ -1561,14 +1623,35 @@
       (list 'set! (local-symbol n ctx)
             (user-op-form (local-symbol n ctx) op rhs))
 
-      (contains? (get-in ctx [:unit-info :top-setters]) n)
+      ;; M12 follow-up: a resolved instance field/setter write (inherited from
+      ;; a superclass, possibly another file) is an implicit-`this` write even
+      ;; when a top-level or cross-file value has the same name (Dart
+      ;; innermost-first). Own fields/setters keep their earlier branches.
+      (and (contains? #{:field :setter} (:dart-element lhs))
+           (:this-sym ctx)
+           (not (local-write? lhs))
+           (not (contains? (:locals ctx) n))
+           (not (contains? (:fields ctx) n))
+           (not (contains? (:instance-setters ctx) n)))
+      (let [dart-name (field-write-name lhs n ctx)]
+        (assign-slot (list (symbol (str ".-" dart-name)) (:this-sym ctx))
+                     (fn [v] (list (symbol (str ".-" dart-name "!"))
+                                   (:this-sym ctx) v))
+                     (if (nil? op) "=" op)
+                     rhs
+                     (or (contains? (:string-fields ctx) n)
+                         (= :string (static-kind lhs)))))
+
+      (and (contains? (get-in ctx [:unit-info :top-setters]) n)
+           (not (local-write? lhs)))
       (assign-static {:read (when (contains? (get-in ctx [:unit-info :top-getters]) n)
                               (list (symbol n)))
                       :write (fn [v] (list (symbol (str "set-" n "!")) v))}
                      op rhs lhs)
 
       (and (:this-sym ctx)
-           (contains? (:instance-setters ctx) n))
+           (contains? (:instance-setters ctx) n)
+           (not (local-write? lhs)))
       (assign-static {:read (when (contains? (:instance-getters ctx) n)
                               (list (symbol (str ".-" n)) (:this-sym ctx)))
                       :write (fn [v] (list (symbol (str ".-" n "!")) (:this-sym ctx) v))}
@@ -1645,7 +1728,13 @@
 (defn- assign-prop [lhs op rhs ctx]
   (let [obj (:target lhs)
         name (:name lhs)
-        dart-name (if (own-instance-field? obj name ctx) (dart-field-name name) name)
+        ;; M12 follow-up: the resolved write element may be a field of a
+        ;; converted class even when the receiver is not the current class
+        ;; (`item.base = 1` from another file).
+        dart-name (if (or (converted-field-element? lhs ctx)
+                          (own-instance-field? obj name ctx))
+                    (dart-field-name name)
+                    name)
         read (list (symbol (str ".-" dart-name)) (emit-expr obj ctx))
         write (fn [v] (list (symbol (str ".-" dart-name "!")) (emit-expr obj ctx) v))]
     (assign-slot read write op rhs (string-expr? lhs ctx))))
@@ -1674,7 +1763,8 @@
     (fail! lhs "unsupported assignment target")))
 
 (defn- emit-assign [node ctx]
-  (assign-write (:lhs node) (:op node) (emit-expr (:rhs node) ctx) ctx))
+  (assign-write (with-write-facts (:lhs node) node)
+                (:op node) (emit-expr (:rhs node) ctx) ctx))
 
 (defn emit-expr-stmt
   "Emit an expression in statement position: increments drop their
@@ -1908,7 +1998,8 @@
     :assign (let [{:keys [lhs op rhs]} s
                   value (emit-expr rhs ctx)
                   name (:name lhs)
-                  write (if (own-instance-field? target name ctx)
+                  write (if (or (converted-field-element? s ctx)
+                                (own-instance-field? target name ctx))
                           (field-write-sym name)
                           (symbol (str ".-" name "!")))]
               (when-not (= "=" op)

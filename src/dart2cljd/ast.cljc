@@ -238,7 +238,14 @@
                      ;; (`:local`, `:param`, instance/static/top-level members,
                      ;; `:class`, `:ctor`, ...); see ir.cljc for the table.
                      (contains? raw :element)
-                     (assoc :dart-element (:element raw)))
+                     (assoc :dart-element (:element raw))
+                     ;; `--types` write facts on assignment/increment nodes:
+                     ;; the element being written and, for fields, the class
+                     ;; declaring it (ClojureDart munges field names).
+                     (contains? raw :write-element)
+                     (assoc :dart-write-element (:write-element raw))
+                     (contains? raw :write-field-class)
+                     (assoc :dart-write-field-class (:write-field-class raw)))
               fields (if-let [ov (get overrides tag)]
                        (ov raw)
                        (normalize-fields raw (:fields spec) src))]
@@ -273,4 +280,5 @@
      (fail! :input "astdump output has no :unit" {}))
    (-> doc
        (assoc :unit (normalize-node (:unit doc)))
-       (select-keys [:ast-version :mode :path :errors :resolved :unit]))))
+       (select-keys [:ast-version :mode :path :errors :resolved
+                     :fn-typedefs :unit]))))

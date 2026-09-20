@@ -526,13 +526,14 @@
 ;; per-file conversion
 ;; ---------------------------------------------------------------------------
 
-(defn parse-unit
-  "Parse a Dart file (path relative to `:dir`) and return its normalized unit.
+(defn parse-doc
+  "Parse a Dart file (path relative to `:dir`) and return its normalized
+  astdump document.
 
   With `:types` the frontend dumps the analyzer-resolved unit (expression
-  `:static-type` facts); when the file cannot be resolved the conversion falls
-  back to the syntactic passes and warns, so a missing `dart pub get` in the
-  source project is visible."
+  `:static-type`/`:element` facts and the unit's `:fn-typedefs`); when the file
+  cannot be resolved the conversion falls back to the syntactic passes and
+  warns, so a missing `dart pub get` in the source project is visible."
   [rel opts]
   (let [path (java.io.File. (str (:dir opts)) rel)
         doc (frontend/astdump-file (.getPath path) opts)]
@@ -540,7 +541,12 @@
       (println (str "dart2cljd: warning: --types could not resolve " rel
                     " (run `dart pub get` in the source project); using the "
                     "syntactic passes for it")))
-    (:unit (ast/normalize-doc doc))))
+    (ast/normalize-doc doc)))
+
+(defn parse-unit
+  "Parse a Dart file and return its normalized unit (see `parse-doc`)."
+  [rel opts]
+  (:unit (parse-doc rel opts)))
 
 (defn- emit-source
   "Emit one unit for batch output (ns from the path, project index attached,
@@ -699,7 +705,11 @@
   element, so the emitter maps these names to `Function` (RESEARCH M8.10).
   Returns #{} when nothing external is imported or the source project cannot
   be resolved (e.g. no `pub get`): conversion then behaves exactly as before,
-  and any such hint fails loudly at compile time."
+  and any such hint fails loudly at compile time.
+
+  With `:types` this pass is unnecessary: the typed dump resolves the same
+  typedefs per file (`:fn-typedefs` in the document), so `convert-dir` uses
+  those instead and only falls back here for parse-only runs."
   [index parsed {:keys [dir] :as opts}]
   (let [uris (:external-imports index)]
     (if (empty? uris)
@@ -717,6 +727,13 @@
                           "); hints naming Dart function typedefs will fail in "
                           "ClojureDart's analyzer helper"))
             #{}))))))
+
+(defn- doc-fn-typedefs
+  "Union of the per-file `:fn-typedefs` facts the typed dumps carry
+  (M12 follow-up); `parsed` entries are `{:file rel :fn-typedefs #{...}}` (a
+  file that failed to parse contributes nothing)."
+  [parsed]
+  (into #{} (mapcat :fn-typedefs) parsed))
 
 (defn convert-dir
   "Translate every Dart file under `:dir` into `:out`.
@@ -763,18 +780,27 @@
         opts (assoc opts :package (or (:package opts) (pubspec-package (:dir opts))))
         parsed (mapv (fn [rel]
                        (try
-                         {:file rel :unit (parse-unit rel opts)}
+                         (let [doc (parse-doc rel opts)]
+                           {:file rel :unit (:unit doc)
+                            :fn-typedefs (into #{} (mapcat val (:fn-typedefs doc)))})
                          (catch Exception e {:file rel :error e})))
                      files)
         ok (into [] (filter :unit) parsed)
         parse-failed (into [] (remove :unit) parsed)
-        grouped (library/group ok {:excluded (set (map :file skipped))
-                                   :parse-failed (set (map :file parse-failed))})
+        grouped (library/group (mapv #(select-keys % [:file :unit]) ok)
+                               {:excluded (set (map :file skipped))
+                                :parse-failed (set (map :file parse-failed))})
         libs (:libraries grouped)
         lib-ok (into [] (remove :error) libs)
         lib-failed (into [] (filter :error) libs)
         index (build-index (mapv #(select-keys % [:file :unit]) lib-ok) opts)
-        index (assoc index :fn-typedefs (resolve-fn-typedefs index lib-ok opts))
+        ;; With `:types` the per-file typed dumps already carry the function
+        ;; typedefs of the tree's external imports, so the separate
+        ;; `frontend/fn-typedefs` resolver pass is skipped (M12 follow-up).
+        index (assoc index :fn-typedefs
+                     (if (:types opts)
+                       (doc-fn-typedefs parsed)
+                       (resolve-fn-typedefs index lib-ok opts)))
         shim (write-exports-shim! opts index)
         warnings (cond-> (:warnings index)
                    (and (seq (mapcat :external (vals (:exports index))))

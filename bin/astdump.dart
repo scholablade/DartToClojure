@@ -18,6 +18,7 @@ import 'dart:io';
 import 'package:analyzer/dart/analysis/analysis_context_collection.dart';
 import 'package:analyzer/dart/analysis/features.dart';
 import 'package:analyzer/dart/analysis/results.dart';
+import 'package:analyzer/dart/analysis/session.dart';
 import 'package:analyzer/dart/analysis/utilities.dart';
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/token.dart';
@@ -40,14 +41,14 @@ bool _types = false;
 
 Future<void> main(List<String> args) async {
   var types = false;
-  var fnTypedefs = false;
+  var fnTypedefsMode = false;
   String? file;
   final positional = <String>[];
   for (final a in args) {
     if (a == '--types') {
       types = true;
     } else if (a == '--fn-typedefs') {
-      fnTypedefs = true;
+      fnTypedefsMode = true;
     } else if (a == '--version') {
       stdout.writeln(':ast-version $astVersion');
       return;
@@ -62,7 +63,7 @@ Future<void> main(List<String> args) async {
       file = a;
     }
   }
-  if (fnTypedefs) {
+  if (fnTypedefsMode) {
     await _fnTypedefs(positional);
     return;
   }
@@ -112,10 +113,12 @@ Future<void> main(List<String> args) async {
   _lineOffset = wrapped ? 1 : 0;
 
   // Typed mode: dump the *resolved* unit so every expression can carry its
-  // static type. Resolution needs a file inside a (possibly pub-get'ed)
-  // project; when it is unavailable the document falls back to the parse-only
-  // unit and no `:static-type` keys are emitted (`:resolved false`).
+  // static type and every named node its element kind. Resolution needs a file
+  // inside a (possibly pub-get'ed) project; when it is unavailable the document
+  // falls back to the parse-only unit and no fact keys are emitted
+  // (`:resolved false`).
   var resolvedTypes = false;
+  var fnTypedefs = <String, Set<String>>{};
   if (types) {
     if (snippet) {
       stderr.writeln('astdump: --types requires a file argument');
@@ -125,6 +128,12 @@ Future<void> main(List<String> args) async {
     if (ru != null) {
       unit = ru.unit;
       resolvedTypes = true;
+      // Function typedefs of the external imports: ClojureDart's analyzer
+      // helper crashes on such elements, so the emitter maps them to
+      // `Function` (M8.10). Resolving them here folds the separate
+      // `--fn-typedefs` pass into the typed dump (cheap: the libraries are
+      // already resolved for the unit).
+      fnTypedefs = await _fnTypedefsByUri(ru.session, _externalImportUris(unit));
     }
   }
   _types = types && resolvedTypes;
@@ -142,6 +151,7 @@ Future<void> main(List<String> args) async {
   buf.write('] :resolved ');
   if (types) {
     buf.write(b(resolvedTypes));
+    buf.write(' :fn-typedefs ${_fnTypedefsEdn(fnTypedefs)}');
   } else {
     buf.write('nil');
   }
@@ -169,6 +179,58 @@ Future<ResolvedUnitResult?> _resolvedUnit(String path) async {
   } catch (_) {
     return null;
   }
+}
+
+/// External (`dart:`/`package:`) import URIs of a unit, sorted and unique.
+List<String> _externalImportUris(CompilationUnit unit) {
+  final uris = <String>{};
+  for (final d in unit.directives) {
+    if (d is ImportDirective) {
+      final uri = d.uri.stringValue;
+      if (uri != null &&
+          (uri.startsWith('dart:') || uri.startsWith('package:'))) {
+        uris.add(uri);
+      }
+    }
+  }
+  return uris.toList()..sort();
+}
+
+/// Function typedefs exported by each URI (`{}` when none); the names and
+/// URIs are sorted at emission.
+Future<Map<String, Set<String>>> _fnTypedefsByUri(
+    AnalysisSession session, List<String> uris) async {
+  final out = <String, Set<String>>{};
+  for (final uri in uris) {
+    final names = <String>{};
+    try {
+      final res = await session.getLibraryByUri(uri);
+      if (res is LibraryElementResult) {
+        for (final e in res.element.exportNamespace.definedNames2.values) {
+          if (e is TypeAliasElement && e.aliasedType is! InterfaceType) {
+            final n = e.name;
+            if (n != null && n.isNotEmpty) names.add(n);
+          }
+        }
+      }
+    } catch (_) {
+      // Unresolvable URI: keep the name out (the compile gate fails loudly
+      // later if a hint actually needs it).
+    }
+    if (names.isNotEmpty) {
+      out[uri] = names;
+    }
+  }
+  return out;
+}
+
+String _fnTypedefsEdn(Map<String, Set<String>> m) {
+  if (m.isEmpty) return '{}';
+  final keys = m.keys.toList()..sort();
+  return '{${keys.map((u) {
+    final names = m[u]!.toList()..sort();
+    return '"${_escape(u)}" #{${names.map((n) => '"${_escape(n)}"').join(' ')}}';
+  }).join(' ')}}';
 }
 
 /// List the names `uris` export as Dart *function* typedefs.
@@ -836,9 +898,10 @@ String dump(AstNode node, LineInfo li) {
   return _withFacts(node, '{:ast ${kw(node)} $f:src ${srcOf(node, li)}}');
 }
 
-/// Inject the resolved facts (`:static-type`, `:element`) into a node's EDN
-/// map when `--types` resolution knows them. Parse-only and unresolved nodes
-/// emit nothing, so untyped output is byte-identical to before.
+/// Inject the resolved facts (`:static-type`, `:element`, `:write-element`,
+/// `:write-field-class`) into a node's EDN map when `--types` resolution knows
+/// them. Parse-only and unresolved nodes emit nothing, so untyped output is
+/// byte-identical to before.
 String _withFacts(AstNode node, String edn) {
   if (!_types) return edn;
   var facts = '';
@@ -850,9 +913,32 @@ String _withFacts(AstNode node, String edn) {
   }
   final kind = _elementKind(_namedElement(node));
   if (kind != null) facts += ' :element $kind';
+  // Write facts for assignment/increment nodes: the element written (locals,
+  // fields, setters, top-level variables) and, for fields, the declaring class
+  // (the emitter needs it to reproduce ClojureDart's `$name_` munging).
+  if (node is CompoundAssignmentExpression) {
+    final we = node.writeElement;
+    final wk = _elementKind(we);
+    if (wk != null) facts += ' :write-element $wk';
+    final wc = _fieldClass(we);
+    if (wc != null) facts += ' :write-field-class ${s(wc)}';
+  }
   if (facts.isEmpty) return edn;
   final head = '{:ast ${kw(node)}';
   return '$head$facts${edn.substring(head.length)}';
+}
+
+/// Class declaring a field write target: the write element of a *field* is the
+/// field's synthetic accessor (`isOriginVariable`), whose enclosing element is
+/// the declaring class/mixin/enum. Declared getters/setters have
+/// `isOriginVariable == false` (their Dart name is not munged), and top-level
+/// variables are enclosed by the library (not an interface).
+String? _fieldClass(Element? e) {
+  if (e is PropertyAccessorElement && e.isOriginVariable) {
+    final owner = e.enclosingElement;
+    if (owner is InterfaceElement) return owner.name;
+  }
+  return null;
 }
 
 /// The element of the *name a node refers to*, for the node kinds where the
@@ -870,7 +956,10 @@ Element? _namedElement(AstNode node) {
 /// Deterministic element-kind keyword for a resolved name (`--types`), or
 /// null when the kind is unknown/unmapped. Instance members (`:field`,
 /// `:getter`, `:setter`, `:method`) are implicit-`this` accesses; the
-/// `:static-*`, `:top-*` kinds are not. See `ir.cljc` for the full table.
+/// `:static-*`, `:top-*` kinds are not. `:field`/`:static-field` are the
+/// synthetic accessors of a *field* (`isOriginVariable`), which ClojureDart
+/// munges to `$name_`; declared getters/setters are `:getter`/`:setter`.
+/// See `ir.cljc` for the full table.
 String? _elementKind(Element? e) {
   if (e == null) return null;
   if (e is LocalVariableElement) return ':local';
@@ -884,7 +973,12 @@ String? _elementKind(Element? e) {
     if (e.enclosingElement is LibraryElement) {
       return getter ? ':top-getter' : ':top-setter';
     }
-    if (e.isStatic) return getter ? ':static-getter' : ':static-setter';
+    if (e.isStatic) {
+      return e.isOriginVariable
+          ? ':static-field'
+          : (getter ? ':static-getter' : ':static-setter');
+    }
+    if (e.isOriginVariable) return ':field';
     return getter ? ':getter' : ':setter';
   }
   if (e is ConstructorElement) return ':ctor';

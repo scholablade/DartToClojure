@@ -43,10 +43,13 @@
 
   Resolved facts (present only for `astdump --types` dumps)
   ---------------------------------------------------------
-  Two cross-cutting annotations are attached to IR nodes when the resolved
-  unit knows them (parse-only dumps carry neither):
-    :dart-type     rendered static type of an expression (M11)
-    :dart-element  what a name refers to (M12)
+  Cross-cutting annotations attached to IR nodes when the resolved unit knows
+  them (parse-only dumps carry none):
+    :dart-type              rendered static type of an expression (M11)
+    :dart-element           what a name refers to (M12)
+    :dart-write-element     what an assignment/increment writes (M12 follow-up)
+    :dart-write-field-class class declaring a written field, for the
+                            ClojureDart `$name_` munging (M12 follow-up)
 
   `:dart-element` is one of, from the analyzer element classes:
     :local :param                       LocalVariableElement /
@@ -57,7 +60,10 @@
                                         LibraryElement (top-level getter/setter,
                                         incl. the implicit accessors of a
                                         top-level variable)
-    :method :getter :setter :field      instance members of a class/mixin/enum
+    :method :getter :setter             instance members of a class/mixin/enum
+    :field                              the synthetic accessor of an instance
+                                        *field* (`isOriginVariable`), which
+                                        ClojureDart munges to `$name_`
     :static-method :static-getter       static members
     :static-setter :static-field
     :class :mixin :enum :typedef        type references
@@ -65,6 +71,10 @@
     :type-param :prefix :label          type parameters, import prefixes, labels
   Instance members (`:method :getter :setter :field`) are implicit-`this`
   accesses in Dart; the other kinds are not. Unmapped elements emit nothing.
+  `:dart-write-element` uses the same keyword set on assignment/increment
+  nodes (`AssignmentExpression.writeElement`, `PrefixExpression`/
+  `PostfixExpression`), so a write can be told apart from a read of the same
+  name (a field write is `:field`, a local write `:local`).
 
   This namespace is pure data; normalization logic lives in dart2cljd.ast."
   (:refer-clojure :exclude []))

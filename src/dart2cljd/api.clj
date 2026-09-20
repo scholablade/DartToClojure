@@ -156,18 +156,22 @@
 
   A library file's `part` files are read and merged into the output (one
   namespace per library, M9); a `part of` file cannot be converted on its
-  own."
+  own. In typed mode (`:types true`) the frontend's per-file function-typedef
+  facts are passed through, so external function typedefs become `Function`
+  hints without the separate `--fn-typedefs` pass (M12 follow-up)."
   [path & args]
   (let [opts (kwargs->map args)
         doc (ast/normalize-doc (astdump-file path opts) opts)
-        unit (:unit doc)]
+        unit (:unit doc)
+        fn-typedefs (into #{} (mapcat val (:fn-typedefs doc)))]
     (when (library/part-of-directive unit)
       (throw (ex-info (str "dart2cljd: " path " is a `part of` file; convert its "
                            "library file instead (parts share a library's "
                            "namespace)")
                       {:dart2cljd/kind :library :file path})))
     (convert-doc (assoc doc :unit (merge-file-parts path unit opts))
-                 (assoc opts :path path))))
+                 (cond-> (assoc opts :path path)
+                   (seq fn-typedefs) (assoc :fn-typedefs fn-typedefs)))))
 
 (defn convert-dir
   "Batch mode (M6): translate a whole Dart directory tree.
