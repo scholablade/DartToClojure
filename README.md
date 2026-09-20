@@ -314,9 +314,14 @@ These are deliberate and recorded with their probe evidence in
   Initializers that reference `this` (`vsync: this`) are assigned through
   `this` after the constructor body, in declaration order — eager instead of
   Dart's lazy-on-first-read. See RESEARCH M8.9.
-- Dart `String +=` maps to the numeric `+` compound operator (use
-  `s = '$s$t'` or `(str …)` in the source); general operator semantics still
-  depend on the syntactic type pass (RESEARCH R2/C2).
+- `String +`/`+=` concatenate: String locals/parameters, implicit-this and
+  idiomatic state fields, literals/interpolations and `toString`-style
+  operands are tracked syntactically and emitted as `str` (RESEARCH M10.1).
+  A receiver whose type is unknown syntactically (`dynamic`, an external
+  field, a call result) keeps the numeric `+` and fails loudly at runtime if
+  it is a String; same-unit String statics and top-level String values are
+  not tracked. General operator semantics still depend on the syntactic type
+  pass (RESEARCH R2/C2).
 - Non-const records are wrapped in `cljd.core/identity` (upstream compiler bug).
 - User-operator dispatch uses a syntactic type pass plus `dart/is?` guards for
   unknown *identifier* receivers; compound assignments and operators on other
@@ -368,7 +373,7 @@ These are deliberate and recorded with their probe evidence in
   mixin-with-fields inlining, `part`/`part of` library assembly, C-style
   collection-for and collection-element splicing, statement-for fixes) and
   the analyzer-triage fixes are covered by
-  `make gate` fixtures (`corpus/m3.dart`, `test/batchproj/`, 37 runtime
+  `make gate` fixtures (`corpus/m3.dart`, `test/batchproj/`, 40 runtime
   checks). The generated probe tree converts 34/34, compiles, and
   `dart analyze` reports 3 residual errors — all the documented upstream
   ClojureDart `^super` cast in classes that apply an external mixin
