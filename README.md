@@ -154,6 +154,13 @@ external class):
 | `int`/`double`/`num` | plain numeric arithmetic, no runtime `dart/is?` guard |
 | `dynamic`/unknown | the syntactic heuristics (guarded dispatch, numeric fallback) |
 
+The same dump carries `:element`, *what a name refers to* (instance member vs
+top-level value vs static vs type), which settles the remaining implicit-`this`
+ambiguities: an instance member inherited from outside the converted tree wins
+over a same-named cross-file top-level value (Dart innermost-first), and a
+top-level function/getter (e.g. unaliased `dart:math`'s `max`/`pi`) routes
+through the imports/exports shim instead of becoming `(.-max this …)`.
+
 ```console
 $ dart2cljd --types -p lib/vec.dart
 ```
@@ -297,6 +304,7 @@ corpus/                 .dart inputs + reviewed .cljd outputs + manifest
 verify/                 cljd Flutter project used by the compile gate
 test/                   unit + golden tests, fixtures, integration corpora
 test/batchproj/         M6 directory fixture (relative/package imports, part file)
+corpus/typedproj/       M12 typed directory fixture (element kinds, `--types`)
 RESEARCH.md             compiler probes and the decisions they bind
 ```
 
@@ -357,9 +365,10 @@ These are deliberate and recorded with their probe evidence in
   functions/getters/setters/vars and static members (reads, calls, writes and
   increments). Duplicate type/value names across files are a warning with
   first-wins by sorted path. Remaining batch approximations: a typedef whose
-  target is a bare type parameter fails loudly at use sites; instance members
-  inherited from outside the converted tree are invisible to the syntactic
-  pass, so a cross-file value with the same name wins over them.
+  target is a bare type parameter fails loudly at use sites; in parse-only
+  mode instance members inherited from outside the converted tree are
+  invisible to the syntactic pass, so a cross-file value with the same name
+  wins over them (`--types` fixes this exactly, see above).
 - External *function typedefs* (`VoidCallback`, `ValueChanged<T>`, ...) are
   emitted as `Function` hints. Batch mode resolves them through the analyzer
   once per run (`--fn-typedefs` frontend mode; the source project must be
@@ -367,9 +376,14 @@ These are deliberate and recorded with their probe evidence in
   fails loudly); ClojureDart's analyzer helper cannot resolve function-typedef
   elements (RESEARCH M8.10). Class hints (`^m/Widget`) are unaffected.
 - Fields named after Dart reserved words/built-in identifiers (`base`,
-  `class`, `late`, ...) are munged by ClojureDart (`$base_`); `.-field!`
-  setters generated for constructor bodies/late initializers do not follow the
-  munging and fail at runtime (RESEARCH M8.12).
+  `late`, ...) are munged by ClojureDart (`$base_`); the emitter reproduces
+  the munging for every `this`-routed write (constructor bodies, closures,
+  `this.x = v`, `this.x++`, cascades, `late` initializers) and for writes
+  through a local syntactically known to hold the current class (RESEARCH
+  M12.2). A write through a receiver of unknown type (another file's instance,
+  `dynamic`) keeps the plain `.-x!` spelling; ClojureDart's setter path does
+  not munge it, so such a write to a reserved-name field fails at runtime
+  (loudly).
 - The astdump frontend is run through a kernel snapshot cached in
   `.dart2cljd-cache/` (`dart run` re-JITs `package:analyzer` at ~40 s per
   call; the snapshot is ~1.3 s and is rebuilt when `bin/astdump.dart`
@@ -393,12 +407,13 @@ These are deliberate and recorded with their probe evidence in
 - `~/` emits the Dart interop operator `(. a "~/" b)` instead of
   `cljd.core/quot`: `quot` is declared `^num` although Dart's `num.~/`
   returns `int`, so int contexts (`int f() => (a ~/ 2).clamp(0, n)`) failed.
-- M8/M9 batch features (barrel `export` support + exports shim over imports,
-  mixin-with-fields inlining, `part`/`part of` library assembly, C-style
-  collection-for and collection-element splicing, statement-for fixes) and
-  the analyzer-triage fixes are covered by
-  `make gate` fixtures (`corpus/m3.dart`, `test/batchproj/`, 40 runtime
-  checks). The generated probe tree converts 34/34, compiles, and
-  `dart analyze` reports 3 residual errors — all the documented upstream
-  ClojureDart `^super` cast in classes that apply an external mixin
-  (RESEARCH M8.18).
+- M8/M9/M12 batch features (barrel `export` support + exports shim over
+  imports, mixin-with-fields inlining, `part`/`part of` library assembly,
+  C-style collection-for and collection-element splicing, statement-for
+  fixes, typed element-kind routing, reserved-word field munging) and the
+  analyzer-triage fixes are covered by
+  `make gate` fixtures (`corpus/m3.dart`, `test/batchproj/`,
+  `corpus/typedproj/`, 43 runtime checks). The generated probe tree converts
+  34/34, compiles, and `dart analyze` reports 3 residual errors — all the
+  documented upstream ClojureDart `^super` cast in classes that apply an
+  external mixin (RESEARCH M8.18).
