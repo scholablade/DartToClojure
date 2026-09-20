@@ -69,6 +69,7 @@ The CLI keeps DartClojure's flag surface, so editor integrations port over:
 | `--package NAME` | batch mode: Dart package name (default: nearest `pubspec.yaml`) |
 | `--exports-file PATH` | batch mode: write the external imports/exports Dart shim here |
 | `--exports-uri URI` | batch mode: URI under which generated code requires that shim |
+| `--types` | file/batch modes: use analyzer-resolved static types (see below) |
 
 ### Batch conversion (`--dir`)
 
@@ -137,6 +138,29 @@ Dart `with` clause. Generic mixins drop their type parameters (ClojureDart
 has no bounds support); members that reference a type parameter, static mixin
 members, `super` calls in mixin methods and member name collisions fail
 loudly.
+
+### Resolved static types (`--types`)
+
+File (`-p`) and batch (`--dir`) modes accept `--types`: the frontend dumps the
+analyzer-resolved unit and every expression carries its static type, which the
+emitter uses for decisions the syntactic passes cannot make (the type of a
+call result, another object's field, a static field, a top-level getter, an
+external class):
+
+| Resolved type of the receiver | Emission |
+|---|---|
+| `String` (either operand of `+`) | `(str …)` concatenation, also for `+=` |
+| a class (unit, project or external) | the operator interop call `(. recv + arg)` |
+| `int`/`double`/`num` | plain numeric arithmetic, no runtime `dart/is?` guard |
+| `dynamic`/unknown | the syntactic heuristics (guarded dispatch, numeric fallback) |
+
+```console
+$ dart2cljd --types -p lib/vec.dart
+```
+
+Resolution needs the source project to be resolvable (`dart pub get`); a file
+that cannot be resolved warns and falls back to the syntactic passes (never
+to garbage). `--types` requires a file: snippets cannot be resolved.
 
 ### API
 
