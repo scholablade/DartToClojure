@@ -743,9 +743,12 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- emit-catch [c ctx]
+  ;; A bare Dart `catch` becomes `on Object` (not `on dynamic`): Dart can only
+  ;; throw non-null objects, and `dynamic` in an `on` clause is a
+  ;; `nullable_type_in_catch_clause` warning.
   (let [ty (if (:exception-type c)
              (core/type-symbol (:exception-type c) ctx)
-             'dynamic)
+             'Object)
         e (core/local-symbol (or (:exception-var c) "_") ctx)
         st (when (:stack-var c) (core/local-symbol (:stack-var c) ctx))
         ctx' (assoc ctx :catch-exception e)

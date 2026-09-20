@@ -181,7 +181,7 @@
            "s_else_if" "(defn s_else_if [^int a]\n  (cond (> a 0) (do (print \"pos\") nil) (< a 0) (do (print \"neg\") nil) :else (do (print \"zero\") nil)))"
            "s_for_in" "(defn s_for_in [xs]\n  (doseq [x xs] (print x)))"
            "s_switch" "(defn s_switch [^int x]\n  (case x\n    1 (do (print \"one\") nil)\n    2 (do (print \"2or3\") nil)\n    3 (do (print \"2or3\") nil)\n    (do (print \"other\") nil)))"
-           "s_try" "(defn s_try []\n  (try\n    (print 1)\n    nil\n    (catch StateError e st (print e) nil)\n    (catch dynamic e (print e) nil)\n    (finally (print 2))))"
+           "s_try" "(defn s_try []\n  (try\n    (print 1)\n    nil\n    (catch StateError e st (print e) nil)\n    (catch Object e (print e) nil)\n    (finally (print 2))))"
            "s_return" "(defn s_return [^int a]\n  (+ a 1))"
            "s_expr_body" "(defn s_expr_body [^int a]\n  (* a 2))"
            "s_vars" "(defn s_vars []\n  (let [a 1 b 2] (print (+ a b)) nil))"
