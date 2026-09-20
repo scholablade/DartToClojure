@@ -34,6 +34,7 @@
             [dart2cljd.ast :as ast]
             [dart2cljd.batch :as batch]
             [dart2cljd.emit.decls :as decls]
+            [dart2cljd.library :as library]
             [dart2cljd.printer :as printer]))
 
 (def ^:private default-timeout 1800)
@@ -137,6 +138,11 @@
     (let [doc (api/astdump-file (str "corpus/" name ".dart") {:root root})
           unit (:unit (ast/normalize-doc doc))
           out (io/file root "verify/src/verify/gen" (str name ".cljd"))]
+      (when (seq (library/part-uris unit))
+        (throw (ex-info (str "dart2cljd.verify: corpus/" name ".dart has `part` "
+                             "directives; file entries are translated without "
+                             "part merging — use a :kind :dir entry")
+                        {:dart2cljd/kind :verify :file (str name ".dart")})))
       (io/make-parents out)
       (spit out (str (gen-source unit entry) "\n"))
       (.getPath out))))

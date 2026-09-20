@@ -17,9 +17,11 @@
   (`foo/bar_baz.dart` -> `foo.bar-baz`), so the generated tree compiles as a
   ClojureDart source tree.
 
-  Directive policy: `part`, `part of` and `export` are not representable in
-  ClojureDart and fail loudly per file; `library` names are ignored (the
-  generated ns comes from the output path).
+  Directive policy: `part`/`part of` libraries are assembled before emission
+  (M9: a library's part declarations are merged into its namespace and part
+  files produce no output of their own); `export` is supported through the
+  generated exports shim; `library` names are ignored (the generated ns comes
+  from the output path).
 
   Public entry point: `convert-dir`. The map it returns is pure data (the CLI
   prints it); nothing here calls System/exit."
@@ -31,6 +33,7 @@
             [dart2cljd.emit.decls :as decls]
             [dart2cljd.frontend :as frontend]
             [dart2cljd.idiomatic :as idiomatic]
+            [dart2cljd.library :as library]
             [dart2cljd.printer :as printer])
   (:import (java.nio.file FileSystems PathMatcher Paths)))
 
@@ -105,24 +108,23 @@
     (symbol (str (when ns-prefix (str ns-prefix "."))
                  (str/join "." (map #(str/replace % "_" "-") segments))))))
 
-(def ^:private unsupported-directives
-  {:part "`part` directives are not supported by ClojureDart; merge the part files by hand"
-   :part-of "`part of` files are not supported by ClojureDart; merge the part files by hand"})
+(defn resolve-relative
+  "Resolve a relative Dart URI against the declaring file's directory (both
+  relative to `:dir`). Returns the normalized relative path, or
+  `:dart2cljd.batch/missing` when the URI escapes the converted tree."
+  [file uri]
+  (let [rel (library/resolve-relative file uri)]
+    (if (= rel library/missing)
+      ::missing
+      rel)))
 
-(defn check-directives!
-  "Fail loudly when a unit carries a directive the translator cannot
-  represent (`part`, `part of`, `export`)."
-  [unit rel]
-  (doseq [d (:directives unit)
-          :let [kind (:ir d)]
-          :when (contains? unsupported-directives kind)]
-    (let [{:keys [line col]} (:src d)]
-      (throw (ex-info (str "dart2cljd: " (get unsupported-directives kind)
-                           (when (and line col) (str " at " line ":" col)))
-                      {:dart2cljd/kind :batch
-                       :file rel
-                       :directive kind
-                       :node d})))))
+(defn library-units
+  "Group parsed files into libraries with their `part` files merged (M9).
+
+  See `dart2cljd.library/group`; `opts` may carry `:excluded` and
+  `:parse-failed` sets. Returns `{:libraries :parts :errors}`."
+  [parsed opts]
+  (library/group parsed opts))
 
 ;; ---------------------------------------------------------------------------
 ;; package name (for own-`package:` import resolution)
@@ -142,26 +144,6 @@
 ;; ---------------------------------------------------------------------------
 ;; project index (cross-file correctness, M6 phase 2)
 ;; ---------------------------------------------------------------------------
-
-(defn- parent-dir [rel]
-  (str/join "/" (butlast (str/split rel #"/"))))
-
-(defn resolve-relative
-  "Resolve a relative Dart import URI against the importing file's directory
-  (both relative to `:dir`). Returns the normalized relative path, or
-  ::missing when the URI escapes the converted tree."
-  [file uri]
-  (let [dir (parent-dir file)
-        parts (concat (when (seq dir) (str/split dir #"/"))
-                      (str/split uri #"/"))]
-    (loop [ps parts out []]
-      (cond
-        (empty? ps) (str/join "/" out)
-        (= (first ps) ".") (recur (rest ps) out)
-        (= (first ps) "..") (if (seq out)
-                              (recur (rest ps) (pop out))
-                              ::missing)
-        :else (recur (rest ps) (conj out (first ps)))))))
 
 (defn project-target
   "Generated ns for an import URI that points into the converted tree, nil
@@ -186,6 +168,13 @@
   (for [d (:decls unit)
         :when (contains? #{:class :enum :mixin :type-alias} (:ir d))]
     [(:name d) (:ir d)]))
+
+(defn- private-name?
+  "Dart private names (`_x`) are library-scoped: they can never be referenced
+  from another converted file, so the project index leaves them out (no
+  spurious duplicate warnings when two libraries each declare `_helper`)."
+  [n]
+  (and (string? n) (str/starts-with? n "_")))
 
 ;; ---------------------------------------------------------------------------
 ;; exports (barrel files)
@@ -377,17 +366,20 @@
                             widgets (when (= :idiomatic (:mode opts))
                                       (:widgets (idiomatic/plan unit)))
                             ns (get file->ns file)]
-                      [name kind] (declared-types unit)]
+                      [name kind] (declared-types unit)
+                      :when (not (private-name? name))]
                   {:file file :name name
                    :info (type-info name ns kind (get widgets name) ui)})
         value-entries (for [{:keys [file unit]} parsed
                             :let [ns (get file->ns file)
                                   ui (decls/unit-info unit)]
-                            [name info] (values-map ns ui)]
+                            [name info] (values-map ns ui)
+                            :when (not (private-name? name))]
                         {:file file :name name :info info})
         mixin-entries (for [{:keys [file unit]} parsed
                             d (:decls unit)
-                            :when (= :mixin (:ir d))]
+                            :when (and (= :mixin (:ir d))
+                                       (not (private-name? (:name d))))]
                         {:file file :name (:name d)
                          :info {:decl d :kind :mixin
                                 :ns (get file->ns file)}})
@@ -584,7 +576,6 @@
 
   Returns `{:file rel :out path :ns ns}`."
   [rel unit index {:keys [out exports-uri] :as opts}]
-  (check-directives! unit rel)
   (let [missing (get-in index [:exports rel :missing])]
     (when (seq missing)
       (let [uri (first missing)]
@@ -681,9 +672,11 @@
 ;; ---------------------------------------------------------------------------
 
 (defn summary
-  "Deterministic one-line report: `converted N, skipped M, failed K`."
-  [{:keys [converted skipped failed]}]
+  "Deterministic one-line report: `converted N, merged P, skipped M,
+  failed K` (`merged` appears only when part files were merged)."
+  [{:keys [converted skipped failed merged]}]
   (str "converted " (count converted)
+       (when (seq merged) (str ", merged " (count merged)))
        ", skipped " (count skipped)
        ", failed " (count failed)))
 
@@ -733,15 +726,17 @@
                  (e.g. `package:mycljd/d2c_exports.dart`)
     :root/:dart  astdump frontend options (dart2cljd.frontend)
 
-  Pass 1 parses every file and builds the cross-file project index (imports,
-  type -> namespace, constructors/statics); pass 2 emits with that index, so
-  cross-file imports become symbol requires and cross-file type references
-  resolve to the generated namespaces.
+  Pass 1 parses every file, groups libraries with their `part` files (a part's
+  declarations merge into its library's namespace; part files produce no
+  output) and builds the cross-file project index (imports, type -> namespace,
+  constructors/statics); pass 2 emits with that index, so cross-file imports
+  become symbol requires and cross-file type references resolve to the
+  generated namespaces.
 
-  Returns `{:converted [...] :skipped [...] :failed [...] :warnings [...]
-  :package ... :exit 0|1}`: the run never aborts on a per-file failure, it
-  collects them all (each failure carries the exception, whose message has
-  file/line/column)."
+  Returns `{:converted [...] :merged [...] :skipped [...] :failed [...]
+  :warnings [...] :package ... :exit 0|1}`: the run never aborts on a per-file
+  failure, it collects them all (each failure carries the exception, whose
+  message has file/line/column)."
   [opts]
   (when-not (:dir opts)
     (throw (ex-info "dart2cljd: convert-dir requires :dir"
@@ -753,15 +748,18 @@
         opts (assoc opts :package (or (:package opts) (pubspec-package (:dir opts))))
         parsed (mapv (fn [rel]
                        (try
-                         (let [unit (parse-unit rel opts)]
-                           (check-directives! unit rel)
-                           {:file rel :unit unit})
+                         {:file rel :unit (parse-unit rel opts)}
                          (catch Exception e {:file rel :error e})))
                      files)
         ok (into [] (filter :unit) parsed)
         parse-failed (into [] (remove :unit) parsed)
-        index (build-index ok opts)
-        index (assoc index :fn-typedefs (resolve-fn-typedefs index ok opts))
+        grouped (library/group ok {:excluded (set (map :file skipped))
+                                   :parse-failed (set (map :file parse-failed))})
+        libs (:libraries grouped)
+        lib-ok (into [] (remove :error) libs)
+        lib-failed (into [] (filter :error) libs)
+        index (build-index (mapv #(select-keys % [:file :unit]) lib-ok) opts)
+        index (assoc index :fn-typedefs (resolve-fn-typedefs index lib-ok opts))
         shim (write-exports-shim! opts index)
         warnings (cond-> (:warnings index)
                    (and (seq (mapcat :external (vals (:exports index))))
@@ -774,15 +772,51 @@
                         (try
                           {:ok (convert-one file unit index opts)}
                           (catch Exception e {:file file :error e})))
-                      ok)
+                      lib-ok)
         converted (into [] (keep :ok) emitted)
-        failed (->> (concat parse-failed (remove :ok emitted))
+        failed (->> (concat parse-failed
+                            (:errors grouped)
+                            (map (fn [{:keys [file error]}]
+                                   {:file file :error error})
+                                 lib-failed)
+                            (remove :ok emitted))
                     (sort-by :file)
                     vec)
-        units (into {} (map (fn [{:keys [file unit]}] [file unit])) ok)
+        units (into {} (map (fn [{:keys [file unit]}] [file unit])) lib-ok)
         [converted failed] (propagate-import-failures index units converted failed)
-        failed (vec (sort-by :file failed))]
+        converted-files (set (map :file converted))
+        failed-files (set (map :file failed))
+        merged (into []
+                     (for [{:keys [file parts]} lib-ok
+                           :when (contains? converted-files file)
+                           part parts]
+                       {:file part
+                        :into file
+                        :ns (path->ns file opts)}))
+        ;; Parts of a failed library never made it into an output file: report
+        ;; them as failed too, unless they already failed on their own.
+        part-failed
+        (reduce (fn [m {:keys [file parts]}]
+                  (if (contains? converted-files file)
+                    m
+                    (reduce (fn [m part]
+                              (if (contains? failed-files part)
+                                m
+                                (assoc m part
+                                       {:file part
+                                        :error (ex-info
+                                                (str "dart2cljd: part of library "
+                                                     file ", which failed to convert")
+                                                {:dart2cljd/kind :library
+                                                 :file part
+                                                 :library file})})))
+                            m
+                            parts)))
+                {}
+                libs)
+        failed (vec (sort-by :file (concat failed (vals part-failed))))]
     {:converted converted
+     :merged merged
      :skipped skipped
      :failed failed
      :warnings warnings

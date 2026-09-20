@@ -8,7 +8,8 @@
   the snippet and of bin/astdump.dart, so repeated conversions in tests do
   not pay the Dart startup cost and stale entries are invalidated whenever
   the frontend changes."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.tools.cli :refer [parse-opts]]
             [dart2cljd.alias :as alias]
             [dart2cljd.ast :as ast]
@@ -16,6 +17,7 @@
             [dart2cljd.emit.core :as core]
             [dart2cljd.emit.decls :as decls]
             [dart2cljd.frontend :as frontend]
+            [dart2cljd.library :as library]
             [dart2cljd.printer :as printer]))
 
 ;; ---------------------------------------------------------------------------
@@ -92,6 +94,53 @@
   frontend/astdump-file)
 
 ;; ---------------------------------------------------------------------------
+;; single-file libraries (part merging)
+;; ---------------------------------------------------------------------------
+
+(defn- part-file
+  "The part file a `part` URI points at, relative to `path`'s directory.
+  Non-relative URIs (`package:`, `dart:`, absolute) are invalid Dart."
+  [path uri]
+  (when-not (and (string? uri)
+                 (not (str/starts-with? uri "package:"))
+                 (not (str/starts-with? uri "dart:"))
+                 (not (str/starts-with? uri "/")))
+    (throw (ex-info (str "dart2cljd: part URI " (pr-str uri)
+                         " must be relative to " path)
+                    {:dart2cljd/kind :library :file path :uri uri})))
+  (let [f (io/file path)
+        dir (or (.getParentFile f) (io/file "."))]
+    (io/file dir uri)))
+
+(defn- merge-file-parts
+  "Read the `part` files of a library file and merge them into its unit.
+
+  Single-file mode has no discovery/exclude policy: every part must exist and
+  parse, otherwise conversion fails loudly. (`--dir` batch mode reports each
+  part per file instead.)"
+  [path unit opts]
+  (let [uris (library/part-uris unit)]
+    (if (empty? uris)
+      unit
+      (library/merge-parts
+       unit
+       (mapv (fn [uri]
+               (let [f (part-file path uri)]
+                 (when-not (.isFile f)
+                   (throw (ex-info (str "dart2cljd: part " (pr-str uri)
+                                        " not found (needed by " path ")")
+                                   {:dart2cljd/kind :library :file path :uri uri})))
+                 (let [punit (:unit (ast/normalize-doc
+                                     (astdump-file (.getPath f) opts)))]
+                   (when (seq (library/part-uris punit))
+                     (throw (ex-info (str "dart2cljd: part " (pr-str uri)
+                                          " declares its own parts")
+                                     {:dart2cljd/kind :library
+                                      :file (.getPath f)})))
+                   punit)))
+             uris)))))
+
+;; ---------------------------------------------------------------------------
 ;; public API
 ;; ---------------------------------------------------------------------------
 
@@ -103,11 +152,22 @@
     (convert-doc (ast/normalize-doc (astdump dart opts) opts) opts)))
 
 (defn convert-file
-  "Dart file -> cljd (includes the ns form)."
+  "Dart file -> cljd (includes the ns form).
+
+  A library file's `part` files are read and merged into the output (one
+  namespace per library, M9); a `part of` file cannot be converted on its
+  own."
   [path & args]
   (let [opts (kwargs->map args)
-        doc (ast/normalize-doc (astdump-file path opts) opts)]
-    (convert-doc doc (assoc opts :path path))))
+        doc (ast/normalize-doc (astdump-file path opts) opts)
+        unit (:unit doc)]
+    (when (library/part-of-directive unit)
+      (throw (ex-info (str "dart2cljd: " path " is a `part of` file; convert its "
+                           "library file instead (parts share a library's "
+                           "namespace)")
+                      {:dart2cljd/kind :library :file path})))
+    (convert-doc (assoc doc :unit (merge-file-parts path unit opts))
+                 (assoc opts :path path))))
 
 (defn convert-dir
   "Batch mode (M6): translate a whole Dart directory tree.
