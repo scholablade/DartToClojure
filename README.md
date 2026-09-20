@@ -74,19 +74,34 @@ The CLI keeps DartClojure's flag surface, so editor integrations port over:
 
 ```console
 $ dart2cljd --dir lib --out src --ns-prefix my.app
-dart2cljd: orphan_part.dart: dart2cljd: `part of` files are not supported ...
-dart2cljd: converted 12, skipped 2, failed 1
+dart2cljd: orphan_part.dart: dart2cljd: library "main.dart" does not declare this file as a part at 1:1
+dart2cljd: converted 12, merged 3, skipped 2, failed 1
 $ echo $?
 1
 ```
 
-One `.cljd` per converted input, preserving the tree structure
+One `.cljd` per **library**, preserving the tree structure
 (`lib/foo/bar_baz.dart` → `src/foo/bar_baz.cljd`, namespace
 `my.app.foo.bar-baz`; the mapping is the inverse of ClojureDart's
 `ns-to-paths`). `*.g.dart`, `*.freezed.dart` and `*.mocks.dart` are skipped by
 default. Failures never abort the run: every file is attempted, failures are
 reported per file with `file:line:col`, and the CLI exits nonzero with a
-`converted N, skipped M, failed K` summary.
+`converted N, merged P, skipped M, failed K` summary.
+
+**Libraries and parts**: a file with `part 'x.dart';` directives is a library;
+the part's declarations are merged into the library's namespace before
+emission (Dart parts share the library's imports and private scope), so
+`syntax`/type/constructor references between the library and its parts work
+unchanged and part files produce no `.cljd` of their own (they appear under
+`merged P`; the merged output is byte-stable). Both `part of 'main.dart';` and
+`part of library.name;` (with a matching `library library.name;`) are
+supported. A part that is missing, excluded from discovery, or claims another
+library fails its library loudly; a `part of` file that no converted library
+lists fails on its own. In single-file mode (`-p lib/main.dart`) the parts are
+read from disk and merged too; converting a `part of` file on its own fails
+loudly. Because ClojureDart resolves types eagerly, a library *with parts* has
+its declarations stably reordered so a type is emitted before its uses (a
+part-free library keeps its Dart declaration order byte-for-byte).
 
 Conversion is **two-pass**, so the generated tree is a connected project: a
 project index maps files to namespaces, declared type names to their namespace,
@@ -121,7 +136,7 @@ satisfaction. External mixins (`SingleTickerProviderStateMixin`, …) keep the
 Dart `with` clause. Generic mixins drop their type parameters (ClojureDart
 has no bounds support); members that reference a type parameter, static mixin
 members, `super` calls in mixin methods and member name collisions fail
-loudly. `part` and `part of` still fail loudly.
+loudly.
 
 ### API
 
@@ -241,6 +256,7 @@ src/dart2cljd/
   ir.cljc               IR schema table
   mutable.cljc          reassigned/captured-local analysis (R1)
   pattern.cljc          Dart 3 patterns -> cond tests + binds (R4)
+  library.cljc          Dart libraries: `part`/`part of` assembly (M9)
   typeinfo.cljc         syntactic local-type pass for operator dispatch
   alias.cljc            import -> :require alias table (deterministic)
   emit/core.cljc        expressions, operators, calls, interop
@@ -267,11 +283,27 @@ These are deliberate and recorded with their probe evidence in
 
 - `e as T` → `^T` hint; the Dart runtime `CastError` is not reproduced.
 - Faithful `%` emits `(. a % b)` (Dart euclidean `%`); idiomatic mode uses `mod`.
-- Generators (`yield`, `async*`, `sync*`), `operator []=`, `part`/`part of`
-  and Dart extensions/extension types fail loudly: ClojureDart cannot express
-  them. `export` is supported through the generated exports shim (batch
-  mode); mixins with fields are supported by inlining (`implements` +
-  inlined members), with generic type parameters dropped.
+- Generators (`yield`, `async*`, `sync*`), `operator []=` and Dart
+  extensions/extension types fail loudly: ClojureDart cannot express them.
+  `export` is supported through the generated exports shim (batch mode);
+  `part`/`part of` are supported by merging the part's declarations into the
+  library's namespace (part files produce no output); mixins with fields are
+  supported by inlining (`implements` + inlined members), with generic type
+  parameters dropped.
+- `part`/`part of`: the part's declarations are emitted in the *library's*
+  namespace (they share the library's imports and private scope, so this is
+  the exact mapping; part files get no `.cljd`). A part that is missing or
+  excluded from discovery fails its library loudly (an excluded part cannot
+  be translated, so the library would be incomplete); a part claimed by two
+  libraries, a part that declares its own parts, or a `part of` file whose
+  library does not list it fails loudly too. Parts declared with the named
+  form (`part of library.name;`) need the matching `library library.name;`
+  declaration. Because ClojureDart resolves types eagerly, a library with
+  parts has its declarations stably reordered by local type references (a
+  part-free library keeps its Dart order byte-for-byte). Private names are not
+  indexed for cross-file resolution (Dart privacy is library-scoped), which
+  also removes spurious duplicate warnings between files that each declare the
+  same `_helper`.
 - `late` fields: `late T x;` is assigned after construction, but ClojureDart
   constructors require every field. Non-nullable scalars (`int`, `num`,
   `double`, `bool`, `String`) keep their declared type and get a zero-value
@@ -332,10 +364,11 @@ These are deliberate and recorded with their probe evidence in
 - `~/` emits the Dart interop operator `(. a "~/" b)` instead of
   `cljd.core/quot`: `quot` is declared `^num` although Dart's `num.~/`
   returns `int`, so int contexts (`int f() => (a ~/ 2).clamp(0, n)`) failed.
-- M8 batch features (barrel `export` support + exports shim over imports,
-  mixin-with-fields inlining, C-style collection-for and collection-element
-  splicing, statement-for fixes) and the analyzer-triage fixes are covered by
-  `make gate` fixtures (`corpus/m3.dart`, `test/batchproj/`, 36 runtime
+- M8/M9 batch features (barrel `export` support + exports shim over imports,
+  mixin-with-fields inlining, `part`/`part of` library assembly, C-style
+  collection-for and collection-element splicing, statement-for fixes) and
+  the analyzer-triage fixes are covered by
+  `make gate` fixtures (`corpus/m3.dart`, `test/batchproj/`, 37 runtime
   checks). The generated probe tree converts 34/34, compiles, and
   `dart analyze` reports 3 residual errors — all the documented upstream
   ClojureDart `^super` cast in classes that apply an external mixin
