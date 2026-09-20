@@ -157,9 +157,15 @@ external class):
 The same dump carries `:element`, *what a name refers to* (instance member vs
 top-level value vs static vs type), which settles the remaining implicit-`this`
 ambiguities: an instance member inherited from outside the converted tree wins
-over a same-named cross-file top-level value (Dart innermost-first), and a
-top-level function/getter (e.g. unaliased `dart:math`'s `max`/`pi`) routes
-through the imports/exports shim instead of becoming `(.-max this …)`.
+over a same-named cross-file top-level value (Dart innermost-first) — for
+reads, writes and increments — and a top-level function/getter (e.g.
+unaliased `dart:math`'s `max`/`pi`) routes through the imports/exports shim
+instead of becoming `(.-max this …)`. The write side additionally records the
+class declaring a written field, so ClojureDart's reserved-word field munging
+(`base` → `$base_`) is applied to writes through other files' instances
+(`item.base = 1`). The typed dump also resolves the tree's external function
+typedefs, so the separate `--fn-typedefs` pass only runs for parse-only
+conversions.
 
 ```console
 $ dart2cljd --types -p lib/vec.dart
@@ -321,7 +327,10 @@ These are deliberate and recorded with their probe evidence in
   `part`/`part of` are supported by merging the part's declarations into the
   library's namespace (part files produce no output); mixins with fields are
   supported by inlining (`implements` + inlined members), with generic type
-  parameters dropped.
+  parameters dropped. A subclass whose *implicit* super call must run a
+  same-unit superclass's field initializers is not supported (give the
+  subclass an explicit `: super(value)` call); the ClojureDart compile fails
+  loudly (RESEARCH "Open items" O3).
 - `part`/`part of`: the part's declarations are emitted in the *library's*
   namespace (they share the library's imports and private scope, so this is
   the exact mapping; part files get no `.cljd`). A part that is missing or
@@ -368,22 +377,26 @@ These are deliberate and recorded with their probe evidence in
   target is a bare type parameter fails loudly at use sites; in parse-only
   mode instance members inherited from outside the converted tree are
   invisible to the syntactic pass, so a cross-file value with the same name
-  wins over them (`--types` fixes this exactly, see above).
+  wins over them (`--types` fixes this exactly for reads and writes, see
+  above).
 - External *function typedefs* (`VoidCallback`, `ValueChanged<T>`, ...) are
-  emitted as `Function` hints. Batch mode resolves them through the analyzer
-  once per run (`--fn-typedefs` frontend mode; the source project must be
+  emitted as `Function` hints. Typed runs resolve them per file as part of
+  `--types` (the `:fn-typedefs` facts of the dump); parse-only runs use the
+  separate `--fn-typedefs` frontend pass (the source project must be
   `pub get`-ed, otherwise conversion keeps the ordinary hint and the compile
   fails loudly); ClojureDart's analyzer helper cannot resolve function-typedef
-  elements (RESEARCH M8.10). Class hints (`^m/Widget`) are unaffected.
+  elements (RESEARCH M8.10/M12.4). Class hints (`^m/Widget`) are unaffected.
 - Fields named after Dart reserved words/built-in identifiers (`base`,
   `late`, ...) are munged by ClojureDart (`$base_`); the emitter reproduces
   the munging for every `this`-routed write (constructor bodies, closures,
-  `this.x = v`, `this.x++`, cascades, `late` initializers) and for writes
-  through a local syntactically known to hold the current class (RESEARCH
-  M12.2). A write through a receiver of unknown type (another file's instance,
-  `dynamic`) keeps the plain `.-x!` spelling; ClojureDart's setter path does
-  not munge it, so such a write to a reserved-name field fails at runtime
-  (loudly).
+  `this.x = v`, `this.x++`, cascades, `late` initializers), for same-class
+  locals, and — in typed mode — for fields of converted classes written
+  through any receiver (`item.base = 1` from another file), using the
+  resolved write element and its declaring class (RESEARCH M12.2/M12.3).
+  External Dart classes' fields are never munged (their Dart name is not
+  changed). In parse-only mode a write through a receiver of unknown type
+  keeps the plain `.-x!` spelling; ClojureDart's setter path does not munge
+  it, so such a write to a reserved-name field fails at runtime (loudly).
 - The astdump frontend is run through a kernel snapshot cached in
   `.dart2cljd-cache/` (`dart run` re-JITs `package:analyzer` at ~40 s per
   call; the snapshot is ~1.3 s and is rebuilt when `bin/astdump.dart`
@@ -410,10 +423,10 @@ These are deliberate and recorded with their probe evidence in
 - M8/M9/M12 batch features (barrel `export` support + exports shim over
   imports, mixin-with-fields inlining, `part`/`part of` library assembly,
   C-style collection-for and collection-element splicing, statement-for
-  fixes, typed element-kind routing, reserved-word field munging) and the
-  analyzer-triage fixes are covered by
+  fixes, typed element-kind routing for reads and writes, reserved-word field
+  munging) and the analyzer-triage fixes are covered by
   `make gate` fixtures (`corpus/m3.dart`, `test/batchproj/`,
-  `corpus/typedproj/`, 43 runtime checks). The generated probe tree converts
+  `corpus/typedproj/`, 44 runtime checks). The generated probe tree converts
   34/34, compiles, and `dart analyze` reports 3 residual errors — all the
   documented upstream ClojureDart `^super` cast in classes that apply an
   external mixin (RESEARCH M8.18).
