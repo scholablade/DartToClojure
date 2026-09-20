@@ -119,11 +119,20 @@
 ;; plan / alias details
 ;; ---------------------------------------------------------------------------
 
+(deftest string-state-fields
+  (let [o (out)]
+    (testing "a String state field is a watched atom and concatenates via str (M10)"
+      (is (re-find #"\(defn Typer \[\.key nil\]" o))
+      (is (re-find #"\(swap! text str \"b\"\)" o))
+      (is (re-find #"\(m/Text \(str \(deref text\) \"!\"\)\)" o))
+      (is (re-find #":watch \[_ text _ d2c\$tick\]" o)))))
+
 (deftest plan-consumes-only-paired-state-classes
   (let [p (idiomatic/plan (:unit @doc))]
-    (is (= #{"Greeting" "Counter" "Banner" "Ticker" "Editor" "Fader" "Page"}
+    (is (= #{"Greeting" "Counter" "Banner" "Ticker" "Typer" "Editor" "Fader" "Page"}
            (set (keys (:widgets p)))))
-    (is (= #{"CounterState" "BannerState" "TickerState" "EditorState" "FaderState"}
+    (is (= #{"CounterState" "BannerState" "TickerState" "TyperState"
+             "EditorState" "FaderState"}
            (:consumed p)))))
 
 (deftest managed-lifecycle-resources

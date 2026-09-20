@@ -55,6 +55,18 @@
             :context context
             (m/TextButton .onPressed bump .child (m/Text (str "ticks: " (.-length (deref buf))))))))))
 
+(defn Typer [.key nil]
+  (m/KeyedSubtree
+    .key key
+    .child
+      (let [text (atom "a")
+            d2c$tick (atom 0)]
+        (letfn [(append [] (do (swap! text str "b") (swap! d2c$tick inc)) nil)]
+          (f/widget
+            :watch [_ text _ d2c$tick]
+            :context context
+            (m/TextButton .onPressed append .child (m/Text (str (deref text) "!"))))))))
+
 (defn Editor [.key nil]
   (m/KeyedSubtree
     .key key

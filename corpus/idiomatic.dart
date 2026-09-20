@@ -83,6 +83,28 @@ class TickerState extends State<Ticker> {
   }
 }
 
+class Typer extends StatefulWidget {
+  const Typer({super.key});
+  @override
+  State<Typer> createState() => TyperState();
+}
+
+class TyperState extends State<Typer> {
+  String text = 'a';
+  void append() {
+    setState(() {
+      text += 'b';
+    });
+  }
+  @override
+  Widget build(BuildContext context) {
+    return TextButton(
+      onPressed: append,
+      child: Text(text + '!'),
+    );
+  }
+}
+
 class Editor extends StatefulWidget {
   const Editor({super.key});
   @override

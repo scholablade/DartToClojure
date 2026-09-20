@@ -419,6 +419,55 @@ int guardedClosure(int n) {
   return f();
 }
 
+// M10: Dart `String +`/`+=` concatenate. String locals, parameters and
+// fields are tracked syntactically; `str` replaces the numeric `+` (which
+// ClojureDart would compile to a numeric cast).
+class StringHost {
+  String label = 'a';
+  int count = 0;
+
+  StringHost(String start) {
+    label += start;
+  }
+
+  void bump() {
+    this.label += '!';
+    label = label + '?';
+    count += 1;
+  }
+
+  String describe() => label + ':' + count.toString();
+}
+
+String stringOps(String s, int n) {
+  var out = s;
+  out += '!';
+  out = out + '?' + n.toString();
+  out += n.isEven ? 'even' : 'odd';
+  return out;
+}
+
+// M10: a local assigned inside a nested function is boxed as an atom; the
+// write must be visible to the enclosing scope (`volatile!` would not be).
+int closureMut(int n) {
+  var total = 0;
+  final bump = () {
+    total += n;
+  };
+  bump();
+  bump();
+  return total + 1;
+}
+
+String closureString() {
+  var out = 'x';
+  final add = () {
+    out += 'y';
+  };
+  add();
+  return out;
+}
+
 @Deprecated('use newName')
 int oldName = 1;
 

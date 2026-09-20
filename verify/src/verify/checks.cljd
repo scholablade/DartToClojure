@@ -258,3 +258,30 @@
 (deftest nested-closure-control-flow
   (is (= 6 (g/guardedClosure 3)))
   (is (= 0 (g/guardedClosure -1))))
+
+;; ---------------------------------------------------------------------------
+;; M10: String concatenation and closure mutation
+;; ---------------------------------------------------------------------------
+
+(deftest string-concatenation
+  (is (= "hi!?2even" (g/stringOps "hi" 2)))
+  (is (= "hi!?3odd" (g/stringOps "hi" 3)))
+  (let [h (g/StringHost-new "Z")]
+    (is (= "aZ" (.-label h)))
+    (.bump h)
+    (is (= "aZ!?" (.-label h)))
+    (is (= 1 (.-count h)))
+    (is (= "aZ!?:1" (.describe h)))))
+
+(deftest closure-mutation-visibility
+  (is (= 7 (g/closureMut 3)))
+  (is (= "xy" (g/closureString))))
+
+(deftest string-state-concatenation
+  :runner (ft/testWidgets [tester])
+  (let [^ft/WidgetTester {:flds [pumpWidget tap pump]} tester]
+    (await (pumpWidget (m/MaterialApp .home (i/Typer))))
+    (ft/expect (ft/find.text "a!") ft/findsOneWidget)
+    (await (tap (ft/find.byType m/TextButton)))
+    (await (pump))
+    (ft/expect (ft/find.text "ab!") ft/findsOneWidget)))

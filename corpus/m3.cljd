@@ -480,6 +480,39 @@
           (when (not (deref d2c$done)) (do (vreset! d2c$result (f)) (vreset! d2c$done true))))))
     (deref d2c$result)))
 
+(deftype StringHost
+  [^:mutable ^String label ^:mutable ^int count]
+  :type-only true
+  StringHost
+  (^void bump
+    [this]
+    (.-label! this (str (.-label this) "!"))
+    (set! label (str label "?"))
+    (set! count (+ count 1))
+    nil)
+  (^String describe [this] (str label ":" (.toString count))))
+
+(defn ^StringHost StringHost-new [^String start]
+  (let [label "a"
+        count 0
+        this (StringHost label count)]
+    (.-label! this (str (.-label this) start))
+    nil
+    this))
+
+(defn stringOps [^String s ^int n]
+  (let [out (volatile! s)]
+    (vswap! out str "!")
+    (vreset! out (str (deref out) "?" (.toString n)))
+    (vswap! out str (if (.-isEven n) "even" "odd"))
+    (deref out)))
+
+(defn closureMut [^int n]
+  (let [total (atom 0) bump (fn [] (swap! total + n) nil)] (bump) (bump) (+ (deref total) 1)))
+
+(defn closureString []
+  (let [out (atom "x") add (fn [] (swap! out str "y") nil)] (add) (deref out)))
+
 ^{:dart/annotations ["@Deprecated(\"use newName\")"]} ^:deprecated (def oldName 1)
 
 (defn main []

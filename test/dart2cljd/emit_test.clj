@@ -73,6 +73,20 @@
       (testing "override parameters stay unhinted when the local base is unhinted"
         (is (re-find #"\^String greet \[this other\]" out))))))
 
+(deftest string-concatenation-and-closure-mutation
+  (testing "String + / += emit str instead of the numeric + (M10)"
+    (let [out (printer/print-forms @m3-forms)]
+      (is (re-find #"\(vswap! out str \"!\"\)" out))
+      (is (re-find #"\(vreset! out \(str \(deref out\) \"\?\" \(\.toString n\)\)\)" out))
+      (is (re-find #"\.-label! this \(str \(\.-label this\) start\)" out))
+      (is (re-find #"\(set! label \(str label \"\?\"\)\)" out))
+      (testing "numeric compound assignment is unaffected"
+        (is (re-find #"\(set! count \(\+ count 1\)\)" out)))))
+  (testing "a local mutated inside a nested function is boxed as an atom"
+    (let [out (printer/print-forms @m3-forms)]
+      (is (re-find #"\(let \[total \(atom 0\) bump \(fn \[\] \(swap! total \+ n\) nil\)\]" out))
+      (is (re-find #"\(let \[out \(atom \"x\"\) add \(fn \[\] \(swap! out str \"y\"\) nil\)\]" out)))))
+
 (deftest fn-typedef-type-symbol
   (testing "external function typedefs map to Function (ClojureDart's analyzer
             helper crashes on function-typedef elements; RESEARCH M8.10)"
