@@ -41,6 +41,31 @@
   Field entries are [ir-key mode] or [ir-key mode raw-key] when the astdump
   key differs from the IR key (e.g. analyzer's :id becomes :name).
 
+  Resolved facts (present only for `astdump --types` dumps)
+  ---------------------------------------------------------
+  Two cross-cutting annotations are attached to IR nodes when the resolved
+  unit knows them (parse-only dumps carry neither):
+    :dart-type     rendered static type of an expression (M11)
+    :dart-element  what a name refers to (M12)
+
+  `:dart-element` is one of, from the analyzer element classes:
+    :local :param                       LocalVariableElement /
+                                        FormalParameterElement (writes included)
+    :top-fn :top-var                    TopLevelFunctionElement /
+                                        TopLevelVariableElement
+    :top-getter :top-setter             accessor whose enclosing element is a
+                                        LibraryElement (top-level getter/setter,
+                                        incl. the implicit accessors of a
+                                        top-level variable)
+    :method :getter :setter :field      instance members of a class/mixin/enum
+    :static-method :static-getter       static members
+    :static-setter :static-field
+    :class :mixin :enum :typedef        type references
+    :ctor                               constructor references
+    :type-param :prefix :label          type parameters, import prefixes, labels
+  Instance members (`:method :getter :setter :field`) are implicit-`this`
+  accesses in Dart; the other kinds are not. Unmapped elements emit nothing.
+
   This namespace is pure data; normalization logic lives in dart2cljd.ast."
   (:refer-clojure :exclude []))
 

@@ -801,6 +801,43 @@
       (contains? (:referred (:aliases ctx)) n)
       (alias/import-prefix? n (:aliases ctx))))
 
+;; ---------------------------------------------------------------------------
+;; resolved element facts (M12, `--types` only)
+;; ---------------------------------------------------------------------------
+
+(def ^:private instance-element-kinds
+  "Resolved element kinds that are instance members: Dart resolves a bare
+  reference to them as an implicit-`this` access."
+  #{:field :getter :setter :method})
+
+(def ^:private top-element-kinds
+  "Resolved element kinds declared at the top level of a library."
+  #{:top-var :top-fn :top-getter :top-setter})
+
+(def ^:private non-instance-element-kinds
+  "Resolved element kinds that are definitely not implicit-this members:
+  top-level names, statics and types. An identifier with one of these
+  elements must not fall back to `(.-x this)`."
+  (into top-element-kinds
+        #{:static-method :static-getter :static-setter :static-field
+          :class :mixin :enum :typedef :ctor}))
+
+(defn- element-kind
+  "Resolved element kind of a node (M12), or nil in parse-only dumps."
+  [node]
+  (:dart-element node))
+
+(defn- instance-element?
+  "True when the resolved element says the name is an instance member."
+  [node]
+  (contains? instance-element-kinds (element-kind node)))
+
+(defn- non-instance-element?
+  "True when the resolved element says the name is *not* an implicit-this
+  instance member (top-level, static or type)."
+  [node]
+  (contains? non-instance-element-kinds (element-kind node)))
+
 (defn- widget-fn-info
   "Emission info for a class emitted as an idiomatic widget builder fn."
   [ctx class]
@@ -835,6 +872,14 @@
           (:getter sm) (fail! node (str n " is a static getter; read it as a property"))
           :else (fail! node (str n " is a static setter; assign to it"))))
 
+      ;; M12: a resolved instance method (possibly inherited from outside the
+      ;; unit) is an implicit-`this` call even when a cross-file project value
+      ;; has the same name (Dart innermost-first precedence).
+      (and (instance-element? node)
+           (:this-sym ctx)
+           (not (contains? (:locals ctx) n)))
+      (list* (symbol (str "." n)) (:this-sym ctx) (emit-args (:args node) ctx))
+
       (and (project-value-info n ctx) (not (own-instance-member? n ctx)))
       (let [{:keys [kinds] :as info} (project-value-info n ctx)]
         (cond
@@ -859,7 +904,10 @@
       (list* (alias/qualify n (:aliases ctx)) (emit-args (:args node) ctx))
 
       (and (:this-sym ctx)
-           (not (known-bare? n ctx)))
+           (not (known-bare? n ctx))
+           ;; M12: a resolved top-level/static element is not an implicit-this
+           ;; call; fall through so the shim/alias route handles it.
+           (not (non-instance-element? node)))
       (list* (symbol (str "." n)) (:this-sym ctx) (emit-args (:args node) ctx))
 
       :else
@@ -879,22 +927,32 @@
   `(.-debugPrint this)`, which compiled to a dynamic member access that fails
   at runtime. Names the regular identifier machinery already resolves
   (locals, fields, instance members, statics, project values) and files
-  without an exports shim keep their previous emission."
+  without an exports shim keep their previous emission.
+
+  M12: when the resolved element says the name is a top-level value the
+  routing is exact instead of the shape heuristic; instance elements
+  (`:field`/`:getter`, a callback stored in a field) keep the implicit-this
+  read."
   [node ctx]
   (let [f (:fn node)
-        n (when (= :id (:ir f)) (str (:name f)))]
+        n (when (= :id (:ir f)) (str (:name f)))
+        el (element-kind f)]
     (if (and n
              (:wildcard-alias (:aliases ctx))
              (not (known-bare? n ctx))
-             (not (contains? (:locals ctx) n))
-             (not (contains? (:fields ctx) n))
-             (not (contains? (:atom-fields ctx) n))
-             (not (contains? (:instance-getters ctx) n))
-             (not (contains? (:instance-methods ctx) n))
-             (not (contains? (:instance-setters ctx) n))
-             (not (static-member-info n ctx))
-             (not (project-value-info n ctx))
-             (not (project-type-info n ctx)))
+             (if el
+               ;; Resolved: route exactly when the name is a top-level value.
+               (contains? top-element-kinds el)
+               ;; Parse-only/unresolved: keep the M11 shape heuristic.
+               (and (not (contains? (:locals ctx) n))
+                    (not (contains? (:fields ctx) n))
+                    (not (contains? (:atom-fields ctx) n))
+                    (not (contains? (:instance-getters ctx) n))
+                    (not (contains? (:instance-methods ctx) n))
+                    (not (contains? (:instance-setters ctx) n))
+                    (not (static-member-info n ctx))
+                    (not (project-value-info n ctx))
+                    (not (project-type-info n ctx)))))
       (list* (alias/qualify n (:aliases ctx)) (emit-args (:args node) ctx))
       (list* (emit-expr f ctx) (emit-args (:args node) ctx)))))
 
@@ -1205,6 +1263,54 @@
 (defn- simple-target? [node]
   (contains? #{:id :this :super} (:ir node)))
 
+(def cljd-reserved-words
+  "ClojureDart's `reserved-words` (ClojureDart/clj/src/cljd/compiler.cljc):
+  Dart reserved words and built-in identifiers. ClojureDart munges a deftype
+  *field* with such a name to `$name_` in the generated Dart, but its `set!`
+  path behind `.-name!` (`resolve-field-for-set!`) has no munge fallback, so
+  writes to such a field must use the munged spelling (RESEARCH M12.2).
+  Declared getters/setters and methods are *not* munged, so this applies to
+  `:fields` only."
+  #{"Function" "abstract" "as" "assert" "async" "await" "base" "break" "case"
+    "catch" "class" "const" "continue" "covariant" "default" "deferred" "do"
+    "dynamic" "else" "enum" "export" "extends" "extension" "external"
+    "factory" "false" "final" "finally" "for" "get" "hide" "if" "implements"
+    "import" "in" "interface" "is" "late" "library" "mixin" "new" "null" "on"
+    "operator" "part" "rethrow" "return" "sealed" "set" "show" "static"
+    "super" "switch" "sync" "this" "throw" "true" "try" "typedef" "var"
+    "void" "while" "with" "yield"})
+
+(defn dart-field-name
+  "Dart spelling ClojureDart uses for a deftype field name: reserved words and
+  built-in identifiers become `$name_`, everything else is unchanged (Dart
+  identifiers cannot contain the other characters ClojureDart's munge
+  rewrites)."
+  [n]
+  (let [n (str n)]
+    (if (contains? cljd-reserved-words n) (str "$" n "_") n)))
+
+(defn field-read-sym
+  "`.-name` symbol for a field read, munging reserved-word field names."
+  [n]
+  (symbol (str ".-" (dart-field-name n))))
+
+(defn field-write-sym
+  "`.-name!` symbol for a field write, munging reserved-word field names."
+  [n]
+  (symbol (str ".-" (dart-field-name n) "!")))
+
+(defn- own-instance-field?
+  "True when `name` is an instance field of the current class and `obj` is the
+  implicit/explicit `this` or a local syntactically known to hold an instance
+  of the current class (`ReservedFields other; other.base = 1`)."
+  [obj name ctx]
+  (and (contains? (:fields ctx) (str name))
+       (or (= :this (:ir obj))
+           (and (= :id (:ir obj))
+                (some? (:class-name ctx))
+                (= (str (:class-name ctx))
+                   (get-in ctx [:local-types :classes (:name obj)]))))))
+
 (defn- increment-form
   "Build the cljd form for `place++`/`++place` (and --) given the read and
   write forms of the place. Dart evaluates the place once, so the old value
@@ -1291,7 +1397,9 @@
           setter (if (= :index (:ir target))
                    (fn [v] (list '. (emit-expr (:target target) ctx)
                                  "[]=" (emit-expr (:index target) ctx) v))
-                   (fn [v] (list (symbol (str ".-" (:name target) "!"))
+                   (fn [v] (list (if (own-instance-field? (:target target) (:name target) ctx)
+                                   (field-write-sym (:name target))
+                                   (symbol (str ".-" (:name target) "!")))
                                  (emit-expr (:target target) ctx) v)))]
       (if (or prefix? (simple-target? (:target target)))
         (setter (list op read))
@@ -1332,8 +1440,8 @@
           (and (or (:ctor-body? ctx) (:in-fn ctx))
                (:this-sym ctx)
                (contains? (:fields ctx) n))
-          (increment-form (list (symbol (str ".-" n)) (:this-sym ctx))
-                          (fn [v] (list (symbol (str ".-" n "!")) (:this-sym ctx) v))
+          (increment-form (list (field-read-sym n) (:this-sym ctx))
+                          (fn [v] (list (field-write-sym n) (:this-sym ctx) v))
                           op prefix?)
 
           (contains? (:atom-fields ctx) n)
@@ -1441,8 +1549,8 @@
       (and (or (:ctor-body? ctx) (:in-fn ctx))
            (:this-sym ctx)
            (contains? (:fields ctx) n))
-      (assign-slot (list (symbol (str ".-" n)) (:this-sym ctx))
-                   (fn [v] (list (symbol (str ".-" n "!")) (:this-sym ctx) v))
+      (assign-slot (list (field-read-sym n) (:this-sym ctx))
+                   (fn [v] (list (field-write-sym n) (:this-sym ctx) v))
                    (if (nil? op) "=" op)
                    rhs
                    (or (contains? (:string-fields ctx) n)
@@ -1537,8 +1645,9 @@
 (defn- assign-prop [lhs op rhs ctx]
   (let [obj (:target lhs)
         name (:name lhs)
-        read (list (symbol (str ".-" name)) (emit-expr obj ctx))
-        write (fn [v] (list (symbol (str ".-" name "!")) (emit-expr obj ctx) v))]
+        dart-name (if (own-instance-field? obj name ctx) (dart-field-name name) name)
+        read (list (symbol (str ".-" dart-name)) (emit-expr obj ctx))
+        write (fn [v] (list (symbol (str ".-" dart-name "!")) (emit-expr obj ctx) v))]
     (assign-slot read write op rhs (string-expr? lhs ctx))))
 
 (defn- assign-index [lhs op rhs ctx]
@@ -1791,23 +1900,29 @@
 ;; cascade
 ;; ---------------------------------------------------------------------------
 
-(defn- emit-cascade-section [s ctx]
+(defn- emit-cascade-section
+  [s ctx target]
   (case (:ir s)
     :call (list* (symbol (str "." (:name s))) (emit-args (:args s) ctx))
     :prop (list (symbol (str ".-" (:name s))))
     :assign (let [{:keys [lhs op rhs]} s
-                  value (emit-expr rhs ctx)]
+                  value (emit-expr rhs ctx)
+                  name (:name lhs)
+                  write (if (own-instance-field? target name ctx)
+                          (field-write-sym name)
+                          (symbol (str ".-" name "!")))]
               (when-not (= "=" op)
                 (fail! s (str "unsupported cascade assignment operator " op)))
               (case (:ir lhs)
-                :id (list (symbol (str ".-" (:name lhs) "!")) value)
-                :prop (list (symbol (str ".-" (:name lhs) "!")) value)
+                :id (list write value)
+                :prop (list write value)
                 (fail! s "unsupported cascade assignment target")))
     (fail! s (str "unsupported cascade section " (:ir s)))))
 
 (defn- emit-cascade [node ctx]
-  (list* 'doto (emit-expr (:target node) ctx)
-         (map #(emit-cascade-section % ctx) (:sections node))))
+  (let [target (:target node)]
+    (list* 'doto (emit-expr target ctx)
+           (map #(emit-cascade-section % ctx target) (:sections node)))))
 
 ;; ---------------------------------------------------------------------------
 ;; dispatch
@@ -1817,9 +1932,12 @@
   "Emit a bare identifier: mutable box -> deref, locals/fields, static and
   class members, top getters, cross-file project values, implicit-this
   members, otherwise alias resolution. Dart scoping is innermost-first:
-  locals shadow class members, class members shadow top-level names."
-  [name ctx]
-  (let [n (str name)
+  locals shadow class members, class members shadow top-level names.
+
+  `node` is a `:id` IR node (the `:dart-element` resolved fact, when present,
+  settles the instance-member vs project-value/top-level ambiguities)."
+  [node ctx]
+  (let [n (:name node)
         sm (static-member-info n ctx)]
     (cond
       (contains? (:mutable ctx) n) (list 'deref (local-symbol n ctx))
@@ -1831,7 +1949,7 @@
       (and (or (:ctor-body? ctx) (:in-fn ctx))
            (:this-sym ctx)
            (contains? (:fields ctx) n))
-      (list (symbol (str ".-" n)) (:this-sym ctx))
+      (list (field-read-sym n) (:this-sym ctx))
       (contains? (:fields ctx) n) (symbol n)
       (contains? (:atom-fields ctx) n) (list 'deref (get (:atom-fields ctx) n))
       sm (cond
@@ -1843,6 +1961,13 @@
       (contains? (get-in ctx [:unit-info :top-getters]) n) (list (symbol n))
       (contains? (get-in ctx [:unit-info :top-vars]) n) (symbol n)
       (contains? (get-in ctx [:unit-info :widget-fns]) n) (symbol n)
+      ;; M12: a resolved instance member (possibly inherited from outside the
+      ;; unit) is an implicit-`this` read even when a cross-file project value
+      ;; has the same name (Dart innermost-first precedence).
+      (and (instance-element? node)
+           (:this-sym ctx)
+           (not (contains? (:locals ctx) n)))
+      (list (symbol (str ".-" n)) (:this-sym ctx))
       (and (project-value-info n ctx) (not (own-instance-member? n ctx)))
       (let [{:keys [kinds] :as info} (project-value-info n ctx)]
         (cond
@@ -1851,13 +1976,16 @@
           (contains? kinds :fn) (project-value-symbol info n)
           :else (fail! {:src nil} (str n " is a write-only setter"))))
       (and (:this-sym ctx)
-           (not (known-bare? n ctx)))
+           (not (known-bare? n ctx))
+           ;; M12: a resolved top-level/static/type element is never an
+           ;; implicit-this read; the alias/shim route handles it.
+           (not (non-instance-element? node)))
       (list (symbol (str ".-" n)) (:this-sym ctx))
       :else (alias/qualify n (:aliases ctx)))))
 
 (defn- emit-expr-literal [node ctx]
   (case (:ir node)
-    :id (emit-id (:name node) ctx)
+    :id (emit-id node ctx)
     :prefixed-id (emit-chain node ctx)
     :int-lit (:value node)
     :double-lit (if (number? (:value node))

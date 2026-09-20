@@ -617,7 +617,7 @@
             ctor-call (list* (symbol class)
                              (map #(if (string? %) (symbol %) %) all-fields))
             late-assigns (map (fn [{:keys [name expr]}]
-                                (list (symbol (str ".-" name "!")) this expr))
+                                (list (core/field-write-sym name) this expr))
                               late-inits)
             body (if (and (empty? (remove nil? body))
                           (= :empty-body (:ir (:body ctor))))

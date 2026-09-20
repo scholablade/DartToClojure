@@ -10,8 +10,7 @@
 //   dart run bin/astdump.dart <file.dart>      file mode
 //   cat snippet.dart | dart run bin/astdump.dart -   snippet mode (stdin)
 //   dart run bin/astdump.dart --version        print the EDN schema version
-//   dart run bin/astdump.dart --resolved f.dart  attempt analysis-session resolution
-//   dart run bin/astdump.dart --types f.dart     resolved unit + :static-type per expression
+//   dart run bin/astdump.dart --types f.dart     resolved unit + :static-type/:element per node
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -34,20 +33,18 @@ final featureSet = FeatureSet.latestLanguageVersion();
 /// reported positions match the original snippet.
 int _lineOffset = 0;
 
-/// When true, expression nodes carry `:static-type "<rendered type>"` from
-/// the resolved unit (set by `--types`; requires file mode and resolution).
+/// When true, expression nodes carry `:static-type "<rendered type>"` and
+/// named nodes carry `:element <kind>` from the resolved unit (set by
+/// `--types`; requires file mode and resolution).
 bool _types = false;
 
 Future<void> main(List<String> args) async {
-  var resolved = false;
   var types = false;
   var fnTypedefs = false;
   String? file;
   final positional = <String>[];
   for (final a in args) {
-    if (a == '--resolved') {
-      resolved = true;
-    } else if (a == '--types') {
+    if (a == '--types') {
       types = true;
     } else if (a == '--fn-typedefs') {
       fnTypedefs = true;
@@ -145,10 +142,8 @@ Future<void> main(List<String> args) async {
   buf.write('] :resolved ');
   if (types) {
     buf.write(b(resolvedTypes));
-  } else if (!resolved) {
-    buf.write('nil');
   } else {
-    buf.write(await _resolvedInfo(path));
+    buf.write('nil');
   }
   buf.write(' :unit ');
   if (wrapped) {
@@ -175,9 +170,6 @@ Future<ResolvedUnitResult?> _resolvedUnit(String path) async {
     return null;
   }
 }
-
-Future<String> _resolvedInfo(String path) async =>
-    (await _resolvedUnit(path)) == null ? 'false' : 'true';
 
 /// List the names `uris` export as Dart *function* typedefs.
 ///
@@ -231,9 +223,9 @@ Future<void> _fnTypedefs(List<String> args) async {
 
 void _usage() {
   stderr.writeln(
-      'usage: dart run bin/astdump.dart [--resolved] [--types] [<file.dart>|-]\n'
+      'usage: dart run bin/astdump.dart [--types] [<file.dart>|-]\n'
       '  no file or "-" reads a Dart snippet from stdin\n'
-      '  --types    dump the resolved unit; expressions get :static-type\n'
+      '  --types    dump the resolved unit; nodes get :static-type/:element\n'
       '  --fn-typedefs <ref.dart> <uri>...  function typedefs exported by libs\n'
       '  --version  print the EDN schema version');
 }
@@ -839,20 +831,71 @@ String dump(AstNode node, LineInfo li) {
       f.write(':expr ${dump(wc.expression, li)} ');
 
     default:
-      return _withType(node, dumpGeneric(node, li));
+      return _withFacts(node, dumpGeneric(node, li));
   }
-  return _withType(node, '{:ast ${kw(node)} $f:src ${srcOf(node, li)}}');
+  return _withFacts(node, '{:ast ${kw(node)} $f:src ${srcOf(node, li)}}');
 }
 
-/// Inject `:static-type "<rendered>"` into an expression's EDN map when the
-/// resolved unit knows the expression's type (`--types`).
-String _withType(AstNode node, String edn) {
-  if (!_types || node is! Expression) return edn;
-  final t = node.staticType;
-  if (t == null) return edn;
+/// Inject the resolved facts (`:static-type`, `:element`) into a node's EDN
+/// map when `--types` resolution knows them. Parse-only and unresolved nodes
+/// emit nothing, so untyped output is byte-identical to before.
+String _withFacts(AstNode node, String edn) {
+  if (!_types) return edn;
+  var facts = '';
+  if (node is Expression) {
+    final t = node.staticType;
+    if (t != null) {
+      facts += ' :static-type ${s(t.getDisplayString(withNullability: true))}';
+    }
+  }
+  final kind = _elementKind(_namedElement(node));
+  if (kind != null) facts += ' :element $kind';
+  if (facts.isEmpty) return edn;
   final head = '{:ast ${kw(node)}';
-  final rendered = t.getDisplayString(withNullability: true);
-  return '$head :static-type ${s(rendered)}${edn.substring(head.length)}';
+  return '$head$facts${edn.substring(head.length)}';
+}
+
+/// The element of the *name a node refers to*, for the node kinds where the
+/// name is not itself a dumped child. `SimpleIdentifier` is the name;
+/// property accesses / invocations / prefixed identifiers carry it on their
+/// name part (which astdump dumps as a string, not as a node).
+Element? _namedElement(AstNode node) {
+  if (node is SimpleIdentifier) return node.element;
+  if (node is PropertyAccess) return node.propertyName.element;
+  if (node is MethodInvocation) return node.methodName.element;
+  if (node is PrefixedIdentifier) return node.identifier.element;
+  return null;
+}
+
+/// Deterministic element-kind keyword for a resolved name (`--types`), or
+/// null when the kind is unknown/unmapped. Instance members (`:field`,
+/// `:getter`, `:setter`, `:method`) are implicit-`this` accesses; the
+/// `:static-*`, `:top-*` kinds are not. See `ir.cljc` for the full table.
+String? _elementKind(Element? e) {
+  if (e == null) return null;
+  if (e is LocalVariableElement) return ':local';
+  if (e is FormalParameterElement) return ':param';
+  if (e is TopLevelFunctionElement) return ':top-fn';
+  if (e is TopLevelVariableElement) return ':top-var';
+  if (e is MethodElement) return e.isStatic ? ':static-method' : ':method';
+  if (e is FieldElement) return e.isStatic ? ':static-field' : ':field';
+  if (e is PropertyAccessorElement) {
+    final getter = e is GetterElement;
+    if (e.enclosingElement is LibraryElement) {
+      return getter ? ':top-getter' : ':top-setter';
+    }
+    if (e.isStatic) return getter ? ':static-getter' : ':static-setter';
+    return getter ? ':getter' : ':setter';
+  }
+  if (e is ConstructorElement) return ':ctor';
+  if (e is ClassElement) return ':class';
+  if (e is MixinElement) return ':mixin';
+  if (e is EnumElement) return ':enum';
+  if (e is TypeAliasElement) return ':typedef';
+  if (e is TypeParameterElement) return ':type-param';
+  if (e is PrefixElement) return ':prefix';
+  if (e is LabelElement) return ':label';
+  return null;
 }
 
 // ---------------------------------------------------------------------------

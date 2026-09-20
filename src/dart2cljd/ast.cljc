@@ -233,7 +233,12 @@
                      ;; `--types` resolution facts (a rendered analyzer type,
                      ;; e.g. "String", "Vec", "int?"); parse-only dumps have none.
                      (contains? raw :static-type)
-                     (assoc :dart-type (:static-type raw)))
+                     (assoc :dart-type (:static-type raw))
+                     ;; `--types` resolution facts: what a name refers to
+                     ;; (`:local`, `:param`, instance/static/top-level members,
+                     ;; `:class`, `:ctor`, ...); see ir.cljc for the table.
+                     (contains? raw :element)
+                     (assoc :dart-element (:element raw)))
               fields (if-let [ov (get overrides tag)]
                        (ov raw)
                        (normalize-fields raw (:fields spec) src))]
