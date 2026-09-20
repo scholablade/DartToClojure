@@ -15,6 +15,7 @@
             [verify.main]
             [verify.gen.m3 :as g]
             [verify.gen.idiomatic :as i]
+            [verify.gen.typed :as ty]
             [verify.gen.batchproj.main :as bp]
             [verify.gen.batchproj.models.item :as item]
             ["package:flutter/material.dart" :as m]
@@ -285,3 +286,16 @@
     (await (tap (ft/find.byType m/TextButton)))
     (await (pump))
     (ft/expect (ft/find.text "ab!") ft/findsOneWidget)))
+
+;; ---------------------------------------------------------------------------
+;; M11: analyzer-resolved static types (`--types`)
+;;
+;; `verify.gen.typed` is the translation of `corpus/typed.dart` from the
+;; resolved fixture: operators on call results/field reads and String
+;; concatenation on call results/top getters/static fields.
+;; ---------------------------------------------------------------------------
+
+(deftest resolved-static-types
+  (let [h (ty/Holder-new (ty/Vec-new 5) "n")]
+    (is (= 33 (ty/typedOps h)))
+    (is (= "v4nvec:!" (ty/typedStrings h)))))

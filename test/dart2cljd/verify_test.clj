@@ -19,9 +19,17 @@
                  (edn/read-string
                   (slurp (io/file root "test/fixtures/idiomatic.edn")))))))
 
+(def ^:private typed-unit
+  (delay (:unit (ast/normalize-doc
+                 (edn/read-string
+                  (slurp (io/file root "test/fixtures/typed.edn")))))))
+
+(def ^:private fixture-units
+  {"m3" m3-unit "idiomatic" idiomatic-unit "typed" typed-unit})
+
 (deftest manifest-is-complete
   (let [entries (verify/manifest root)]
-    (is (= #{"m3" "idiomatic" "batchproj"} (set (map :name entries))))
+    (is (= #{"m3" "idiomatic" "typed" "batchproj"} (set (map :name entries))))
     (is (= :faithful (:mode (first (filter #(= "m3" (:name %)) entries)))))
     (is (= :idiomatic (:mode (first (filter #(= "idiomatic" (:name %)) entries)))))
     (testing "each file entry has input and golden files"
@@ -50,7 +58,7 @@
   (doseq [{:keys [name mode] :as entry} (verify/manifest root)
           :when (= :file (verify/entry-kind entry))
           :let [golden (slurp (io/file root "corpus" (str name ".cljd")))
-                unit (if (= "m3" name) @m3-unit @idiomatic-unit)
+                unit @(get fixture-units name)
                 source (verify/gen-source unit entry)
                 expected (str/trim-newline
                           (str/replace-first

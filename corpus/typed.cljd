@@ -1,0 +1,47 @@
+(ns typed)
+
+(deftype Vec
+  [^int x]
+  :type-only true
+  Vec
+  (^Vec + [this o] (Vec-new (+ x (.-x o))))
+  (^Vec * [this ^int k] (Vec-new (* x k)))
+  (^String describe [this] (str "Vec(" x ")")))
+
+(defn ^Vec Vec-new [^int x]
+  (let [this (Vec x)] this))
+
+(deftype Holder
+  [^Vec v ^String name]
+  :type-only true
+  Holder)
+
+(defn ^Holder Holder-new [v ^String name]
+  (let [this (Holder v name)] this))
+
+(def ^:const vecPrefix "vec:")
+
+(defn vecSuffix []
+  "!")
+
+(defn vecOf [^int x]
+  (Vec-new x))
+
+(defn labelOf [^int x]
+  (str "v" x))
+
+(defn intOf [^int x]
+  (+ x 1))
+
+(defn typedOps [h]
+  (let [a (. (vecOf 1) + (vecOf 2))
+        b (. (vecOf 3) * 2)
+        c (. (.-v h) + a)
+        s (str (labelOf 4) "x")
+        t (str (.-name h) vecPrefix)
+        u (str (vecSuffix) (.-name h))
+        n (* (intOf 2) 3)]
+    (+ (.-x c) (.-length s) (.-length t) (.-length u) n (.-x b))))
+
+(defn typedStrings [h]
+  (str (labelOf 4) (.-name h) vecPrefix (vecSuffix)))

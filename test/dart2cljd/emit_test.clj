@@ -87,6 +87,59 @@
       (is (re-find #"\(let \[total \(atom 0\) bump \(fn \[\] \(swap! total \+ n\) nil\)\]" out))
       (is (re-find #"\(let \[out \(atom \"x\"\) add \(fn \[\] \(swap! out str \"y\"\) nil\)\]" out)))))
 
+;; ---------------------------------------------------------------------------
+;; M11: analyzer-resolved static types (`--types` fixture)
+;; ---------------------------------------------------------------------------
+
+(def typed-doc (delay (fixture "typed.edn")))
+
+(def typed-forms
+  (delay (decls/emit-unit (:unit @typed-doc) {:path "corpus/typed.dart"})))
+
+(deftest typed-golden
+  (testing "corpus/typed.dart translates byte-identically to the reviewed golden"
+    (is (= (slurp (io/file "corpus/typed.cljd"))
+           (str (printer/print-forms @typed-forms) "\n")))))
+
+(deftest resolved-static-types
+  (let [out (printer/print-forms @typed-forms)]
+    (testing "operator dispatch on call results / field reads is an interop call"
+      (is (re-find #"\(\. \(vecOf 1\) \+ \(vecOf 2\)\)" out))
+      (is (re-find #"\(\. \(vecOf 3\) \* 2\)" out))
+      (is (re-find #"\(\. \(\.-v h\) \+ a\)" out))
+      (testing "no runtime `dart/is?` guard remains for resolved receivers"
+        (is (not (re-find #"dart/is\?" out)))))
+    (testing "String concatenation uses resolved types"
+      (is (re-find #"\(str \(labelOf 4\) \"x\"\)" out))
+      (is (re-find #"\(str \(\.-name h\) vecPrefix\)" out))
+      (is (re-find #"\(str \(vecSuffix\) \(\.-name h\)\)" out)))
+    (testing "resolved numeric receivers stay plain arithmetic"
+      (is (re-find #"\(\* \(intOf 2\) 3\)" out)))))
+
+(deftest invalid-type-stays-dynamic
+  (testing "the analyzer's InvalidType is not classified as a class"
+    (let [ctx (core/ctx {} {})
+          node {:ir :binary :op "<="
+                :lhs {:ir :id :name "hearts" :dart-type "InvalidType"}
+                :rhs {:ir :int-lit :value 0 :raw "0"}}]
+      (is (= '(<= hearts 0) (core/emit-expr node ctx))))))
+
+(deftest value-call-external-name
+  (testing "a resolved call to an external function-valued variable routes
+            through the exports shim, not an implicit-this member read"
+    (let [ctx (core/ctx {:wildcard-alias 'exports} {})
+          node {:ir :call-fn
+                :fn {:ir :id :name "debugPrint"
+                     :dart-type "void Function(String?)"}
+                :args [{:expr {:ir :string-lit :raw "'x'" :value "x"}}]}]
+      (is (= '(exports/debugPrint "x") (core/emit-expr node ctx)))))
+  (testing "a callback stored in an instance field keeps the implicit-this read"
+    (let [ctx (core/ctx {} {:fields #{"cb"} :this-sym 'this})
+          node {:ir :call-fn
+                :fn {:ir :id :name "cb" :dart-type "void Function()"}
+                :args []}]
+      (is (= '(cb) (core/emit-expr node ctx))))))
+
 (deftest fn-typedef-type-symbol
   (testing "external function typedefs map to Function (ClojureDart's analyzer
             helper crashes on function-typedef elements; RESEARCH M8.10)"

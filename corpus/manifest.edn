@@ -13,6 +13,7 @@
 ;; the generated file `verify.main` requires.
 [{:name "m3" :mode :faithful}
  {:name "idiomatic" :mode :idiomatic}
+ {:name "typed" :mode :faithful :types true}
  {:kind :dir
   :name "batchproj"
   :dir "test/batchproj/lib"
