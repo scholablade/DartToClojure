@@ -20,8 +20,11 @@
     :unit-info   whole-unit class/typedef/getter table built by emit.decls
     :type-vars   type parameters in scope (kept bare in type positions)
     :local-types {:classes map of local name -> unit class name,
-                  :scalars set of names known to be Dart scalars}, from
+                  :scalars set of names known to be Dart scalars,
+                  :strings set of names known to be Dart Strings}, from
                  dart2cljd.typeinfo (unit-info :classes feeds it)
+    :string-fields set of String-typed instance fields of the current class
+                 (String `+`/`+=` concatenation needs it)
     :mixins      project mixin declarations by name (same unit and, in batch
                  mode, cross-file). Appliers inline their members and use
                  `implements` instead of Dart `with` (M8)
@@ -460,6 +463,21 @@
 (defn- box-form [captured? init]
   (list (if captured? 'atom 'volatile!) init))
 
+(defn- inherit-local-types
+  "Local types visible in a nested function: the enclosing function's facts
+  minus the names the nested function itself binds (a parameter/local shadows
+  the outer binding), merged with the nested function's own analysis (which
+  wins for names it declares)."
+  [outer inner shadowed]
+  (let [outer (or outer {:classes {} :scalars #{} :strings #{}})
+        inner (or inner {:classes {} :scalars #{} :strings #{}})]
+    {:classes (merge (apply dissoc (:classes outer) shadowed)
+                     (:classes inner))
+     :scalars (set/union (set/difference (:scalars outer) shadowed)
+                         (:scalars inner))
+     :strings (set/union (set/difference (:strings outer) shadowed)
+                         (:strings inner))}))
+
 (defn wrap-rebinds
   "Wrap `body` forms in the parameter-default rebinds from `emit-params`
   (non-constant Dart defaults become a nil default plus a body binding).
@@ -491,10 +509,18 @@
       (fail! body "generators (async*/sync*) are not supported by ClojureDart"))
     (case (:ir body)
       :expr-body
-      (let [renames (local-renames (keep :name params))
+      (let [param-names (keep :name params)
+            renames (local-renames param-names)
+            ;; An arrow-function parameter shadows an enclosing local of the
+            ;; same name; drop the inherited boxes/type facts for it.
+            shadowed (set param-names)
             ctx' (-> ctx
-                     (update :locals set/union (set (keep :name params)))
-                     (update :local-renames merge renames))
+                     (update :locals set/union (set param-names))
+                     (update :local-renames merge renames)
+                     (update :mutable set/difference shadowed)
+                     (update :captured set/difference shadowed)
+                     (assoc :local-types (inherit-local-types
+                                          (:local-types ctx) nil shadowed)))
             {:keys [params rebinds]} (emit-params params renames ctx')]
         {:params params
          :rebinds rebinds
@@ -518,12 +544,22 @@
                                :when (or (contains? mutated n) (not= base n))]
                            [n (str base (when (contains? mutated n) "$param"))]))
             ctx' (assoc ctx
-                        :mutable (:mutable info)
-                        :captured (:captured info)
-                        :local-types (typeinfo/local-types
-                                      (:block body)
-                                      (get-in ctx [:unit-info :classes])
-                                      params)
+                        ;; A nested function sees the enclosing function's
+                        ;; boxes and syntactic type facts for the names it
+                        ;; does not rebind itself (closure capture).
+                        :mutable (set/union (set/difference (:mutable ctx)
+                                                            (:declared info))
+                                            (:mutable info))
+                        :captured (set/union (set/difference (:captured ctx)
+                                                             (:declared info))
+                                             (:captured info))
+                        :local-types (inherit-local-types
+                                      (:local-types ctx)
+                                      (typeinfo/local-types
+                                       (:block body)
+                                       (get-in ctx [:unit-info :classes])
+                                       params)
+                                      (:declared info))
                         :locals (set/union (:locals ctx) (:declared info))
                         :local-renames (merge (:local-renames ctx) base-renames))
             body-forms ((:emit-body ctx') stmts (assoc ctx' :fn-body? true))
@@ -903,6 +939,21 @@
          (or (contains? (get-in (:local-types ctx) [:scalars]) (:name n))
              (contains? (:scalar-fields ctx) (:name n))))))
 
+(defn- string-expr?
+  "True when `node` is syntactically known to evaluate to a Dart String
+  (see dart2cljd.typeinfo/string-expr?): tracked String locals/parameters,
+  implicit-this `String` fields, literals/interpolations, `toString`-style
+  calls and `+` with a String operand."
+  [node ctx]
+  (let [n (strip-paren node)]
+    (if (and (= :prop (:ir n))
+             (= :this (:ir (:target n))))
+      (contains? (:string-fields ctx) (:name n))
+      (typeinfo/string-expr?
+       n
+       (into (set (get-in (:local-types ctx) [:strings]))
+             (:string-fields ctx))))))
+
 (defn- emit-user-operator [node ctx]
   (let [m (get operator-call-names (:op node))]
     (list '. (emit-expr (:lhs node) ctx) (operator-method-symbol m)
@@ -1016,6 +1067,14 @@
       (and (local-class-receiver (:lhs node) ctx)
            (contains? operator-call-names op))
       (emit-user-operator node ctx)
+
+      ;; Dart `String.+` concatenates; either operand being a String makes the
+      ;; whole (well-typed) `+` chain a concatenation. Same-operator chains
+      ;; flatten into the variadic `str` (evaluation order is preserved).
+      (and (= op "+")
+           (or (string-expr? (:lhs node) ctx)
+               (string-expr? (:rhs node) ctx)))
+      (list* 'str (flatten-same op node ctx))
 
       (guard-binary? node ctx)
       (emit-guarded-binary node ctx)
@@ -1255,6 +1314,13 @@
 
       (fail! node "unsupported increment/decrement target"))))
 
+(defn- string-name?
+  "True when the bare name `n` is a String local/parameter or a String
+  instance field of the current class."
+  [n ctx]
+  (or (contains? (get-in ctx [:local-types :strings]) n)
+      (contains? (:string-fields ctx) n)))
+
 (defn- assign-id [lhs op rhs ctx]
   (let [n (:name lhs)
         op (if (= "=" op) nil op)
@@ -1272,12 +1338,14 @@
           "??" (list 'if (list 'nil? d) (list resetter l rhs) d)
           "&&" (list 'if d (list resetter l rhs) d)
           "||" (list 'if d d (list resetter l rhs))
-          (if m
-            (list setter l
-                  (list 'fn ['d2c$a 'd2c$b]
-                        (list '. 'd2c$a (operator-method-symbol m) 'd2c$b))
-                  rhs)
-            (list setter l (compound-fn op) rhs))))
+          (if (and (= "+" (bare-operator op)) (string-name? n ctx))
+            (list setter l 'str rhs)
+            (if m
+              (list setter l
+                    (list 'fn ['d2c$a 'd2c$b]
+                          (list '. 'd2c$a (operator-method-symbol m) 'd2c$b))
+                    rhs)
+              (list setter l (compound-fn op) rhs)))))
 
       (contains? (:atom-fields ctx) n)
       (let [a (get (:atom-fields ctx) n)
@@ -1287,7 +1355,9 @@
           "??" (list 'if (list 'nil? d) (list 'reset! a rhs) d)
           "&&" (list 'if d (list 'reset! a rhs) d)
           "||" (list 'if d d (list 'reset! a rhs))
-          (list 'swap! a (compound-fn op) rhs)))
+          (if (and (= "+" (bare-operator op)) (string-name? n ctx))
+            (list 'swap! a 'str rhs)
+            (list 'swap! a (compound-fn op) rhs))))
 
       (and (or (:ctor-body? ctx) (:in-fn ctx))
            (:this-sym ctx)
@@ -1295,7 +1365,8 @@
       (assign-slot (list (symbol (str ".-" n)) (:this-sym ctx))
                    (fn [v] (list (symbol (str ".-" n "!")) (:this-sym ctx) v))
                    (if (nil? op) "=" op)
-                   rhs)
+                   rhs
+                   (contains? (:string-fields ctx) n))
 
       (and (contains? (get-in (:local-types ctx) [:classes]) n)
            (contains? operator-call-names (bare-operator op)))
@@ -1353,22 +1424,29 @@
           "||" (list 'if l
                      l
                      (list 'set! l rhs))
-          (list 'set! l (list (compound-fn op) l rhs)))))))
+          (list 'set! l
+                (if (and (= "+" (bare-operator op)) (string-name? n ctx))
+                  (list 'str l rhs)
+                  (list (compound-fn op) l rhs))))))))
 
-(defn- assign-slot [read write op rhs]
-  (case op
-    "=" (write rhs)
-    "??" (list 'if (list 'nil? read) (write rhs) read)
-    "&&" (list 'if read (write rhs) read)
-    "||" (list 'if read read (write rhs))
-    (write (list (compound-fn op) read rhs))))
+(defn- assign-slot
+  ([read write op rhs] (assign-slot read write op rhs false))
+  ([read write op rhs string?]
+   (case op
+     "=" (write rhs)
+     "??" (list 'if (list 'nil? read) (write rhs) read)
+     "&&" (list 'if read (write rhs) read)
+     "||" (list 'if read read (write rhs))
+     (write (if (and string? (= "+" (bare-operator op)))
+              (list 'str read rhs)
+              (list (compound-fn op) read rhs))))))
 
 (defn- assign-prop [lhs op rhs ctx]
   (let [obj (:target lhs)
         name (:name lhs)
         read (list (symbol (str ".-" name)) (emit-expr obj ctx))
         write (fn [v] (list (symbol (str ".-" name "!")) (emit-expr obj ctx) v))]
-    (assign-slot read write op rhs)))
+    (assign-slot read write op rhs (string-expr? lhs ctx))))
 
 (defn- assign-index [lhs op rhs ctx]
   (let [obj (:target lhs)

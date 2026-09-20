@@ -250,6 +250,9 @@
                 :scalar-fields (set (for [f fields
                                           :when (typeinfo/scalar-type? (:type f))]
                                       (:name f)))
+                :string-fields (set (for [f fields
+                                          :when (typeinfo/string-type? (:type f))]
+                                      (:name f)))
                 :static-members statics
                 :type-vars (set type-vars)
                 :this-sym 'this)

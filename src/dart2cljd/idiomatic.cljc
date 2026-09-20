@@ -40,7 +40,8 @@
   through the `setState` tick, not by itself."
   (:refer-clojure :exclude [methods])
   (:require [dart2cljd.alias :as alias]
-            [dart2cljd.emit.core :as core]))
+            [dart2cljd.emit.core :as core]
+            [dart2cljd.typeinfo :as typeinfo]))
 
 ;; ---------------------------------------------------------------------------
 ;; IR shape helpers
@@ -530,7 +531,9 @@
                        (not-any? #(mutates-name? build' (:name %)) managed))
               {:kind :stateful
                :name (:name s)
-               :fields (mapv (fn [f] {:name (:name f) :init (field-init (:name f))})
+               :fields (mapv (fn [f] {:name (:name f)
+                                      :type (:type f)
+                                      :init (field-init (:name f))})
                              (remove #(contains? managed-names (:name %)) fields))
                :managed managed-rw
                :vsync? (boolean (some :vsync? managed-rw))
@@ -675,6 +678,15 @@
                                [(:name f) (symbol (:name f))]))
         state-ctx (assoc ctx
                          :atom-fields atom-fields
+                         :string-fields (set (for [f state-fields
+                                                   :when (typeinfo/string-type? (:type f))]
+                                               (:name f)))
+                         ;; Syntactic facts for the builder-fn parameters
+                         ;; (scalar/String `+` semantics inside the widget body).
+                         :local-types (typeinfo/local-types
+                                       nil
+                                       (get-in ctx [:unit-info :classes])
+                                       params)
                          :state-ctx true
                          :tick-atom (when tick? 'd2c$tick))
         locals (cond-> (into param-names (concat method-names init-field-names

@@ -34,6 +34,43 @@
 (defn- strip-paren [node]
   (if (= :paren (:ir node)) (recur (:expr node)) node))
 
+(defn string-type?
+  "True when a normalized type node names `String` (nullable or not)."
+  [ty]
+  (and (scalar-type? ty)
+       (= "String" (str (:name ty)))))
+
+(def ^:private string-call-names
+  "Instance/static calls that return a Dart String, for the syntactic
+  string tracking. `toString` and `toRadixString` exist on `Object`/`int`
+  and are unambiguously String-returning; the static `String` factories are
+  matched by their receiver name."
+  #{"toString" "toRadixString"})
+
+(defn string-expr?
+  "True when a normalized expression node is syntactically known to hold a
+  Dart String. `strings` is the set of names already known to be strings
+  (locals, parameters and implicit-this String fields).
+
+  Sound for well-typed Dart: string literals and string interpolations are
+  Strings, `toString`/`toRadixString` return Strings, and `+` with a String
+  operand is Dart's `String.+` concatenation (Dart rejects a non-String
+  operand statically)."
+  [node strings]
+  (let [n (strip-paren node)]
+    (case (:ir n)
+      (:string-lit :string-interp :adjacent-strings) true
+      :id (contains? strings (str (:name n)))
+      :binary (and (= "+" (:op n))
+                   (or (string-expr? (:lhs n) strings)
+                       (string-expr? (:rhs n) strings)))
+      :call (or (contains? string-call-names (str (:name n)))
+                (and (= "String" (str (:name (:target n))))
+                     (contains? #{"fromCharCode" "fromEnvironment"
+                                  "fromCharCodes"}
+                                (str (:name n)))))
+      false)))
+
 (defn- unit-class
   "Class name when `ty` is a bare named type naming a class of this unit."
   [ty classes]
@@ -70,21 +107,37 @@
         :id (get types (:name n))
         nil))))
 
+(defn- definitely-non-string?
+  "True when a variable declaration is syntactically known not to hold a
+  String (used to drop a name whose declarations conflict under shadowing)."
+  [v]
+  (let [ty (:type v)
+        init (:ir (strip-paren (:init v)))]
+    (or (and (scalar-type? ty) (not (string-type? ty)))
+        (contains? #{:int-lit :double-lit :bool-lit :null-lit} init))))
+
 (defn local-types
   "Map of local name -> unit class name for locals constructed from unit
-  classes, plus the set of locals known to be scalars.
+  classes, plus the sets of locals known to be scalars / Strings.
 
   `classes` is the unit-info `:classes` map (class name -> info map) and
   `params` the function parameters (`:type` carries scalar declarations).
-  Returns {:classes {name class} :scalars #{name}}."
+  Returns {:classes {name class} :scalars #{name} :strings #{name}}.
+
+  Like the other syntactic passes it is name-based and over-approximates
+  shadowing; a name declared both as a String and with a definitely
+  non-String declaration is dropped from `:strings` (conservative)."
   [block classes params]
   (let [types (volatile! {})
-        scalars (volatile! #{})]
+        scalars (volatile! #{})
+        strings (volatile! #{})]
     (doseq [p params]
       (if-let [c (unit-class (:type p) classes)]
         (vswap! types assoc (:name p) c)
         (when (scalar-type? (:type p))
-          (vswap! scalars conj (:name p)))))
+          (vswap! scalars conj (:name p))
+          (when (string-type? (:type p))
+            (vswap! strings conj (:name p))))))
     (letfn [(scan [n]
               (cond
                 (map? n)
@@ -97,11 +150,17 @@
                       (when (or (scalar-type? (:type v))
                                 (contains? literal-irs
                                            (:ir (strip-paren (:init v)))))
-                        (vswap! scalars conj (:name v)))))
+                        (vswap! scalars conj (:name v))))
+                    (when (or (string-type? (:type v))
+                              (string-expr? (:init v) @strings))
+                      (vswap! strings conj (:name v)))
+                    (when (and (contains? @strings (:name v))
+                               (definitely-non-string? v))
+                      (vswap! strings disj (:name v))))
                   (:fn :fn-decl) nil
                   (doseq [v (vals (dissoc n :ir :src :annotations))]
                     (scan v)))
 
                 (coll? n) (doseq [v n] (scan v))))]
       (scan block)
-      {:classes @types :scalars @scalars})))
+      {:classes @types :scalars @scalars :strings @strings})))

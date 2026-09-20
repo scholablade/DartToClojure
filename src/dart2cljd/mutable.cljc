@@ -9,8 +9,10 @@
 
   The analysis is purely syntactic and intentionally over-approximates:
   name shadowing in disjoint scopes is not tracked (the result is still
-  correct, just occasionally boxes a local that did not need it), and
-  references inside nested functions only feed the `:captured` set.
+  correct, just occasionally boxes a local that did not need it). A write
+  inside a nested function counts as an assignment of the enclosing local
+  (closure capture mutation), which is what makes
+  `var x = 1; final g = () { x += 1; };` box `x` as an atom.
 
   No type information is needed, so results are stable and reproducible."
   (:require [clojure.set :as set]))
@@ -86,8 +88,9 @@
     (case (:ir node)
       :id (if (pos? depth) (ref-name acc (:name node)) acc)
 
-      ;; nested functions: only references inside count (as captures);
-      ;; their own declarations/assignments belong to their own analysis.
+      ;; nested functions: their own declarations are recorded (name-based),
+      ;; and a write to a name that is not declared inside them is an
+      ;; assignment of the enclosing local (closure capture).
       :fn (walk (:body node) (inc depth) acc)
       :fn-decl (let [acc (if (zero? depth)
                            (declare-name acc (:name node))
@@ -104,23 +107,21 @@
       :declared-ident (declare-name acc (:name node))
 
       :assign
-      (let [acc (if (and (zero? depth) (= :id (:ir (:lhs node))))
+      (let [acc (if (= :id (:ir (:lhs node)))
                   (assign-name acc (:name (:lhs node)))
                   acc)
             acc (walk (:lhs node) depth acc)]
         (walk (:rhs node) depth acc))
 
       :postfix
-      (let [acc (if (and (zero? depth)
-                         (contains? #{"++" "--"} (:op node))
+      (let [acc (if (and (contains? #{"++" "--"} (:op node))
                          (= :id (:ir (:operand node))))
                   (assign-name acc (:name (:operand node)))
                   acc)]
         (walk (:operand node) depth acc))
 
       :prefix
-      (let [acc (if (and (zero? depth)
-                         (contains? #{"++" "--"} (:op node))
+      (let [acc (if (and (contains? #{"++" "--"} (:op node))
                          (= :id (:ir (:operand node))))
                   (assign-name acc (:name (:operand node)))
                   acc)]
@@ -161,9 +162,7 @@
         acc)
 
       :pattern-assign
-      (let [acc (if (zero? depth)
-                  (pattern-assigns acc (:pattern node))
-                  acc)
+      (let [acc (pattern-assigns acc (:pattern node))
             acc (walk (:pattern node) depth acc)]
         (walk (:expr node) depth acc))
 
