@@ -47,6 +47,17 @@
            (n {:ast :SimpleStringLiteral :raw "'hi'" :value "hi"
                :raw-string false :multiline false :src (src 6 1)})))))
 
+(deftest resolved-facts
+  (testing ":static-type and :element become :dart-type / :dart-element"
+    (is (= {:ir :id :name "foo" :dart-type "String" :dart-element :getter
+            :src (src 1 1)}
+           (n {:ast :SimpleIdentifier :id "foo" :static-type "String"
+               :element :getter :src (src 1 1)}))))
+  (testing "parse-only nodes carry neither fact"
+    (let [node (n {:ast :SimpleIdentifier :id "foo" :src (src 1 1)})]
+      (is (nil? (:dart-type node)))
+      (is (nil? (:dart-element node))))))
+
 (deftest type-annotations
   (testing "NamedType"
     (is (= {:ir :named-type :prefix "m" :name "Text" :type-args [] :nullable true

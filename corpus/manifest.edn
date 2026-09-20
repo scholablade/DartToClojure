@@ -24,4 +24,18 @@
   :expect-failures ["orphan_part.dart"]
   :entry "main"
   :exports-file "verify/lib/d2c_exports.dart"
-  :exports-uri "package:cljd_verify/d2c_exports.dart"}]
+  :exports-uri "package:cljd_verify/d2c_exports.dart"}
+ ;; M12: a *typed* directory conversion (element kinds from resolution). The
+ ;; fixture's package context is the dart2cljd checkout itself, so resolution
+ ;; needs no separate `dart pub get`.
+ {:kind :dir
+  :name "typedproj"
+  :dir "corpus/typedproj/lib"
+  :out "verify/src/verify/gen/typedproj"
+  :ns-prefix "verify.gen.typedproj"
+  :package "typedproj"
+  :mode :faithful
+  :types true
+  :entry "main"
+  :exports-file "verify/lib/typed_exports.dart"
+  :exports-uri "package:cljd_verify/typed_exports.dart"}]

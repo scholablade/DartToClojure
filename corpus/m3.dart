@@ -471,6 +471,64 @@ String closureString() {
 @Deprecated('use newName')
 int oldName = 1;
 
+// M12: Dart built-in identifiers are legal field names but are reserved words
+// for ClojureDart, which munges them to `$name_` in the generated Dart. Writes
+// must use the munged spelling (`.-$base_!`) — its `.-base!` setter sugar has
+// no munge fallback and compiled to a dynamic member assignment (RESEARCH
+// M12.2). Covers ctor-body, method, closure and cascade writes.
+class ReservedFields {
+  int base;
+  String tag;
+  late int late;
+
+  ReservedFields(int b, String t, int l) : base = b, tag = t {
+    late = l;
+    base = base + 1;
+  }
+
+  int readBase() => base;
+
+  int bumpBase(int by) {
+    base = base + by;
+    return base;
+  }
+
+  int bumpInClosure(int by) {
+    final bump = () {
+      base += by;
+    };
+    bump();
+    return base;
+  }
+
+  String readTag() => tag;
+
+  void appendTag(String s) {
+    tag = tag + s;
+  }
+
+  int readLate() => late;
+
+  void setLate(int v) {
+    late = v;
+  }
+
+  int bumpLate() {
+    this.late++;
+    return late;
+  }
+
+  void copyBase(ReservedFields other) {
+    other.base = base + 1;
+  }
+
+  void cascade() {
+    this
+      ..base = 5
+      ..late = 6;
+  }
+}
+
 void main() {
   final p = Point(1, 2);
   p.x = 3;

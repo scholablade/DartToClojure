@@ -515,6 +515,33 @@
 
 ^{:dart/annotations ["@Deprecated(\"use newName\")"]} ^:deprecated (def oldName 1)
 
+(deftype ReservedFields
+  [^:mutable ^int base ^:mutable ^String tag ^:mutable ^int late]
+  :type-only true
+  ReservedFields
+  (^int readBase [this] base)
+  (^int bumpBase [this ^int by] (set! base (+ base by)) base)
+  (^int bumpInClosure
+    [this ^int by]
+    (let [bump (fn [] (.-$base_! this (+ (.-$base_ this) by)) nil)] (bump) base))
+  (^String readTag [this] tag)
+  (^void appendTag [this ^String s] (set! tag (str tag s)) nil)
+  (^int readLate [this] late)
+  (^void setLate [this ^int v] (set! late v) nil)
+  (^int bumpLate [this] (.-$late_! this (inc (.-late this))) late)
+  (^void copyBase [this other] (.-$base_! other (+ base 1)) nil)
+  (^void cascade [this] (doto this (.-$base_! 5) (.-$late_! 6)) nil))
+
+(defn ^ReservedFields ReservedFields-new [^int b ^String t ^int l]
+  (let [base b
+        tag t
+        late 0
+        this (ReservedFields base tag late)]
+    (.-$late_! this l)
+    (.-$base_! this (+ (.-$base_ this) 1))
+    nil
+    this))
+
 (defn main []
   (let [p (Point-new 1 2)]
     (.-x! p 3)

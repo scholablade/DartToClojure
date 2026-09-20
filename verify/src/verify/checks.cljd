@@ -18,6 +18,8 @@
             [verify.gen.typed :as ty]
             [verify.gen.batchproj.main :as bp]
             [verify.gen.batchproj.models.item :as item]
+            [verify.gen.typedproj.main :as tp]
+            [verify.gen.typedproj.shared :as shared]
             ["package:flutter/material.dart" :as m]
             ["package:flutter_test/flutter_test.dart" :as ft]))
 
@@ -288,6 +290,33 @@
     (ft/expect (ft/find.text "ab!") ft/findsOneWidget)))
 
 ;; ---------------------------------------------------------------------------
+;; M12: reserved-word field names
+;;
+;; `ReservedFields` (corpus/m3.dart) declares fields named `base`/`late`:
+;; ClojureDart munges them to `$base_`/`$late_` in the generated Dart, so every
+;; write must use the munged spelling (RESEARCH M12.2).
+;; ---------------------------------------------------------------------------
+
+(deftest reserved-word-fields
+  (let [r (g/ReservedFields-new 1 "a" 2)]
+    (is (= 2 (.readBase r)))
+    (is (= "a" (.readTag r)))
+    (is (= 2 (.readLate r)))
+    (is (= 5 (.bumpBase r 3)))
+    (is (= 7 (.bumpInClosure r 2)))
+    (.appendTag r "b")
+    (is (= "ab" (.readTag r)))
+    (is (= 3 (.bumpLate r)))
+    (.setLate r 9)
+    (is (= 9 (.readLate r)))
+    (.cascade r)
+    (is (= 5 (.readBase r)))
+    (is (= 6 (.readLate r)))
+    (let [other (g/ReservedFields-new 0 "o" 0)]
+      (.copyBase r other)
+      (is (= 6 (.readBase other))))))
+
+;; ---------------------------------------------------------------------------
 ;; M11: analyzer-resolved static types (`--types`)
 ;;
 ;; `verify.gen.typed` is the translation of `corpus/typed.dart` from the
@@ -299,3 +328,28 @@
   (let [h (ty/Holder-new (ty/Vec-new 5) "n")]
     (is (= 33 (ty/typedOps h)))
     (is (= "v4nvec:!" (ty/typedStrings h)))))
+
+;; ---------------------------------------------------------------------------
+;; M12: element kinds from resolution (`--types`)
+;;
+;; `verify.gen.typedproj.main` is the translation of the typed directory
+;; fixture `corpus/typedproj/lib`: an instance member inherited from outside
+;; the converted tree (`StringBuffer.length`) wins over the same-named
+;; cross-file top-level value (Dart innermost-first), and unaliased
+;; `dart:math` top-level names route through the exports shim instead of
+;; becoming implicit-this member accesses.
+;; ---------------------------------------------------------------------------
+
+(deftest resolved-element-kinds
+  ;; Without the resolved element fact this returned 42 (the project's
+  ;; `length` value); `StringBuffer.length` must win inside `Buf`.
+  (is (= 4 (tp/bufLength "abcd")))
+  (is (= 42 (tp/topLength)))
+  ;; `max`/`pi` are dart:math top-levels; the shim re-exports them.
+  (is (= 7 (tp/calcMax 3 7)))
+  (is (< 3.14 (tp/calcArea 1.0) 3.15))
+  ;; The project's top-level variable/function still resolve to their
+  ;; generated namespace.
+  (shared/resetShared)
+  (is (= 1 (tp/sharedValue)))
+  (is (= 2 (do (tp/bumpedShared) (tp/sharedValue)))))

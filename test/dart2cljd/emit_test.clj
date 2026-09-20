@@ -124,6 +124,66 @@
                 :rhs {:ir :int-lit :value 0 :raw "0"}}]
       (is (= '(<= hearts 0) (core/emit-expr node ctx))))))
 
+(deftest resolved-element-kinds
+  (testing "an instance element is an implicit-this read even when a
+            cross-file project value has the same name (Dart innermost-first)"
+    (let [ctx (core/ctx {:project-values {"length" {:ns 'app.shared :kinds #{:var}}}}
+                        {:this-sym 'this})
+          node {:ir :id :name "length" :dart-element :getter}]
+      (is (= '(.-length this) (core/emit-expr node ctx))))
+    (testing "without the element fact the project value still wins"
+      (let [ctx (core/ctx {:project-values {"length" {:ns 'app.shared :kinds #{:var}}}}
+                          {:this-sym 'this})
+            node {:ir :id :name "length"}]
+        (is (= 'app.shared/length (core/emit-expr node ctx))))))
+  (testing "a top-level element inside a class is not an implicit-this read"
+    (let [ctx (core/ctx {:wildcard-alias 'exports} {:this-sym 'this})
+          node {:ir :id :name "pi" :dart-element :top-getter}]
+      ;; an external top-level getter is a Dart property reference through
+      ;; the shim, not a generated cljd getter fn (that is the same-unit case)
+      (is (= 'exports/pi (core/emit-expr node ctx))))
+    (testing "without the element fact it becomes `(.-pi this)`"
+      (let [ctx (core/ctx {} {:this-sym 'this})
+            node {:ir :id :name "pi"}]
+        (is (= '(.-pi this) (core/emit-expr node ctx))))))
+  (testing "a resolved top-level function inside a class routes through the
+            imports/exports shim, not to an implicit-this call"
+    (let [ctx (core/ctx {:wildcard-alias 'exports} {:this-sym 'this})
+          node {:ir :call :name "max" :dart-element :top-fn :target nil
+                :args [{:expr {:ir :int-lit :value 1 :raw "1"}}
+                       {:expr {:ir :int-lit :value 2 :raw "2"}}]}]
+      (is (= '(exports/max 1 2) (core/emit-expr node ctx))))
+    (testing "without the element fact it becomes `(.max this 1 2)`"
+      (let [ctx (core/ctx {} {:this-sym 'this})
+            node {:ir :call :name "max" :target nil
+                  :args [{:expr {:ir :int-lit :value 1 :raw "1"}}
+                         {:expr {:ir :int-lit :value 2 :raw "2"}}]}]
+        (is (= '(.max this 1 2) (core/emit-expr node ctx))))))
+  (testing "an instance method element wins over a same-named project value"
+    (let [ctx (core/ctx {:project-values {"describe" {:ns 'app.shared :kinds #{:fn}}}
+                         :wildcard-alias 'exports}
+                        {:this-sym 'this})
+          node {:ir :call :name "describe" :dart-element :method :target nil :args []}]
+      (is (= '(.describe this) (core/emit-expr node ctx))))
+    (testing "without the element fact the project value is called"
+      (let [ctx (core/ctx {:project-values {"describe" {:ns 'app.shared :kinds #{:fn}}}}
+                          {:this-sym 'this})
+            node {:ir :call :name "describe" :target nil :args []}]
+        (is (= '(app.shared/describe) (core/emit-expr node ctx))))))
+  (testing "a value call routes by element: top-level vs implicit-this field"
+    (let [ctx (core/ctx {:wildcard-alias 'exports} {:this-sym 'this})]
+      (is (= '(exports/debugPrint "x")
+             (core/emit-expr {:ir :call-fn
+                              :fn {:ir :id :name "debugPrint"
+                                   :dart-element :top-getter}
+                              :args [{:expr {:ir :string-lit :value "x"}}]}
+                             ctx)))
+      (is (= '((.-cb this))
+             (core/emit-expr {:ir :call-fn
+                              :fn {:ir :id :name "cb" :dart-element :getter}
+                              :args []}
+                             ctx))))))
+
 (deftest value-call-external-name
   (testing "a resolved call to an external function-valued variable routes
             through the exports shim, not an implicit-this member read"
@@ -150,6 +210,48 @@
       (is (= 'Function? (core/type-symbol (named "VoidCallback" true) ctx)))
       (testing "names the pass did not resolve keep their ordinary hint"
         (is (= 'Widget (core/type-symbol (named "Widget" false) ctx)))))))
+
+(deftest reserved-word-field-names
+  (testing "ClojureDart's field munging is reproduced for reserved words"
+    (is (= "$base_" (core/dart-field-name "base")))
+    (is (= "$late_" (core/dart-field-name "late")))
+    (is (= "value" (core/dart-field-name "value"))))
+  (testing "a closure write to a reserved-word field uses the munged spelling
+            (the `.-base!` sugar compiles to a dynamic assignment)"
+    (let [ctx (assoc (core/ctx {} {:fields #{"base"} :this-sym 'this}) :in-fn true)]
+      (is (= '(.-$base_! this 1)
+             (core/emit-expr {:ir :assign :op "="
+                              :lhs {:ir :id :name "base"}
+                              :rhs {:ir :int-lit :value 1 :raw "1"}}
+                             ctx)))))
+  (testing "a plain method write keeps the bare field symbol"
+    (let [ctx (core/ctx {} {:fields #{"base"} :this-sym 'this})]
+      (is (= '(set! base 1)
+             (core/emit-expr {:ir :assign :op "="
+                              :lhs {:ir :id :name "base"}
+                              :rhs {:ir :int-lit :value 1 :raw "1"}}
+                             ctx)))))
+  (testing "`this.base = 1` uses the munged setter sugar"
+    (let [ctx (core/ctx {} {:fields #{"base"} :this-sym 'this})]
+      (is (= '(.-$base_! this 1)
+             (core/emit-expr {:ir :assign :op "="
+                              :lhs {:ir :prop :name "base" :target {:ir :this}}
+                              :rhs {:ir :int-lit :value 1 :raw "1"}}
+                             ctx)))))
+  (testing "`this.base++` uses the munged write"
+    (let [ctx (core/ctx {} {:fields #{"base"} :this-sym 'this})]
+      (is (= '(.-$base_! this (inc (.-base this)))
+             (core/emit-expr {:ir :postfix :op "++"
+                              :operand {:ir :prop :name "base"
+                                        :target {:ir :this}}}
+                             ctx)))))
+  (testing "non-reserved field names are untouched"
+    (let [ctx (assoc (core/ctx {} {:fields #{"value"} :this-sym 'this}) :in-fn true)]
+      (is (= '(.-value! this 1)
+             (core/emit-expr {:ir :assign :op "="
+                              :lhs {:ir :id :name "value"}
+                              :rhs {:ir :int-lit :value 1 :raw "1"}}
+                             ctx))))))
 
 ;; ---------------------------------------------------------------------------
 ;; expression parity (seeded from DartClojure's corpus, corrected to

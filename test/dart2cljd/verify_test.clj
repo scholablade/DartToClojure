@@ -29,7 +29,8 @@
 
 (deftest manifest-is-complete
   (let [entries (verify/manifest root)]
-    (is (= #{"m3" "idiomatic" "typed" "batchproj"} (set (map :name entries))))
+    (is (= #{"m3" "idiomatic" "typed" "batchproj" "typedproj"}
+           (set (map :name entries))))
     (is (= :faithful (:mode (first (filter #(= "m3" (:name %)) entries)))))
     (is (= :idiomatic (:mode (first (filter #(= "idiomatic" (:name %)) entries)))))
     (testing "each file entry has input and golden files"
@@ -38,10 +39,17 @@
         (is (.exists (io/file root "corpus" (str name ".dart"))))
         (is (.exists (io/file root "corpus" (str name ".cljd"))))))
     (testing "the directory entry names its source tree and expected failures"
-      (let [entry (first (filter #(= :dir (verify/entry-kind %)) entries))]
+      (let [entry (first (filter #(= "batchproj" (:name %)) entries))]
         (is (= "test/batchproj/lib" (:dir entry)))
         (is (= "verify.gen.batchproj" (:ns-prefix entry)))
         (is (= ["orphan_part.dart"] (:expect-failures entry)))
+        (is (= "main" (:entry entry)))
+        (is (.isDirectory (io/file root (:dir entry))))))
+    (testing "the typed directory entry resolves element kinds"
+      (let [entry (first (filter #(= "typedproj" (:name %)) entries))]
+        (is (= "corpus/typedproj/lib" (:dir entry)))
+        (is (true? (:types entry)))
+        (is (= "verify.gen.typedproj" (:ns-prefix entry)))
         (is (= "main" (:entry entry)))
         (is (.isDirectory (io/file root (:dir entry))))))))
 
