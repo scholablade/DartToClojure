@@ -239,6 +239,20 @@
                      ;; `:class`, `:ctor`, ...); see ir.cljc for the table.
                      (contains? raw :element)
                      (assoc :dart-element (:element raw))
+                     ;; `--types` resolution facts: extension members are
+                     ;; static sugar in Dart (`180.w`, `s.startWith(v)`); the
+                     ;; emitter needs the extension's name and library to emit
+                     ;; ClojureDart's explicit application form.
+                     (contains? raw :extension)
+                     (assoc :dart-extension (:extension raw))
+                     (contains? raw :extension-uri)
+                     (assoc :dart-extension-uri (:extension-uri raw))
+                     ;; `--types` resolution facts: the instantiated type
+                     ;; arguments of a constructor call, which Dart would infer
+                     ;; from the arguments (the generated code loses the
+                     ;; argument's static type, so the emitter restores them).
+                     (contains? raw :resolved-type-args)
+                     (assoc :dart-type-args (:resolved-type-args raw))
                      ;; `--types` write facts on assignment/increment nodes:
                      ;; the element being written and, for fields, the class
                      ;; declaring it (ClojureDart munges field names).

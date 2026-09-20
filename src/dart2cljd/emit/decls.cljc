@@ -1123,7 +1123,13 @@
                  (and (= :call (:ir node))
                       (= :id (:ir (:target node)))
                       (contains? renames (:name (:target node))))
-                 (assoc-in [:target :name] (get renames (:name (:target node)))))]
+                 (assoc-in [:target :name] (get renames (:name (:target node))))
+                 ;; resolved type arguments (`--types`) carry raw analyzer
+                 ;; names, which the unit-local private rename must cover too
+                 ;; (`List<_ContentItem>` -> `List<d2c_ContentItem>`).
+                 (seq (:dart-type-args node))
+                 (update :dart-type-args
+                         (fn [names] (mapv #(get renames % %) names))))]
       (reduce-kv (fn [acc k v] (assoc acc k (rename-private-type-node v renames)))
                  {} node))
     (vector? node) (mapv #(rename-private-type-node % renames) node)

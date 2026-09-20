@@ -224,6 +224,35 @@
         (symbol (str sym "?"))
         sym))))
 
+(defn- type-params-meta
+  "Metadata `{:type-params [...]}` for an explicit Dart generic invocation:
+  ClojureDart expresses call-site type arguments as metadata on the called
+  symbol (constructors, methods, functions), never as a call argument."
+  [args ctx node]
+  (when-let [args (seq args)]
+    {:type-params (mapv #(or (type-symbol % ctx)
+                             (fail! node "unsupported type argument"))
+                        args)}))
+
+(defn- with-type-params
+  "Attach `^{:type-params [...]}` to `sym` when the call carries explicit Dart
+  type arguments (`BlocBuilder<A, B>`, `ctx.read<T>()`)."
+  [sym args ctx node]
+  (if-let [m (type-params-meta args ctx node)]
+    (with-meta sym (merge (meta sym) m))
+    sym))
+
+(defn- with-resolved-type-params
+  "Attach `^{:type-params [...]}` from analyzer type-argument *names* (a
+  `--types` fact) for a constructor call whose instantiation Dart would infer
+  from the argument's static type — which the generated code loses."
+  [sym node ctx]
+  (if-let [names (seq (:dart-type-args node))]
+    (with-meta sym (merge (meta sym)
+                          {:type-params (mapv #(alias/qualify % (:aliases ctx))
+                                              names)}))
+    sym))
+
 (defn- ctor-symbol [ctor ctx]
   (let [t (:type ctor)
         ;; `const Foo.named(...)` parses in parse-only mode as a NamedType
@@ -596,9 +625,29 @@
 (defn- link? [n]
   (and (map? n) (contains? #{:prop :call :prefixed-id} (:ir n))))
 
+(defn- link-extension
+  "Extension symbol applying a chain link whose member is an extension member
+  (a `--types` fact: `180.w`, `s.startWith(v)`). Nil for ordinary members;
+  fails loudly when the extension cannot be resolved in this unit."
+  [n ctx]
+  (when-let [ext (:dart-extension n)]
+    (or (alias/qualify-extension (:dart-extension-uri n) ext (:aliases ctx))
+        (fail! n (str "extension " ext " is not available in this unit; import "
+                      "its library directly or route it through the exports shim")))))
+
+(def ^:private core-primitive-classes
+  "Lowercase dart:core type names that can be the base of a static member
+  access (`double.infinity`, `int.parse`) — the UpperCamelCase class-name
+  heuristic misses them, and `(.-infinity double)` calls the `double`
+  coercion function at runtime."
+  #{"double" "int" "num" "bool"})
+
 (defn- class-like? [name ctx]
   (or (local-class? name ctx)
-      (alias/class-name? name)))
+      (alias/class-name? name)
+      (and (contains? core-primitive-classes (str name))
+           (not (contains? (:locals ctx) (str name)))
+           (not (contains? (:fields ctx) (str name))))))
 
 (defn- static-base? [n ctx]
   (and (= :id (:ir n))
@@ -638,13 +687,20 @@
       (let [{:keys [prefix name src]} n]
         (if (import-prefix-sym? prefix ctx)
           [(qualified-node (symbol (str prefix "/" name)) src) links]
-          [(id-node prefix src) (cons {:kind :get :name name :null-aware false} links)]))
+          [(id-node prefix src)
+           (cons {:kind :get :name name :null-aware false
+                  :extension (link-extension n ctx)}
+                 links)]))
 
       (:prop :call)
       (let [t (:target n)
+            ext (link-extension n ctx)
             link (if (= :call (:ir n))
-                   {:kind :call :name (:name n) :args (:args n) :null-aware (:null-aware n)}
-                   {:kind :get :name (:name n) :null-aware (:null-aware n)})]
+                   {:kind :call :name (:name n) :args (:args n)
+                    :type-args (:type-args n)
+                    :null-aware (:null-aware n) :extension ext}
+                   {:kind :get :name (:name n) :null-aware (:null-aware n)
+                    :extension ext})]
         (cond
           ;; a target-less call/property is itself the chain base
           (nil? t) [n links]
@@ -665,10 +721,27 @@
 
       [n links])))
 
-(defn- link-step [l ctx]
-  (case (:kind l)
-    :get (symbol (str ".-" (:name l)))
-    :call (list* (symbol (str "." (:name l))) (emit-args (:args l) ctx))))
+(defn- link-steps
+  "Thread steps for one chain link. An extension member first applies its
+  extension class to the current value, then the member:
+  `(-> x alias/Ext (.-w))`, `(-> s alias/StartWithExtension (.startWith v))`.
+  Explicit type arguments become `^{:type-params [...]}` on the member symbol.
+
+  In a null-aware (`some->`) chain the two are emitted as one combined `->`
+  step: `some->` binds each step's value and Dart forbids binding an explicit
+  extension application, while `(some-> x (-> Ext (.m)))` expands to the
+  valid inline `(-> x Ext (.m))`."
+  [l ctx null-aware?]
+  (let [member (case (:kind l)
+                 :get (symbol (str ".-" (:name l)))
+                 :call (list* (with-type-params (symbol (str "." (:name l)))
+                                                (:type-args l) ctx l)
+                              (emit-args (:args l) ctx)))]
+    (if-let [ext (:extension l)]
+      (if null-aware?
+        [(list '-> ext member)]
+        [ext member])
+      [member])))
 
 (defn- emit-base [base ctx]
   (if (= :qualified (:ir base))
@@ -696,6 +769,7 @@
         f (first links)
         member (:name f)
         more (rest links)
+        null-aware? (boolean (some :null-aware links))
         kind (static-member-kind class member ctx)
         base-form (case (:kind f)
                     :get (case kind
@@ -716,7 +790,7 @@
                                                     " is a field, not a method"))
                             nil (fail! node (str "unknown static member "
                                                  class "." member))))]
-    (thread base-form (map #(link-step % ctx) more)
+    (thread base-form (mapcat #(link-steps % ctx null-aware?) more)
             (boolean (some :null-aware links)))))
 
 (defn- emit-project-static
@@ -729,6 +803,7 @@
         f (first links)
         member (:name f)
         more (rest links)
+        null-aware? (boolean (some :null-aware links))
         kinds (get (:statics info) member)
         sym (symbol (str (:ns info) "/" class "-" member))
         base-form (case (:kind f)
@@ -751,7 +826,7 @@
     (when (:widget? info)
       (fail! node (str class " is translated as a widget builder fn; static "
                        "member access is not available in idiomatic mode")))
-    (thread base-form (map #(link-step % ctx) more)
+    (thread base-form (mapcat #(link-steps % ctx null-aware?) more)
             (boolean (some :null-aware links)))))
 
 (defn- emit-chain [node ctx]
@@ -766,10 +841,18 @@
         (if (static-base? base ctx)
           (let [[f & more] links]
             (if (= :call (:kind f))
-              ;; static method call, then optional further steps
-              (thread (list* (alias/qualify-member (:name base) (:name f) (:aliases ctx))
-                             (emit-args (:args f) ctx))
-                      (map #(link-step % ctx) more)
+              ;; static method call, then optional further steps. Explicit
+              ;; type arguments require the `(.member Class args)` form with
+              ;; `^{:type-params [...]}` on the *member* symbol (ClojureDart
+              ;; reads the class symbol's metadata as the class's own type
+              ;; arguments, which fails for a non-generic class).
+              (thread (if-let [m (type-params-meta (:type-args f) ctx f)]
+                        (list* (with-meta (symbol (str "." (:name f))) m)
+                               (alias/qualify (:name base) (:aliases ctx))
+                               (emit-args (:args f) ctx))
+                        (list* (alias/qualify-member (:name base) (:name f) (:aliases ctx))
+                               (emit-args (:args f) ctx)))
+                      (mapcat #(link-steps % ctx null-aware?) more)
                       (boolean (some :null-aware links)))
               ;; static field/getter path -> dotted symbol, then optional
               ;; further steps (`WidgetsBinding.instance.addObserver(this)`,
@@ -780,10 +863,10 @@
                   (fail! node "unsupported static member chain"))
                 (thread (symbol (str (alias/qualify (:name base) (:aliases ctx))
                                      (apply str (map #(str "." (:name %)) getters))))
-                        (map #(link-step % ctx) more)
+                        (mapcat #(link-steps % ctx null-aware?) more)
                         (boolean (some :null-aware links))))))
           (thread (emit-base base ctx)
-                  (map #(link-step % ctx) links)
+                  (mapcat #(link-steps % ctx null-aware?) links)
                   null-aware?))))))
 
 (defn- known-bare?
@@ -934,7 +1017,9 @@
             (fail! node (str n " has no unnamed constructor")))))
 
       (class-like? n ctx)
-      (list* (alias/qualify n (:aliases ctx)) (emit-args (:args node) ctx))
+      (list* (with-type-params (alias/qualify n (:aliases ctx))
+                               (:type-args node) ctx node)
+             (emit-args (:args node) ctx))
 
       (and (:this-sym ctx)
            (not (known-bare? n ctx))
@@ -945,7 +1030,8 @@
 
       :else
       (list* (if (and (:wildcard-alias (:aliases ctx)) (not (known-bare? n ctx)))
-               (alias/qualify n (:aliases ctx))
+               (with-type-params (alias/qualify n (:aliases ctx))
+                                 (:type-args node) ctx node)
                (local-symbol n ctx))
              (emit-args (:args node) ctx)))))
 
@@ -1315,12 +1401,26 @@
 
 (defn dart-field-name
   "Dart spelling ClojureDart uses for a deftype field name: reserved words and
-  built-in identifiers become `$name_`, everything else is unchanged (Dart
-  identifiers cannot contain the other characters ClojureDart's munge
-  rewrites)."
+  built-in identifiers become `$name_`; every other character outside
+  `[A-Za-z0-9]` is escaped the way ClojureDart's `munge` escapes it
+  (`_` -> `$UNDERSCORE_`, `$` -> `$DOLLAR_`; a leading `-` is `$_`). Dart
+  identifiers contain only `[A-Za-z0-9_$]`, so `_` and `$` are the cases in
+  practice — but `_` is common (`_authSub` -> `$UNDERSCORE_authSub`) and the
+  `.-name!` setter path has no munge fallback (RESEARCH M12.2)."
   [n]
   (let [n (str n)]
-    (if (contains? cljd-reserved-words n) (str "$" n "_") n)))
+    (cond
+      (contains? cljd-reserved-words n) (str "$" n "_")
+      (re-matches #"[A-Za-z0-9]+" n) n
+      :else (str/replace n #"[^A-Za-z0-9]"
+                         (fn [c]
+                           (case c
+                             "_" "$UNDERSCORE_"
+                             "$" "$DOLLAR_"
+                             "-" "$_"
+                             (str "$u"
+                                  (str/upper-case (.toString (int (first c)) 16))
+                                  "_")))))))
 
 (defn field-read-sym
   "`.-name` symbol for a field read, munging reserved-word field names."
@@ -1428,9 +1528,18 @@
   (assign-slot (:read st) (:write st) (if (nil? op) "=" op) rhs
                (= :string (static-kind lhs))))
 
+(defn- fail-on-extension-write!
+  "Extension setters/increments are not supported: fail loudly instead of
+  emitting a wrong member write (`--types` extension fact)."
+  [node what]
+  (when (:dart-extension node)
+    (fail! node (str "writing the extension member " (:dart-extension node)
+                     " is not supported (" what ")"))))
+
 (defn- emit-increment-place
   "`x++` on a property/index target, incl. static members of classes."
   [target node ctx op prefix?]
+  (fail-on-extension-write! target "increment")
   (if-let [st (and (= :prop (:ir target)) (static-write-target target ctx))]
     (do
       (when (nil? (:read st))
@@ -1726,6 +1835,7 @@
               (list (compound-fn op) read rhs))))))
 
 (defn- assign-prop [lhs op rhs ctx]
+  (fail-on-extension-write! lhs "assignment")
   (let [obj (:target lhs)
         name (:name lhs)
         ;; M12 follow-up: the resolved write element may be a field of a
@@ -1992,6 +2102,7 @@
 
 (defn- emit-cascade-section
   [s ctx target]
+  (fail-on-extension-write! s "cascade")
   (case (:ir s)
     :call (list* (symbol (str "." (:name s))) (emit-args (:args s) ctx))
     :prop (list (symbol (str ".-" (:name s))))
@@ -2151,27 +2262,42 @@
     :call (:name node)))
 
 (defn- emit-ctor-head [node ctx]
-  (let [raw (ctor-node-name node)]
-    (cond
-      (contains? (get-in ctx [:unit-info :widget-fns]) (str raw)) (symbol (str raw))
+  (let [raw (ctor-node-name node)
+        internal? (or (contains? (get-in ctx [:unit-info :widget-fns]) (str raw))
+                      (local-class? raw ctx)
+                      (project-type-info raw ctx))
+        sym (cond
+              (contains? (get-in ctx [:unit-info :widget-fns]) (str raw))
+              (symbol (str raw))
 
-      (local-class? raw ctx)
-      (if (known-ctor? raw (:name (:ctor node)) ctx)
-        (ctor-symbol-for raw (:name (:ctor node)))
-        (fail! node (str raw " has no constructor "
-                         (or (:name (:ctor node)) "new"))))
+              (local-class? raw ctx)
+              (if (known-ctor? raw (:name (:ctor node)) ctx)
+                (ctor-symbol-for raw (:name (:ctor node)))
+                (fail! node (str raw " has no constructor "
+                                 (or (:name (:ctor node)) "new"))))
 
-      (project-type-info raw ctx)
-      (let [info (project-type-info raw ctx)]
-        (cond
-          (:widget? info) (symbol (str (:ns info) "/" raw))
-          :else (or (project-ctor-symbol info raw (:name (:ctor node)))
-                    (fail! node (str raw " has no constructor "
-                                     (or (:name (:ctor node)) "new"))))))
+              (project-type-info raw ctx)
+              (let [info (project-type-info raw ctx)]
+                (cond
+                  (:widget? info) (symbol (str (:ns info) "/" raw))
+                  :else (or (project-ctor-symbol info raw (:name (:ctor node)))
+                            (fail! node (str raw " has no constructor "
+                                             (or (:name (:ctor node)) "new"))))))
 
-      :else (case (:ir node)
-              :new (ctor-symbol (:ctor node) ctx)
-              :call (alias/qualify raw (:aliases ctx))))))
+              :else (case (:ir node)
+                      :new (ctor-symbol (:ctor node) ctx)
+                      :call (alias/qualify raw (:aliases ctx))))]
+    ;; Explicit type arguments on an *external* constructor become
+    ;; `^{:type-params [...]}` metadata (converted classes are emitted as
+    ;; plain fns, which cannot take Dart type arguments). Without explicit
+    ;; arguments the analyzer's instantiation is restored when the value's
+    ;; static type is lost (`BlocProvider.value(value: lateField)`).
+    (if internal?
+      sym
+      (if-let [args (seq (or (:type-args node)
+                             (get-in node [:ctor :type :type-args])))]
+        (with-type-params sym args ctx node)
+        (with-resolved-type-params sym node ctx)))))
 
 (defn- emit-ctor-args [node ctx drop-index]
   (let [raw (ctor-node-name node)

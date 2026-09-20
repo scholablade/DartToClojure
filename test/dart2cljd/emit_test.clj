@@ -2,6 +2,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
+            [dart2cljd.alias :as alias]
             [dart2cljd.api :as api]
             [dart2cljd.ast :as ast]
             [dart2cljd.emit.core :as core]
@@ -491,3 +492,71 @@
           "void f(int x) { switch (x) { case 1: if (x > 0) break; print('a'); } }"
           :dart dart-bin)))
     (is true "dart binary not present; skipped")))
+
+;; ---------------------------------------------------------------------------
+;; runtime bring-up fixes (extension methods, type arguments, field munging)
+;; ---------------------------------------------------------------------------
+
+(deftest field-name-munging-matches-clojuredart
+  (testing "ClojureDart munges deftype field names; `.-name!` has no fallback"
+    (is (= "plain" (core/dart-field-name "plain")))
+    (is (= "$base_" (core/dart-field-name "base")))
+    (is (= "$UNDERSCORE_authSub" (core/dart-field-name "_authSub")))
+    (is (= "d2c$DOLLAR_super0" (core/dart-field-name "d2c$super0")))
+    (is (= "a$UNDERSCORE_b$DOLLAR_c" (core/dart-field-name "a_b$c")))))
+
+(def ^:private extension-ctx
+  (alias/context
+   [{:uri {:value "package:rxdart/rxdart.dart"} :as "rxdart"}
+    {:uri {:value "package:flutter/material.dart"} :as "m"}]
+   {:default-alias "m" :wildcard-alias "exports"}))
+
+(deftest qualify-extension-resolves-the-application-symbol
+  (testing "dart:core keeps the explicit library qualifier (bare names are
+            unknown to the ClojureDart compiler)"
+    (is (= 'dart:core/EnumName
+           (alias/qualify-extension "dart:core" "EnumName" extension-ctx))))
+  (testing "an extension declared in a `src/` library of an imported package
+            uses that package's alias"
+    (is (= 'rxdart/StartWithExtension
+           (alias/qualify-extension
+            "package:rxdart/src/transformers/start_with.dart"
+            "StartWithExtension" extension-ctx))))
+  (testing "otherwise the exports shim alias carries the extension"
+    (is (= 'exports/SizeExtension
+           (alias/qualify-extension
+            "package:flutter_screenutil/src/size_extension.dart"
+            "SizeExtension" extension-ctx))))
+  (testing "no alias at all fails loudly upstream"
+    (is (nil? (alias/qualify-extension "package:nope/nope.dart" "Nope"
+                                       (dissoc extension-ctx :wildcard-alias))))))
+
+(deftest extension-links-use-the-explicit-application
+  (let [ctx (assoc @parity-ctx
+                   :aliases extension-ctx
+                   :locals #{"x"})
+        node {:ir :prop
+              :src {:line 1 :col 1}
+              :target {:ir :id :name "x" :src {:line 1 :col 1}}
+              :name "w" :null-aware false
+              :dart-extension "SizeExtension"
+              :dart-extension-uri "package:flutter_screenutil/src/size_extension.dart"}]
+    (is (= "(-> x exports/SizeExtension .-w)"
+           (printer/flat (core/emit-expr node ctx))))))
+
+(deftest explicit-type-arguments-become-metadata
+  (let [ctx (assoc @parity-ctx :aliases extension-ctx)
+        node {:ir :new
+              :src {:line 1 :col 1}
+              :const false
+              :ctor {:ir :ctor-name
+                     :src {:line 1 :col 1}
+                     :type {:ir :named-type
+                            :src {:line 1 :col 1}
+                            :prefix nil :name "BlocBuilder" :nullable false
+                            :type-args [{:ir :named-type :src {:line 1 :col 1}
+                                         :prefix nil :name "String" :nullable false}]}
+                     :name nil}
+              :args []}]
+    (is (= "(^{:type-params [String]} exports/BlocBuilder)"
+           (printer/flat (core/emit-expr node ctx))))))

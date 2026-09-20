@@ -23,6 +23,7 @@ import 'package:analyzer/dart/analysis/utilities.dart';
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/token.dart';
 import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/nullability_suffix.dart';
 import 'package:analyzer/dart/element/type.dart';
 import 'package:analyzer/diagnostic/diagnostic.dart';
 import 'package:analyzer/source/line_info.dart';
@@ -764,22 +765,29 @@ String dump(AstNode node, LineInfo li) {
           ':type-args ${_typeArgs(ll.typeArguments, li)} '
           ':elements ${vec(ll.elements.map((el) => dump(el, li)))} ');
     case SetOrMapLiteral sm:
-      // isMap/isSet require resolution; infer the kind syntactically
+      // Under `--types` the resolved kind is authoritative: an empty `{}` is
+      // a set when the context type is a set (`super({})` into a
+      // `Cubit<Set<String>>`), which the syntactic shape cannot tell. Parse-
+      // only nodes infer the kind syntactically (as before).
       final bool hasEntry = sm.elements.any((e) => e is MapLiteralEntry);
       final bool hasValue = sm.elements.any((e) =>
           e is! SpreadElement && e is! NullAwareElement);
       final int nTypeArgs = sm.typeArguments?.arguments.length ?? 0;
-      final String kind = hasEntry
-          ? ':map'
-          : hasValue
-              ? ':set'
-              : nTypeArgs == 2
+      final String kind = (_types && sm.isSet)
+          ? ':set'
+          : (_types && sm.isMap)
+              ? ':map'
+              : hasEntry
                   ? ':map'
-                  : nTypeArgs == 1
+                  : hasValue
                       ? ':set'
-                      : sm.elements.isEmpty
-                          ? ':map' // bare {} is an empty map in Dart
-                          : ':unknown';
+                      : nTypeArgs == 2
+                          ? ':map'
+                          : nTypeArgs == 1
+                              ? ':set'
+                              : sm.elements.isEmpty
+                                  ? ':map' // bare {} is an empty map in Dart
+                                  : ':unknown';
       f.write(':kind $kind '
           ':const ${b(sm.isConst)} '
           ':type-args ${_typeArgs(sm.typeArguments, li)} '
@@ -911,8 +919,18 @@ String _withFacts(AstNode node, String edn) {
       facts += ' :static-type ${s(t.getDisplayString(withNullability: true))}';
     }
   }
-  final kind = _elementKind(_namedElement(node));
+  final named = _namedElement(node);
+  final kind = _elementKind(named);
   if (kind != null) facts += ' :element $kind';
+  // Extension members (`180.w`, `stream.startWith(v)`) are static sugar in
+  // Dart; ClojureDart needs the explicit application form, so the emitter
+  // gets the extension's name and its declaring library.
+  final ext = _extensionName(named);
+  if (ext != null) {
+    facts += ' :extension ${s(ext)}';
+    final uri = named?.library?.identifier;
+    if (uri != null) facts += ' :extension-uri ${s(uri)}';
+  }
   // Write facts for assignment/increment nodes: the element written (locals,
   // fields, setters, top-level variables) and, for fields, the declaring class
   // (the emitter needs it to reproduce ClojureDart's `$name_` munging).
@@ -922,6 +940,14 @@ String _withFacts(AstNode node, String edn) {
     if (wk != null) facts += ' :write-element $wk';
     final wc = _fieldClass(we);
     if (wc != null) facts += ' :write-field-class ${s(wc)}';
+  }
+  // Resolved type arguments of a constructor call: Dart infers them from the
+  // arguments (`BlocProvider.value(value: bloc)`), but the generated code
+  // loses the argument's static type (late fields are emitted dynamic), so the
+  // emitter restores the instantiation explicitly.
+  if (node is InstanceCreationExpression) {
+    final rta = _resolvedTypeArgs(node.staticType);
+    if (rta != null) facts += ' :resolved-type-args ${vec(rta.map(s))}';
   }
   if (facts.isEmpty) return edn;
   final head = '{:ast ${kw(node)}';
@@ -951,6 +977,35 @@ Element? _namedElement(AstNode node) {
   if (node is MethodInvocation) return node.methodName.element;
   if (node is PrefixedIdentifier) return node.identifier.element;
   return null;
+}
+
+/// Names of the instantiated type arguments of a resolved type, when all of
+/// them are plain interface types (no generics, no nullability). Null when the
+/// type has no type arguments or they cannot be named simply.
+List<String>? _resolvedTypeArgs(DartType? t) {
+  if (t is! InterfaceType) return null;
+  final args = t.typeArguments;
+  if (args.isEmpty) return null;
+  final names = <String>[];
+  for (final a in args) {
+    if (a is! InterfaceType) return null;
+    if (a.typeArguments.isNotEmpty) return null;
+    if (a.nullabilitySuffix != NullabilitySuffix.none) return null;
+    final n = a.element.name;
+    if (n == null || n.isEmpty) return null;
+    names.add(n);
+  }
+  return names;
+}
+
+/// Name of the extension declaring a resolved member (`180.w` resolves to
+/// `SizeExtension`), or null when the element is not an extension member.
+/// Analyzer 14 has no `isExtensionMember`: a member whose enclosing element is
+/// an [ExtensionElement] is one.
+String? _extensionName(Element? e) {
+  if (e == null) return null;
+  final owner = e.enclosingElement;
+  return owner is ExtensionElement ? owner.name : null;
 }
 
 /// Deterministic element-kind keyword for a resolved name (`--types`), or

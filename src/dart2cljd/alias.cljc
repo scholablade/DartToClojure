@@ -137,6 +137,43 @@
   [p ctx]
   (contains? (:prefix->uri ctx) (str p)))
 
+(defn- same-library-root?
+  "True when two Dart URIs name the same library for aliasing purposes: equal,
+  or both `package:NAME/...` with the same package (an extension is declared in
+  a `src/` library that the package's public library re-exports:
+  `package:rxdart/rxdart.dart` exports `src/transformers/start_with.dart`)."
+  [a b]
+  (or (= a b)
+      (let [pkg (fn [u]
+                  (let [u (str u)]
+                    (when (str/starts-with? u "package:")
+                      (-> (subs u (count "package:"))
+                          (str/split #"/")
+                          first))))]
+        (and (some? (pkg a)) (= (pkg a) (pkg b))))))
+
+(defn qualify-extension
+  "Resolve an extension name to the symbol applying it in this unit, for
+  ClojureDart's explicit extension syntax `(-> recv alias/Ext (.member …))`.
+
+  `dart:core` extensions keep the explicit `dart:core/` qualifier (ClojureDart
+  resolves the extension symbol at compile time; a bare name is unknown); an
+  extension declared in a library the file imports directly (or in the same
+  package as one) uses that library's alias; anything else routes through the
+  exports shim alias (the shim re-exports every external URI the converted
+  tree imports or exports). Nil when no alias can carry the name."
+  [uri name ctx]
+  (let [name (str name)
+        uri (str uri)
+        direct (or (get (:uri->alias ctx) uri)
+                   (some (fn [[u a]] (when (same-library-root? u uri) a))
+                         (:uri->alias ctx)))]
+    (cond
+      (contains? implicit-uris uri) (symbol (str uri "/" name))
+      direct (symbol (str direct "/" name))
+      (:wildcard-alias ctx) (symbol (str (:wildcard-alias ctx) "/" name))
+      :else nil)))
+
 (defn flutter-alias
   "Deterministic alias for cljd.flutter in this context: the existing binding
   when the library is already aliased, otherwise the first free candidate
