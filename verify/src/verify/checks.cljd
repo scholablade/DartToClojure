@@ -161,6 +161,15 @@
   (is (= "L:x:true" (bp/badgeText "x")))
   (is (= "x" (.-data (bp/makeLabel "x")))))
 
+(deftest parts-are-merged-into-their-library
+  (let [i (item/Item-new "p" 2.0)]
+    (is (= "p#2.0" (bp/describeTag i)))
+    (is (= "p#2.0" (item/tagLine i)))
+    (is (= "[p]" (bp/itemTag i)))
+    (is (= "meta" (bp/itemMeta i)))
+    (is (= "[z]" (bp/makeTag "z")))
+    (is (= "item:name" (bp/declaredName "name")))))
+
 (deftest enum-named-arguments
   (is (= "b" (.-id g/Rank-bronze)))
   (is (= "Gold" (.-name g/Rank-gold)))

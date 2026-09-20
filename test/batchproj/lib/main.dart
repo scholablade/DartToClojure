@@ -29,6 +29,19 @@ double hyp(double a, double b) => math.sqrt(a * a + b * b);
 String mergeBoxes() =>
     Box(Item('a', 1.0)).merge(Box(Item('b', 2.0)));
 
+// M9: symbols declared in `item.dart`'s parts (`item_tags.dart`,
+// `item_names.dart`) are library members: they are indexed under item.dart's
+// namespace and callable across files.
+String describeTag(Item item) => tagLine(item);
+
+String itemTag(Item item) => item.tag().render();
+
+String itemMeta(Item item) => item.meta();
+
+String makeTag(String value) => Tag(value).render();
+
+String declaredName(String label) => itemDisplayName(label);
+
 // M8: `Badge` (declared in the barrel) applies a mixin from another file;
 // `Widget`/`Text` arrive through the barrel's external `export`, so the
 // generated file must require the exports shim.

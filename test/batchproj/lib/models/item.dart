@@ -1,3 +1,8 @@
+library batchproj.models.item;
+
+part 'item_tags.dart';
+part 'item_names.dart';
+
 typedef Label = String;
 
 int itemCount = 0;
@@ -38,4 +43,8 @@ class Item {
   }
 
   String get display => '$label ($price)';
+
+  Tag tag() => Tag(label);
+
+  String meta() => _Meta('meta').text;
 }
