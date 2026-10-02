@@ -430,3 +430,20 @@ These are deliberate and recorded with their probe evidence in
   34/34, compiles, and `dart analyze` reports 3 residual errors — all the
   documented upstream ClojureDart `^super` cast in classes that apply an
   external mixin (RESEARCH M8.18).
+
+## License
+
+Copyright (C) 2026 Scholablade.
+
+Licensed under the GNU Affero General Public License, version 3 or (at your
+option) any later version. See [`LICENSE`](LICENSE) for the full text.
+
+Why AGPL: `dart2cljd` is a build-time translator that ships as source, so the
+copyleft surface is the tooling rather than a hosted service — AGPL still
+covers the case where someone hosts a modified `dart2cljd` as a web
+translation service without publishing their changes (AGPL §13).
+
+Upstream projects are *not* relicensed by this: `DartClojure` (the
+inspiration) stays Apache-2.0 and `ClojureDart` (the compilation target) stays
+EPL-1.0. No upstream source is vendored here — `verify/` depends on a local
+`ClojureDart` checkout via `:local/root` as a normal library dependency.
