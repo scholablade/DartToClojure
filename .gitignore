@@ -11,3 +11,7 @@ verify/.cljd/
 *.iml
 *.swp
 probe/
+
+# Private local journals: kept on disk, deliberately not published.
+SESSION.md
+RESEARCH.md

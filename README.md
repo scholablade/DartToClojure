@@ -311,13 +311,13 @@ verify/                 cljd Flutter project used by the compile gate
 test/                   unit + golden tests, fixtures, integration corpora
 test/batchproj/         M6 directory fixture (relative/package imports, part file)
 corpus/typedproj/       M12 typed directory fixture (element kinds, `--types`)
-RESEARCH.md             compiler probes and the decisions they bind
 ```
 
 ## Documented divergences
 
-These are deliberate and recorded with their probe evidence in
-[`RESEARCH.md`](RESEARCH.md):
+These are deliberate; each was decided from a compiler probe against the real
+ClojureDart toolchain, and the commit history records the probe and the fix it
+motivated:
 
 - `e as T` → `^T` hint; the Dart runtime `CastError` is not reproduced.
 - Faithful `%` emits `(. a % b)` (Dart euclidean `%`); idiomatic mode uses `mod`.
