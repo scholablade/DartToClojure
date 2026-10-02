@@ -7,6 +7,7 @@
             [dart2cljd.ast :as ast]
             [dart2cljd.emit.core :as core]
             [dart2cljd.emit.decls :as decls]
+            [dart2cljd.emit.statements :as statements]
             [dart2cljd.printer :as printer]))
 
 ;; ---------------------------------------------------------------------------
@@ -330,7 +331,7 @@
            "p04_intdiv" "(. 7 \"~/\" 2)"
            "p05_mod" "(. 7 % 3)"
            "p06_logic" "(or (and true false) (not true))"
-           "p07_ifnull" "(or nil 3)"
+           "p07_ifnull" "3"
            "p08_ternary" "(if (> 1 0) \"pos\" \"neg\")"
            "p09_eq" "(= 1 2)"
            "p10_neq" "(not= 1 2)"
@@ -369,7 +370,7 @@
            "p39_static_chain" "m/Colors.grey.shade300"
             "p40_lambda" "(fn [^int a] (+ a 1))"
             "p41_lambda_block" "(fn [^int a] (+ a 1))"
-           "p43_throw_expr" "(or x (throw (StateError \"boom\")))"
+           "p43_throw_expr" "(let [d2c$nil x] (if (nil? d2c$nil) (throw (StateError \"boom\")) d2c$nil))"
            "p44_cascade" "(doto (m/Point 1 2) (.-x! 3) (.-y! 4))"
            "p45_cascade_call" "(doto list (.add 1) (.add 2))"
            "p46_bitwise" "(bit-or (bit-and 1 2) (bit-xor 3 4))"
@@ -401,6 +402,35 @@
            "p72_const_list" "(m/SizedBox .height 8)"}]
     (testing name
       (is (= expected (emit-expr-str name))))))
+
+(deftest if-null-coalescing
+  (testing "?? tests nil only, keeps false, and evaluates the left operand once"
+    (let [ctx (core/ctx {} {:locals #{"flag" "x"}})]
+      (is (= '(let [d2c$nil flag] (if (nil? d2c$nil) true d2c$nil))
+             (core/emit-expr {:ir :binary :op "??"
+                              :lhs {:ir :id :name "flag"}
+                              :rhs {:ir :bool-lit :value true}}
+                             ctx)))
+      (is (= '(let [d2c$nil (f)] (if (nil? d2c$nil) 3 d2c$nil))
+             (core/emit-expr {:ir :binary :op "??"
+                              :lhs {:ir :call-fn :fn {:ir :id :name "f"} :args []}
+                              :rhs {:ir :int-lit :value 3 :raw "3"}}
+                             ctx)))))
+  (testing "a nil literal left operand drops the test"
+    (is (= '3 (core/emit-expr {:ir :binary :op "??"
+                               :lhs {:ir :null-lit}
+                               :rhs {:ir :int-lit :value 3 :raw "3"}}
+                              (core/ctx {} {}))))))
+
+(deftest for-updater-if-null-assign
+  (testing "a for-loop updater i ??= v keeps false and nil-tests i"
+    (is (= '["i" (if (nil? i) 1 i)]
+           (#'statements/updater-new-value
+            {:ir :assign :op "??"
+             :lhs {:ir :id :name "i"}
+             :rhs {:ir :int-lit :value 1 :raw "1"}}
+            #{"i"}
+            (core/ctx {} {}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; statements

@@ -1082,7 +1082,7 @@
 (def ^:private binary-ops
   {"==" '= "!=" 'not= "<" '< ">" '> "<=" '<= ">=" '>=
    "+" '+ "-" '- "*" '* "/" '/ "~/" 'quot
-   "&&" 'and "||" 'or "??" 'or
+   "&&" 'and "||" 'or
    "&" 'bit-and "|" 'bit-or "^" 'bit-xor
    "<<" 'bit-shift-left ">>" 'bit-shift-right ">>>" 'unsigned-bit-shift-right})
 
@@ -1342,6 +1342,16 @@
       ;; string `"~/"`: the bare symbol `~/` reads as `unquote`.
       (= op "~/")
       (list '. (emit-expr (:lhs node) ctx) "~/" (emit-expr (:rhs node) ctx))
+
+      ;; Dart `??` tests for nil only, so `or` is wrong for a `false` left
+      ;; operand (`flag ?? true` with `flag = false` is false in Dart, true
+      ;; under `or`). Bind the left operand once and test `nil?`.
+      (= op "??")
+      (if (= :null-lit (:ir (strip-paren (:lhs node))))
+        (emit-expr (:rhs node) ctx)
+        (let [x (symbol "d2c$nil")]
+          (list 'let [x (emit-expr (:lhs node) ctx)]
+                (list 'if (list 'nil? x) (emit-expr (:rhs node) ctx) x))))
 
       (contains? binary-ops op)
       (let [args (if (contains? non-variadic-ops op)

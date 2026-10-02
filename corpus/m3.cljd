@@ -205,6 +205,16 @@
 (defn tripleDiv [^int a ^int b ^int c]
   (. (. a "~/" b) "~/" c))
 
+(defn coalesce [value ^int fallback]
+  (let [d2c$nil value] (if (nil? d2c$nil) fallback d2c$nil)))
+
+(defn coalesceBool [value]
+  (let [d2c$nil value] (if (nil? d2c$nil) true d2c$nil)))
+
+(defn coalesceChain [a b ^int fallback]
+  (let [d2c$nil (let [d2c$nil a] (if (nil? d2c$nil) b d2c$nil))]
+    (if (nil? d2c$nil) fallback d2c$nil)))
+
 (deftype Shape
   [^:mutable ^String label]
   :type-only true

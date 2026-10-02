@@ -204,6 +204,14 @@ bool loopVarEven(int n) => [for (var i = 0; i < n; i++) i.isEven].first;
 // M8.18: `~/` chains must not be flattened (`quot` takes two arguments).
 int tripleDiv(int a, int b, int c) => a ~/ b ~/ c;
 
+// M13 follow-up: `??` tests nil only (keeps `false`) and evaluates its left
+// operand once.
+int coalesce(int? value, int fallback) => value ?? fallback;
+
+bool coalesceBool(bool? value) => value ?? true;
+
+int coalesceChain(int? a, int? b, int fallback) => a ?? b ?? fallback;
+
 abstract class Shape {
   String label;
   Shape(this.label);

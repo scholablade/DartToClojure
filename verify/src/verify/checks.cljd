@@ -35,6 +35,16 @@
     (is (= "Point(2.0, 3.0)" (str (. p + q))))
     (is (= "Point(-1.0, -2.0)" (str (.unary- p))))))
 
+(deftest null-coalescing
+  (is (= 7 (g/coalesce nil 7)))
+  (is (= 3 (g/coalesce 3 7)))
+  (is (= false (g/coalesceBool false)))
+  (is (= true (g/coalesceBool true)))
+  (is (= true (g/coalesceBool nil)))
+  (is (= 9 (g/coalesceChain nil nil 9)))
+  (is (= 4 (g/coalesceChain nil 4 9)))
+  (is (= 2 (g/coalesceChain 2 4 9))))
+
 (deftest fields-and-setters
   (let [p (g/Point-new 1 2)]
     (.-x! p 3)
